@@ -1,0 +1,386 @@
+import Cocoa
+import ApplicationServices
+import Combine
+import Foundation
+
+public struct ClipboardHistoryEntry: Identifiable, Codable, Equatable, Sendable {
+    public var id: UUID = UUID()
+    public let text: String
+    public let sourceApp: String
+    public let copiedAt: Date
+
+    public init(id: UUID = UUID(), text: String, sourceApp: String, copiedAt: Date = Date()) {
+        self.id = id
+        self.text = text
+        self.sourceApp = sourceApp
+        self.copiedAt = copiedAt
+    }
+}
+
+public struct CrossAppContextEntry: Identifiable, Codable, Equatable, Sendable {
+    public var id: UUID = UUID()
+    public let appName: String
+    public let bundleId: String
+    public let windowTitle: String
+    public let domainOrURL: String?
+    public let capturedSnippet: String
+    public let timestamp: Date
+
+    public init(
+        id: UUID = UUID(),
+        appName: String,
+        bundleId: String,
+        windowTitle: String,
+        domainOrURL: String? = nil,
+        capturedSnippet: String,
+        timestamp: Date = Date()
+    ) {
+        self.id = id
+        self.appName = appName
+        self.bundleId = bundleId
+        self.windowTitle = windowTitle
+        self.domainOrURL = domainOrURL
+        self.capturedSnippet = capturedSnippet
+        self.timestamp = timestamp
+    }
+}
+
+/// Deep On-Device Context Engine.
+/// Since FreeTypist runs 100% locally on the user's Mac, it can synthesize rich context from:
+/// 1. Visible text & conversation threads in the active window (AX hierarchy traversal)
+/// 2. Active browser URL / document path (AXURL / AXDocument)
+/// 3. Multi-item clipboard history ring buffer (last 10 copied items)
+/// 4. Cross-app recent activity trail (what you were reading/writing in the previous 5 apps)
+/// 5. Local user, date/time, and workspace metadata
+@MainActor
+public final class DeepContextCollector: ObservableObject {
+    public static let shared = DeepContextCollector()
+
+    @Published public private(set) var clipboardHistory: [ClipboardHistoryEntry] = []
+    @Published public private(set) var crossAppTrail: [CrossAppContextEntry] = []
+    @Published public private(set) var activeWindowSurroundingText: [String] = []
+    @Published public private(set) var activeDocumentOrURL: String?
+    @Published public private(set) var lastCapturedWindowTitle: String = ""
+    @Published public private(set) var lastCapturedAppName: String = "FreeTypist"
+
+    private var lastPasteboardChangeCount: Int = 0
+    private var clipboardTimer: Timer?
+    private var cachedWindowContextKey: String = ""
+    private var cachedWindowSnippets: [String] = []
+    private var cachedWindowTimestamp: Date = .distantPast
+
+    private init() {
+        self.lastPasteboardChangeCount = NSPasteboard.general.changeCount
+        seedInitialRichContext()
+        startMonitoring()
+    }
+
+    private func seedInitialRichContext() {
+        let now = Date()
+        if let liveClip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !liveClip.isEmpty {
+            clipboardHistory.append(ClipboardHistoryEntry(text: String(liveClip.prefix(400)), sourceApp: "Clipboard", copiedAt: now))
+        }
+        crossAppTrail = []
+        activeWindowSurroundingText = []
+    }
+
+    public func startMonitoring() {
+        clipboardTimer?.invalidate()
+        // Lightweight 2.5s poll with 0.8s tolerance for clipboard changes (~0.0% CPU)
+        let timer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkPasteboardIfChanged()
+            }
+        }
+        timer.tolerance = 0.8
+        self.clipboardTimer = timer
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+                return
+            }
+            Task { @MainActor [weak self] in
+                self?.handleAppSwitch(to: app)
+            }
+        }
+    }
+
+    private func checkPasteboardIfChanged() {
+        let pb = NSPasteboard.general
+        guard pb.changeCount != lastPasteboardChangeCount else { return }
+        lastPasteboardChangeCount = pb.changeCount
+
+        guard let raw = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return }
+
+        let settings = AppSettings.shared
+        let finalClip: String
+        if settings.sanitizeSecretsLocally {
+            finalClip = SecretSanitizer.sanitize(String(raw.prefix(600))).sanitized
+        } else {
+            finalClip = String(raw.prefix(600))
+        }
+
+        let frontApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Clipboard"
+        clipboardHistory.removeAll { $0.text == finalClip }
+        clipboardHistory.insert(
+            ClipboardHistoryEntry(text: finalClip, sourceApp: frontApp, copiedAt: Date()),
+            at: 0
+        )
+        if clipboardHistory.count > 10 {
+            clipboardHistory.removeLast(clipboardHistory.count - 10)
+        }
+    }
+
+    private func handleAppSwitch(to app: NSRunningApplication) {
+        let appName = app.localizedName ?? "App"
+        let bundleId = app.bundleIdentifier ?? "unknown"
+        // Don't overwrite trail when opening FreeTypist's own settings window
+        guard bundleId != Bundle.main.bundleIdentifier else { return }
+
+        lastCapturedAppName = appName
+        let snapshot = captureFocusedWindowHierarchy(for: app, activeFieldText: "")
+        if !snapshot.snippets.isEmpty || !snapshot.windowTitle.isEmpty {
+            recordCrossAppSnapshot(
+                appName: appName,
+                bundleId: bundleId,
+                windowTitle: snapshot.windowTitle,
+                domainOrURL: snapshot.documentOrURL,
+                snippet: snapshot.snippets.prefix(2).joined(separator: " | ")
+            )
+        }
+    }
+
+    public func recordCrossAppSnapshot(
+        appName: String,
+        bundleId: String,
+        windowTitle: String,
+        domainOrURL: String?,
+        snippet: String
+    ) {
+        let cleanSnippet = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanSnippet.isEmpty || !windowTitle.isEmpty else { return }
+
+        crossAppTrail.removeAll { $0.bundleId == bundleId && $0.windowTitle == windowTitle }
+        crossAppTrail.insert(
+            CrossAppContextEntry(
+                appName: appName,
+                bundleId: bundleId,
+                windowTitle: windowTitle.isEmpty ? appName : windowTitle,
+                domainOrURL: domainOrURL,
+                capturedSnippet: String(cleanSnippet.prefix(320)),
+                timestamp: Date()
+            ),
+            at: 0
+        )
+        if crossAppTrail.count > 8 {
+            crossAppTrail.removeLast(crossAppTrail.count - 8)
+        }
+    }
+
+    /// Captures visible text elements inside the active window (messages above reply box, email subject, headings, URLs)
+    /// Uses a 2.5-second cache per window so rapid typing never re-walks the AX tree on every keystroke.
+    public func gatherRichWindowContext(activeFieldText: String) -> (surroundingSnippets: [String], documentOrURL: String?) {
+        let settings = AppSettings.shared
+        guard settings.readSurroundingWindowText else {
+            return ([], nil)
+        }
+
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            return (activeWindowSurroundingText, activeDocumentOrURL)
+        }
+
+        if frontApp.bundleIdentifier == Bundle.main.bundleIdentifier {
+            // Inside FreeTypist Playground: return the live/seeded surrounding context so Playground can test deep context!
+            return (activeWindowSurroundingText, activeDocumentOrURL)
+        }
+
+        let cacheKey = "\(frontApp.processIdentifier)-\(lastCapturedWindowTitle)"
+        if cacheKey == cachedWindowContextKey && Date().timeIntervalSince(cachedWindowTimestamp) < 2.5 {
+            return (cachedWindowSnippets, activeDocumentOrURL)
+        }
+
+        let result = captureFocusedWindowHierarchy(for: frontApp, activeFieldText: activeFieldText)
+        cachedWindowContextKey = "\(frontApp.processIdentifier)-\(result.windowTitle)"
+        cachedWindowTimestamp = Date()
+        cachedWindowSnippets = result.snippets
+        if !result.snippets.isEmpty {
+            activeWindowSurroundingText = result.snippets
+        }
+        if let doc = result.documentOrURL {
+            activeDocumentOrURL = doc
+        }
+        if !result.windowTitle.isEmpty {
+            lastCapturedWindowTitle = result.windowTitle
+        }
+        return (result.snippets, result.documentOrURL)
+    }
+
+    private func captureFocusedWindowHierarchy(
+        for app: NSRunningApplication,
+        activeFieldText: String
+    ) -> (windowTitle: String, documentOrURL: String?, snippets: [String]) {
+        guard AXIsProcessTrusted() else {
+            return ("", nil, activeWindowSurroundingText)
+        }
+
+        let appAX = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedWinObj: AnyObject?
+        guard AXUIElementCopyAttributeValue(appAX, kAXFocusedWindowAttribute as CFString, &focusedWinObj) == .success,
+              let win = focusedWinObj else {
+            return ("", nil, [])
+        }
+        let winAX = win as! AXUIElement
+
+        var titleObj: AnyObject?
+        AXUIElementCopyAttributeValue(winAX, kAXTitleAttribute as CFString, &titleObj)
+        let windowTitle = (titleObj as? String) ?? ""
+
+        var docObj: AnyObject?
+        AXUIElementCopyAttributeValue(winAX, kAXDocumentAttribute as CFString, &docObj)
+        var documentOrURL = docObj as? String
+
+        // Bounded BFS traversal of up to 65 AX nodes in the active window to extract visible labels/messages/headings
+        var queue: [AXUIElement] = [winAX]
+        var visited = 0
+        let maxNodes = 65
+        var collected: [String] = []
+        let trimmedActive = activeFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        while !queue.isEmpty && visited < maxNodes && collected.count < 10 {
+            let current = queue.removeFirst()
+            visited += 1
+
+            var roleObj: AnyObject?
+            AXUIElementCopyAttributeValue(current, kAXRoleAttribute as CFString, &roleObj)
+            let role = (roleObj as? String) ?? ""
+
+            var subroleObj: AnyObject?
+            AXUIElementCopyAttributeValue(current, kAXSubroleAttribute as CFString, &subroleObj)
+            if (subroleObj as? String) == "AXSecureTextField" {
+                continue
+            }
+
+            if documentOrURL == nil {
+                var urlObj: AnyObject?
+                if AXUIElementCopyAttributeValue(current, kAXURLAttribute as CFString, &urlObj) == .success {
+                    if let url = urlObj as? URL {
+                        documentOrURL = url.absoluteString
+                    } else if let str = urlObj as? String {
+                        documentOrURL = str
+                    }
+                }
+            }
+
+            // Extract text from StaticText, Heading, TextArea, Cell, Link, or WebArea description
+            if ["AXStaticText", "AXHeading", "AXTextArea", "AXTextField", "AXLink", "AXCell"].contains(role) {
+                var valObj: AnyObject?
+                if AXUIElementCopyAttributeValue(current, kAXValueAttribute as CFString, &valObj) == .success,
+                   let str = (valObj as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   str.count >= 8,
+                   str != trimmedActive,
+                   !collected.contains(str) {
+                    collected.append(String(str.prefix(240)))
+                } else {
+                    var descObj: AnyObject?
+                    if AXUIElementCopyAttributeValue(current, kAXDescriptionAttribute as CFString, &descObj) == .success,
+                       let desc = (descObj as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       desc.count >= 10,
+                       desc != trimmedActive,
+                       !collected.contains(desc) {
+                        collected.append(String(desc.prefix(240)))
+                    }
+                }
+            }
+
+            var childrenObj: AnyObject?
+            if AXUIElementCopyAttributeValue(current, kAXChildrenAttribute as CFString, &childrenObj) == .success,
+               let children = childrenObj as? [AXUIElement] {
+                for child in children.prefix(12) {
+                    queue.append(child)
+                }
+            }
+        }
+
+        return (windowTitle, documentOrURL, collected)
+    }
+
+    /// Synthesizes a compact, high-signal multi-source local context block for PromptBuilder and OfflinePredictor
+    public func buildSynthesizedContextSummary(
+        currentAppName: String,
+        currentBundleId: String?,
+        activeFieldText: String
+    ) -> String {
+        let settings = AppSettings.shared
+        var sections: [String] = []
+
+        // 1. User & Temporal Environment
+        if settings.includeSystemAndUserMetadata {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "EEEE, MMM d, yyyy 'at' h:mm a"
+            let nowStr = formatter.string(from: Date())
+            let fullName = NSFullUserName()
+            let userLabel = fullName.isEmpty ? NSUserName() : fullName
+            sections.append("User: \(userLabel) | Local Time: \(nowStr)")
+        }
+
+        // 2. Surrounding Window Text / Conversation Thread
+        if settings.readSurroundingWindowText {
+            let (windowSnippets, docURL) = gatherRichWindowContext(activeFieldText: activeFieldText)
+            if let url = docURL, !url.isEmpty {
+                sections.append("Active Document/URL: \(url)")
+            }
+            if !windowSnippets.isEmpty {
+                let joined = windowSnippets.prefix(4).joined(separator: " • ")
+                sections.append("Visible Window / Thread Context: \(joined)")
+            }
+        }
+
+        // 3. Cross-App Recent Activity Trail
+        if settings.trackCrossAppContext {
+            let recentOtherApps = crossAppTrail
+                .filter { $0.bundleId != currentBundleId }
+                .prefix(3)
+            if !recentOtherApps.isEmpty {
+                let trailDesc = recentOtherApps.map { entry in
+                    "[\(entry.appName) — \(entry.windowTitle): \(entry.capturedSnippet)]"
+                }.joined(separator: " ; ")
+                sections.append("Recent Cross-App Activity: \(trailDesc)")
+            }
+        }
+
+        // 4. Multi-Clipboard Ring Buffer
+        if settings.useClipboardContext && !clipboardHistory.isEmpty {
+            let count = settings.trackMultiClipboardHistory ? min(3, clipboardHistory.count) : 1
+            let clips = clipboardHistory.prefix(count).enumerated().map { idx, item in
+                "Clip #\(idx + 1) (\(item.sourceApp)): \(item.text)"
+            }.joined(separator: " | ")
+            sections.append("Clipboard Memory: \(clips)")
+        }
+
+        return sections.joined(separator: "\n")
+    }
+
+    public func addSimulatedWindowContext(_ snippet: String) {
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        activeWindowSurroundingText.removeAll { $0 == trimmed }
+        activeWindowSurroundingText.insert(trimmed, at: 0)
+        if activeWindowSurroundingText.count > 6 {
+            activeWindowSurroundingText.removeLast()
+        }
+    }
+
+    public func clearClipboardHistory() {
+        clipboardHistory.removeAll()
+    }
+
+    public func clearCrossAppTrail() {
+        crossAppTrail.removeAll()
+    }
+}
