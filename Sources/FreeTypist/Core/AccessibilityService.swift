@@ -310,58 +310,130 @@ public final class AccessibilityService: @unchecked Sendable {
         return nil
     }
 
-    public func insertText(_ text: String, deleteBackwardsCount: Int = 0) {
-        if deleteBackwardsCount > 0 {
-            for _ in 0..<deleteBackwardsCount {
-                simulateKeyPress(keyCode: 51, flags: []) // Backspace
-            }
-        }
+    public static let syntheticEventMarker: Int64 = 0x46545950
+    public private(set) var isPerformingSyntheticInsertion: Bool = false
+    private let syntheticQueue = DispatchQueue(label: "com.freetypist.syntheticInput", qos: .userInteractive)
 
+    public func insertText(_ text: String, deleteBackwardsCount: Int = 0) {
         let systemWide = AXUIElementCreateSystemWide()
         var focusedElement: AnyObject?
-        let result = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
+        var result = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
+        if (result != .success || focusedElement == nil),
+           let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier {
+            let appAX = AXUIElementCreateApplication(pid)
+            result = AXUIElementCopyAttributeValue(appAX, kAXFocusedUIElementAttribute as CFString, &focusedElement)
+        }
 
-        if deleteBackwardsCount == 0, result == .success, let element = focusedElement {
+        // 1. Try atomic Accessibility range replacement first (0 keystrokes when supported by native Cocoa apps)
+        var wordAlreadySelectedViaAX = false
+        if result == .success, let element = focusedElement {
             let axElement = element as! AXUIElement
-            let axSetResult = AXUIElementSetAttributeValue(axElement, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
-            if axSetResult == .success {
-                return
-            }
-        }
 
-        insertViaPasteboard(text)
-    }
+            var beforeValObj: AnyObject?
+            _ = AXUIElementCopyAttributeValue(axElement, kAXValueAttribute as CFString, &beforeValObj)
+            let beforeValue = (beforeValObj as? String) ?? (beforeValObj as? NSAttributedString)?.string
 
-    private func insertViaPasteboard(_ text: String) {
-        let pasteboard = NSPasteboard.general
-        let previousItems = pasteboard.pasteboardItems?.compactMap { item -> (NSPasteboard.PasteboardType, Data)? in
-            guard let type = item.types.first, let data = item.data(forType: type) else { return nil }
-            return (type, data)
-        }
+            var rangeObj: AnyObject?
+            if AXUIElementCopyAttributeValue(axElement, kAXSelectedTextRangeAttribute as CFString, &rangeObj) == .success,
+               let rObj = rangeObj,
+               CFGetTypeID(rObj) == AXValueGetTypeID() {
+                var selectedRange = CFRange(location: 0, length: 0)
+                AXValueGetValue(rObj as! AXValue, .cfRange, &selectedRange)
 
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+                if deleteBackwardsCount > 0 && selectedRange.location >= deleteBackwardsCount {
+                    var replaceRange = CFRange(
+                        location: selectedRange.location - deleteBackwardsCount,
+                        length: deleteBackwardsCount
+                    )
+                    if let axRange = AXValueCreate(.cfRange, &replaceRange) {
+                        if AXUIElementSetAttributeValue(axElement, kAXSelectedTextRangeAttribute as CFString, axRange) == .success {
+                            // Verify whether the app actually selected the range
+                            var verifyRangeObj: AnyObject?
+                            if AXUIElementCopyAttributeValue(axElement, kAXSelectedTextRangeAttribute as CFString, &verifyRangeObj) == .success,
+                               let vObj = verifyRangeObj,
+                               CFGetTypeID(vObj) == AXValueGetTypeID() {
+                                var verifiedRange = CFRange(location: 0, length: 0)
+                                AXValueGetValue(vObj as! AXValue, .cfRange, &verifiedRange)
+                                if verifiedRange.length == deleteBackwardsCount {
+                                    wordAlreadySelectedViaAX = true
+                                }
+                            }
+                        }
+                    }
+                }
 
-        simulateKeyPress(keyCode: 9, flags: .maskCommand)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            if let saved = previousItems, !saved.isEmpty {
-                pasteboard.clearContents()
-                for (type, data) in saved {
-                    pasteboard.setData(data, forType: type)
+                if deleteBackwardsCount == 0 || wordAlreadySelectedViaAX {
+                    if AXUIElementSetAttributeValue(axElement, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success {
+                        var afterValObj: AnyObject?
+                        _ = AXUIElementCopyAttributeValue(axElement, kAXValueAttribute as CFString, &afterValObj)
+                        let afterValue = (afterValObj as? String) ?? (afterValObj as? NSAttributedString)?.string
+                        // Confirm the underlying text value actually changed
+                        if let beforeValue, let afterValue, afterValue != beforeValue {
+                            return
+                        }
+                    }
                 }
             }
         }
+
+        // 2. Reliable Paced Keyboard Replacement (never mixes unmodified Backspaces with Cmd+V modifier flags)
+        let backspacesToSend = wordAlreadySelectedViaAX ? 1 : deleteBackwardsCount
+        syntheticQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.isPerformingSyntheticInsertion = true
+            defer {
+                usleep(18_000)
+                self.isPerformingSyntheticInsertion = false
+            }
+
+            let source = CGEventSource(stateID: .privateState)
+
+            if backspacesToSend > 0 {
+                for _ in 0..<backspacesToSend {
+                    self.postKey(keyCode: 51, flags: [], source: source)
+                    usleep(4_500) // 4.5ms spacing guarantees Chromium/Electron/Cocoa processes every single Backspace
+                }
+                // Wait 20ms for all Backspaces to commit in the target app before typing the replacement
+                usleep(20_000)
+            }
+
+            self.postUnicodeString(text, source: source)
+        }
     }
 
-    private func simulateKeyPress(keyCode: CGKeyCode, flags: CGEventFlags) {
-        let source = CGEventSource(stateID: .combinedSessionState)
+    private func postUnicodeString(_ text: String, source: CGEventSource?) {
+        for char in text {
+            if char == "\n" || char == "\r" {
+                postKey(keyCode: 36, flags: [], source: source)
+                usleep(2_500)
+                continue
+            }
+            var utf16Units = Array(String(char).utf16)
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                continue
+            }
+            keyDown.flags = []
+            keyUp.flags = []
+            keyDown.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
+            keyUp.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
+            keyDown.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
+            keyUp.keyboardSetUnicodeString(stringLength: utf16Units.count, unicodeString: &utf16Units)
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            usleep(2_000)
+        }
+    }
+
+    private func postKey(keyCode: CGKeyCode, flags: CGEventFlags, source: CGEventSource?) {
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
         keyDown?.flags = flags
+        keyDown?.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
         keyDown?.post(tap: .cghidEventTap)
 
         let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
         keyUp?.flags = flags
+        keyUp?.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
         keyUp?.post(tap: .cghidEventTap)
     }
 }

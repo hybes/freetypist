@@ -69,7 +69,7 @@ public final class KeyboardHook: @unchecked Sendable {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         self.isRunning = true
-        print("✅ FreeTypist: KeyboardHook event tap active.")
+        print("FreeTypist: KeyboardHook event tap active.")
     }
 
     private func setupWorkspaceObserver() {
@@ -93,8 +93,12 @@ public final class KeyboardHook: @unchecked Sendable {
             guard let self = self else { return }
             // Only use fallback monitor when CGEventTap isn't active
             guard !self.isRunning else { return }
+            if AccessibilityService.shared.isPerformingSyntheticInsertion { return }
             if self.isTypingInFreeTypist() { return }
             if let cgEvent = event.cgEvent {
+                if cgEvent.getIntegerValueField(.eventSourceUserData) == AccessibilityService.syntheticEventMarker {
+                    return
+                }
                 self.typingBuffer.handle(event: cgEvent)
             }
             Task { @MainActor [weak self] in
@@ -139,6 +143,12 @@ public final class KeyboardHook: @unchecked Sendable {
             return Unmanaged.passRetained(event)
         }
 
+        // Ignore synthetic keystrokes posted by AccessibilityService during replacements
+        if event.getIntegerValueField(.eventSourceUserData) == AccessibilityService.syntheticEventMarker ||
+           AccessibilityService.shared.isPerformingSyntheticInsertion {
+            return Unmanaged.passRetained(event)
+        }
+
         if isTypingInFreeTypist() {
             return Unmanaged.passRetained(event)
         }
@@ -155,7 +165,13 @@ public final class KeyboardHook: @unchecked Sendable {
             let isShiftPressed = flags.contains(.maskShift)
 
             Task { @MainActor in
-                if isOptionPressed || isShiftPressed {
+                // If there is an active typo fix or slash command, always apply the full replacement
+                let isReplacement = CompletionEngine.shared.activeAutocorrect != nil
+                    || CompletionEngine.shared.activeSlashCommand != nil
+                    || !CompletionEngine.shared.activeEmojiCandidates.isEmpty
+                    || (CompletionEngine.shared.currentSuggestion?.replacementLength ?? 0) > 0
+
+                if (isOptionPressed || isShiftPressed) && !isReplacement {
                     if let word = CompletionEngine.shared.acceptNextWord() {
                         self.typingBuffer.append(word)
                         AccessibilityService.shared.insertText(word)
@@ -163,7 +179,10 @@ public final class KeyboardHook: @unchecked Sendable {
                     }
                 } else {
                     if let accepted = CompletionEngine.shared.acceptFull() {
-                        self.typingBuffer.append(accepted.textToInsert)
+                        self.typingBuffer.replaceTrailing(
+                            count: accepted.deleteBackwardsCount,
+                            with: accepted.textToInsert
+                        )
                         AccessibilityService.shared.insertText(
                             accepted.textToInsert,
                             deleteBackwardsCount: accepted.deleteBackwardsCount
@@ -207,6 +226,7 @@ public final class KeyboardHook: @unchecked Sendable {
 
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 20_000_000)
+            guard !AccessibilityService.shared.isPerformingSyntheticInsertion else { return }
             self?.requestCompletionFromContext()
         }
 
@@ -215,6 +235,7 @@ public final class KeyboardHook: @unchecked Sendable {
 
     @MainActor
     private func requestCompletionFromContext() {
+        guard !AccessibilityService.shared.isPerformingSyntheticInsertion else { return }
         let bufferSnapshot = typingBuffer.snapshot()
         let caretInfo = AccessibilityService.shared.getCurrentCaretInfo()
 
@@ -268,12 +289,14 @@ public final class KeyboardHook: @unchecked Sendable {
     private func hasSuggestion() -> Bool {
         if Thread.isMainThread {
             return MainActor.assumeIsolated {
-                CompletionEngine.shared.currentSuggestion != nil
+                let eng = CompletionEngine.shared
+                return eng.currentSuggestion != nil || eng.activeAutocorrect != nil || eng.activeSlashCommand != nil || !eng.activeEmojiCandidates.isEmpty
             }
         }
         return DispatchQueue.main.sync {
             MainActor.assumeIsolated {
-                CompletionEngine.shared.currentSuggestion != nil
+                let eng = CompletionEngine.shared
+                return eng.currentSuggestion != nil || eng.activeAutocorrect != nil || eng.activeSlashCommand != nil || !eng.activeEmojiCandidates.isEmpty
             }
         }
     }
@@ -300,6 +323,17 @@ final class TypingBuffer: @unchecked Sendable {
     func append(_ value: String) {
         lock.lock()
         text.append(value)
+        trimLocked()
+        lock.unlock()
+    }
+
+    func replaceTrailing(count: Int, with replacement: String) {
+        lock.lock()
+        if count > 0 {
+            let dropCount = min(count, text.count)
+            text.removeLast(dropCount)
+        }
+        text.append(replacement)
         trimLocked()
         lock.unlock()
     }

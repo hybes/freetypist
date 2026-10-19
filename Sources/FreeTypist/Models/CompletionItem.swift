@@ -7,11 +7,13 @@ public struct CompletionItem: Equatable, Sendable {
     public let timestamp: Date
     public let providerName: String
     public let latencyMs: Int
+    public let replacementLength: Int
 
-    public init(fullText: String, providerName: String = "AI", latencyMs: Int = 0) {
+    public init(fullText: String, providerName: String = "AI", latencyMs: Int = 0, replacementLength: Int = 0) {
         self.fullText = fullText
         self.providerName = providerName
         self.latencyMs = latencyMs
+        self.replacementLength = replacementLength
         self.timestamp = Date()
         self.acceptedWordIndex = 0
         

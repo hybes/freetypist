@@ -14,18 +14,12 @@ public final class LocalModelManager: ObservableObject {
     @Published public var downloadStatusMessage: String = ""
 
     private var downloadTask: URLSessionDownloadTask?
+    private var downloadSession: URLSession?
     private var activeDownloadingModel: LocalModelInfo?
     private var downloadDelegate: InternalDownloadDelegate?
 
     public var recommendedModel: LocalModelInfo {
-        let ramBytes = ProcessInfo.processInfo.physicalMemory
-        let ramGB = Int(ramBytes / (1024 * 1024 * 1024))
-
-        if ramGB >= 16 {
-            return availableModels.first(where: { $0.id == "gemma-4-e4b" }) ?? availableModels[0]
-        } else {
-            return availableModels.first(where: { $0.id == "qwen-2.5-1.5b" }) ?? availableModels[1]
-        }
+        availableModels[0] // Qwen 2.5 1.5B (1.1 GB) is fast, light, and great for instant completions
     }
 
     public var freeTypistModelsDirectory: URL {
@@ -45,20 +39,15 @@ public final class LocalModelManager: ObservableObject {
     }
 
     private init() {
-        let defaultModel = LocalModelInfo.catalog[0]
-        self.selectedModel = defaultModel
-
-        self.selectedModel = recommendedModel
+        self.selectedModel = LocalModelInfo.catalog[0]
         scanLocalModels()
     }
 
     /// Verifies that a `.gguf` file starts with the standard 4-byte ASCII `"GGUF"` magic header (`0x47 0x47 0x55 0x46`)
-    /// so Cotypist's encrypted `-Q5_C.gguf` / `-Q4_C.gguf` containers are never passed to `llama-server`.
     public nonisolated static func isValidStandardGGUF(atPath path: String) -> Bool {
         guard let handle = FileHandle(forReadingAtPath: path) else { return false }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: 4), data.count == 4 else { return false }
-        // 'G' = 0x47, 'G' = 0x47, 'U' = 0x55, 'F' = 0x46
         return data[0] == 0x47 && data[1] == 0x47 && data[2] == 0x55 && data[3] == 0x46
     }
 
@@ -66,7 +55,6 @@ public final class LocalModelManager: ObservableObject {
         var found: [String: String] = [:]
         let fm = FileManager.default
 
-        // 1. Scan FreeTypist Models Directory
         let freeDir = freeTypistModelsDirectory
         if let files = try? fm.contentsOfDirectory(atPath: freeDir.path) {
             for file in files where file.hasSuffix(".gguf") {
@@ -80,49 +68,24 @@ public final class LocalModelManager: ObservableObject {
             }
         }
 
-        // 2. Scan Cotypist Models Directory ONLY for unencrypted standard GGUF models
         if let coDir = cotypistModelsDirectory, let files = try? fm.contentsOfDirectory(atPath: coDir.path) {
             for file in files where file.hasSuffix(".gguf") {
                 let fullPath = coDir.appendingPathComponent(file).path
-                // Skip Cotypist's encrypted -Q5_C / -Q4_C containers that lack 'GGUF' magic bytes
                 guard Self.isValidStandardGGUF(atPath: fullPath) else { continue }
                 for model in availableModels {
-                    if found[model.id] == nil {
-                        if file.lowercased().contains("gemma-4") && model.id == "gemma-4-e4b" {
-                            found[model.id] = fullPath
-                        } else if file.lowercased().contains("qwen") && model.id == "qwen-2.5-1.5b" {
-                            found[model.id] = fullPath
-                        } else if file.lowercased().contains("llama-3.2-1b") && model.id == "llama-3.2-1b" {
-                            found[model.id] = fullPath
-                        } else if file.lowercased().contains("llama-3.2-3b") && model.id == "llama-3.2-3b" {
-                            found[model.id] = fullPath
-                        } else if file.lowercased() == model.filename.lowercased() {
-                            found[model.id] = fullPath
-                        }
+                    if found[model.id] == nil && file.lowercased() == model.filename.lowercased() {
+                        found[model.id] = fullPath
                     }
-                }
-                if !found.values.contains(fullPath) {
-                    found[file] = fullPath
                 }
             }
         }
 
         self.downloadedModelPaths = found
 
-        // If the selected model is not downloaded but another valid GGUF is, default to the downloaded one
-        if downloadedModelPaths[selectedModel.id] == nil, let firstAvailableId = downloadedModelPaths.keys.first,
+        if downloadedModelPaths[selectedModel.id] == nil,
+           let firstAvailableId = downloadedModelPaths.keys.first,
            let model = availableModels.first(where: { $0.id == firstAvailableId }) {
             self.selectedModel = model
-        }
-    }
-
-    /// Automatically begins downloading a fast standard GGUF model (`gemma-3-1b` or `qwen-2.5-1.5b`) if no valid GGUF is installed yet.
-    public func ensureDefaultModelReady() {
-        scanLocalModels()
-        guard downloadedModelPaths.isEmpty && !isDownloading else { return }
-        if let fastModel = availableModels.first(where: { $0.id == "gemma-3-1b" }) ?? availableModels.first(where: { $0.id == "qwen-2.5-1.5b" }) {
-            self.selectedModel = fastModel
-            startDownload(model: fastModel)
         }
     }
 
@@ -140,40 +103,76 @@ public final class LocalModelManager: ObservableObject {
     }
 
     public func startDownload(model: LocalModelInfo) {
-        guard !isDownloading else { return }
-        guard let url = URL(string: model.downloadURLString) else { return }
+        // Cancel any previous download so clicking Download always responds immediately
+        downloadTask?.cancel()
+        downloadSession?.invalidateAndCancel()
+
+        guard let url = URL(string: model.downloadURLString) else {
+            self.downloadStatusMessage = "Invalid model URL."
+            return
+        }
 
         self.activeDownloadingModel = model
         self.isDownloading = true
-        self.downloadProgress = 0.0
-        self.downloadStatusMessage = "Connecting to download \(model.name)..."
+        self.downloadProgress = 0.02
+        self.downloadStatusMessage = "Starting download of \(model.name) (\(model.sizeText))..."
 
+        let expectedBytes = model.expectedSizeBytes
         let delegate = InternalDownloadDelegate(
             onProgress: { [weak self] written, total in
                 Task { @MainActor [weak self] in
-                    guard let self = self else { return }
-                    if total > 0 {
-                        let progress = Double(written) / Double(total)
-                        let mbDownloaded = Double(written) / (1024 * 1024)
-                        let mbTotal = Double(total) / (1024 * 1024)
-                        self.downloadProgress = progress
-                        self.downloadStatusMessage = String(format: "Downloading %.1f / %.1f MB (%.0f%%)", mbDownloaded, mbTotal, progress * 100)
-                    }
+                    guard let self = self, self.isDownloading else { return }
+                    let effectiveTotal = total > 0 ? total : expectedBytes
+                    let progress = min(max(Double(written) / Double(max(1, effectiveTotal)), 0.02), 0.99)
+                    let mbDownloaded = Double(written) / (1024 * 1024)
+                    let mbTotal = Double(effectiveTotal) / (1024 * 1024)
+                    self.downloadProgress = progress
+                    self.downloadStatusMessage = String(
+                        format: "Downloading %@: %.1f MB / %.0f MB (%.0f%%)",
+                        model.name,
+                        mbDownloaded,
+                        mbTotal,
+                        progress * 100
+                    )
                 }
             },
-            onFinish: { [weak self] location in
+            onFinish: { [weak self] location, statusCode in
+                let fm = FileManager.default
+                let tempCopy = fm.temporaryDirectory.appendingPathComponent("ft_dl_\(UUID().uuidString).gguf")
+                try? fm.removeItem(at: tempCopy)
+                let movedTemp = (try? fm.moveItem(at: location, to: tempCopy)) != nil
+
                 Task { @MainActor [weak self] in
                     guard let self = self, let model = self.activeDownloadingModel else { return }
+                    defer { try? FileManager.default.removeItem(at: tempCopy) }
+
+                    if statusCode >= 400 {
+                        self.isDownloading = false
+                        self.downloadProgress = 0.0
+                        self.downloadStatusMessage = "Download failed (HTTP \(statusCode)). Please try another model."
+                        self.activeDownloadingModel = nil
+                        return
+                    }
+
+                    guard movedTemp, Self.isValidStandardGGUF(atPath: tempCopy.path) else {
+                        self.isDownloading = false
+                        self.downloadProgress = 0.0
+                        self.downloadStatusMessage = "Downloaded file was not a valid GGUF model."
+                        self.activeDownloadingModel = nil
+                        return
+                    }
+
                     let targetURL = self.freeTypistModelsDirectory.appendingPathComponent(model.filename)
                     do {
                         if FileManager.default.fileExists(atPath: targetURL.path) {
                             try FileManager.default.removeItem(at: targetURL)
                         }
-                        try FileManager.default.moveItem(at: location, to: targetURL)
+                        try FileManager.default.moveItem(at: tempCopy, to: targetURL)
 
                         self.scanLocalModels()
                         self.isDownloading = false
-                        self.downloadStatusMessage = "Download completed!"
+                        self.downloadProgress = 1.0
+                        self.downloadStatusMessage = "\(model.name) downloaded and ready."
                         self.activeDownloadingModel = nil
 
                         LocalInferenceService.shared.startServer(for: targetURL.path)
@@ -188,6 +187,7 @@ public final class LocalModelManager: ObservableObject {
                     guard let self = self else { return }
                     if let err = error as NSError?, err.code != NSURLErrorCancelled {
                         self.isDownloading = false
+                        self.downloadProgress = 0.0
                         self.downloadStatusMessage = "Download failed: \(err.localizedDescription)"
                         self.activeDownloadingModel = nil
                     }
@@ -196,18 +196,27 @@ public final class LocalModelManager: ObservableObject {
         )
 
         self.downloadDelegate = delegate
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        let task = session.downloadTask(with: url)
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.waitsForConnectivity = false
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        self.downloadSession = session
+
+        var request = URLRequest(url: url)
+        request.setValue("FreeTypist/1.0 (macOS)", forHTTPHeaderField: "User-Agent")
+        let task = session.downloadTask(with: request)
         self.downloadTask = task
         task.resume()
     }
 
     public func cancelDownload() {
         downloadTask?.cancel()
+        downloadSession?.invalidateAndCancel()
         downloadTask = nil
+        downloadSession = nil
         isDownloading = false
         downloadProgress = 0.0
-        downloadStatusMessage = ""
+        downloadStatusMessage = "Download cancelled."
         activeDownloadingModel = nil
         downloadDelegate = nil
     }
@@ -216,12 +225,12 @@ public final class LocalModelManager: ObservableObject {
 // MARK: - Dedicated Download Delegate
 final class InternalDownloadDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
     private let onProgress: @Sendable (Int64, Int64) -> Void
-    private let onFinish: @Sendable (URL) -> Void
+    private let onFinish: @Sendable (URL, Int) -> Void
     private let onError: @Sendable (Error?) -> Void
 
     init(
         onProgress: @escaping @Sendable (Int64, Int64) -> Void,
-        onFinish: @escaping @Sendable (URL) -> Void,
+        onFinish: @escaping @Sendable (URL, Int) -> Void,
         onError: @escaping @Sendable (Error?) -> Void
     ) {
         self.onProgress = onProgress
@@ -234,10 +243,13 @@ final class InternalDownloadDelegate: NSObject, URLSessionDownloadDelegate, Send
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        onFinish(location)
+        let code = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 200
+        onFinish(location, code)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        onError(error)
+        if let error {
+            onError(error)
+        }
     }
 }

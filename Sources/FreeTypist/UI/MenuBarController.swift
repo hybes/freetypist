@@ -58,7 +58,7 @@ public final class MenuBarController: NSObject {
         let stats = StatsManager.shared
 
         let effectivelyActive = settings.isEnabled && !isTemporarilyPaused
-        let symbolName = effectivelyActive ? "sparkles" : "pause.circle"
+        let symbolName = effectivelyActive ? "character.cursor.ibeam" : "pause.circle"
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "FreeTypist")
         button.image?.isTemplate = true
         button.imagePosition = .imageLeading
@@ -77,31 +77,34 @@ public final class MenuBarController: NSObject {
         let stats = StatsManager.shared
         let monitor = SystemResourceMonitor.shared
 
-        // Status Header
+        // Clean Status Header (Zero Emojis)
         let statusTitle: String
         if !settings.isEnabled {
-            statusTitle = "○ Autocomplete: Paused"
+            statusTitle = "FreeTypist: Paused"
         } else if isTemporarilyPaused {
-            statusTitle = "◐ Autocomplete: Snoozed"
+            statusTitle = "FreeTypist: Snoozed"
         } else if monitor.isSecureInputActive {
-            statusTitle = "🔒 Protected Password Field Active"
+            statusTitle = "FreeTypist: Protected Field Active"
         } else {
-            statusTitle = "● Autocomplete: Active (\(String(format: "%.0f", monitor.appMemoryMB)) MB RAM)"
+            statusTitle = "FreeTypist: Active (\(String(format: "%.0f", monitor.appMemoryMB)) MB)"
         }
         let statusHeaderItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
         statusHeaderItem.isEnabled = false
         menu.addItem(statusHeaderItem)
 
-        menu.addItem(NSMenuItem.separator())
+        let statsItem = NSMenuItem(
+            title: "\(stats.todayCompletionsAccepted) completions today (\(stats.todayWordsSaved) words saved)",
+            action: #selector(openStats),
+            keyEquivalent: ""
+        )
+        statsItem.target = self
+        menu.addItem(statsItem)
 
-        // Playground
-        let playgroundItem = NSMenuItem(title: "🎮 Open Interactive Playground...", action: #selector(openPlayground), keyEquivalent: "p")
-        playgroundItem.target = self
-        menu.addItem(playgroundItem)
+        menu.addItem(NSMenuItem.separator())
 
         // Quick Toggle
         let toggleItem = NSMenuItem(
-            title: settings.isEnabled ? "Pause Autocomplete" : "Resume Autocomplete",
+            title: settings.isEnabled ? "Pause Completions" : "Resume Completions",
             action: #selector(toggleEnabled),
             keyEquivalent: ""
         )
@@ -117,77 +120,17 @@ public final class MenuBarController: NSObject {
         snoozeItem.target = self
         menu.addItem(snoozeItem)
 
-        // Quick Model Switcher Submenu
-        let modelSubmenu = NSMenu()
-        for provider in AIProviderType.allCases {
-            let item = NSMenuItem(
-                title: provider.rawValue,
-                action: #selector(selectProvider(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = provider
-            item.state = (settings.activeProvider == provider) ? .on : .off
-            modelSubmenu.addItem(item)
-        }
-        let modelMenuItem = NSMenuItem(title: "Active Engine: \(settings.activeProvider.rawValue)", action: nil, keyEquivalent: "")
-        modelMenuItem.submenu = modelSubmenu
-        menu.addItem(modelMenuItem)
-
-        // Personalization Strength Submenu
-        let strengthSubmenu = NSMenu()
-        for strength in PersonalizationStrength.allCases {
-            let item = NSMenuItem(
-                title: "\(strength.rawValue) — \(strength.subtitle)",
-                action: #selector(selectStrength(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = strength.rawValue
-            item.state = (settings.personalizationStrength == strength) ? .on : .off
-            strengthSubmenu.addItem(item)
-        }
-        let strengthMenuItem = NSMenuItem(title: "Constant Learning: \(settings.personalizationStrength.rawValue)", action: nil, keyEquivalent: "")
-        strengthMenuItem.submenu = strengthSubmenu
-        menu.addItem(strengthMenuItem)
-
         menu.addItem(NSMenuItem.separator())
 
-        // Today's Stats
-        let statsItem = NSMenuItem(
-            title: "⚡️ \(stats.todayCompletionsAccepted) accepted today • \(stats.todayWordsSaved) words (\(stats.totalWordsSaved) total)",
-            action: #selector(openStats),
-            keyEquivalent: ""
-        )
-        statsItem.target = self
-        menu.addItem(statsItem)
-
-        // Writing History & Learning
-        let historyItem = NSMenuItem(
-            title: "🧠 Writing History & Learned Vocabulary (\(LearningEngine.shared.historyRecords.count))...",
-            action: #selector(openHistory),
-            keyEquivalent: "h"
-        )
-        historyItem.target = self
-        menu.addItem(historyItem)
-
-        menu.addItem(NSMenuItem.separator())
+        // Playground
+        let playgroundItem = NSMenuItem(title: "Open Playground...", action: #selector(openPlayground), keyEquivalent: "p")
+        playgroundItem.target = self
+        menu.addItem(playgroundItem)
 
         // Settings
-        let prefsItem = NSMenuItem(title: "Settings & Personalization...", action: #selector(openAISettings), keyEquivalent: ",")
+        let prefsItem = NSMenuItem(title: "Settings...", action: #selector(openAISettings), keyEquivalent: ",")
         prefsItem.target = self
         menu.addItem(prefsItem)
-
-        // Permissions & Battery
-        let permItem = NSMenuItem(title: "Battery, RAM & Accessibility Setup...", action: #selector(openPermissions), keyEquivalent: "")
-        permItem.target = self
-        menu.addItem(permItem)
-
-        if LocalInferenceService.shared.isServerRunning {
-            let sleepItem = NSMenuItem(title: "💤 Unload Local Model from RAM", action: #selector(sleepLocalModel), keyEquivalent: "")
-            sleepItem.target = self
-            menu.addItem(sleepItem)
-        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -216,28 +159,6 @@ public final class MenuBarController: NSObject {
         rebuildMenu()
     }
 
-    @objc private func selectProvider(_ sender: NSMenuItem) {
-        if let provider = sender.representedObject as? AIProviderType {
-            AppSettings.shared.activeProvider = provider
-            AppSettings.shared.baseURL = provider.defaultBaseURL
-            AppSettings.shared.modelName = provider.defaultModel
-            rebuildMenu()
-        }
-    }
-
-    @objc private func selectStrength(_ sender: NSMenuItem) {
-        if let raw = sender.representedObject as? String,
-           let strength = PersonalizationStrength(rawValue: raw) {
-            AppSettings.shared.personalizationStrength = strength
-            rebuildMenu()
-        }
-    }
-
-    @objc private func sleepLocalModel() {
-        LocalInferenceService.shared.stopServer()
-        rebuildMenu()
-    }
-
     @objc public func openPlayground() {
         openSettings(tab: 0)
     }
@@ -246,16 +167,8 @@ public final class MenuBarController: NSObject {
         openSettings(tab: 1)
     }
 
-    @objc private func openHistory() {
-        openSettings(tab: 3)
-    }
-
     @objc private func openStats() {
-        openSettings(tab: 5)
-    }
-
-    @objc private func openPermissions() {
-        openSettings(tab: 6)
+        openSettings(tab: 4)
     }
 
     @objc public func openSettings(tab: Int = 0) {

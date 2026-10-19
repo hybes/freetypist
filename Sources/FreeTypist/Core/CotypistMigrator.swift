@@ -53,6 +53,7 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
     @Published public private(set) var detectedStatsWordsCount: Int = 0
     @Published public private(set) var lastMigrationReport: CotypistMigrationReport?
     @Published public private(set) var isMigrating: Bool = false
+    @Published public private(set) var hasCompletedInteractiveImport: Bool = false
 
     public var cotypistSupportDir: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -96,7 +97,12 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
     @discardableResult
     public func migrateAllFromCotypist(includeDatabaseKeychainUnlock: Bool = true) -> CotypistMigrationReport {
         isMigrating = true
-        defer { isMigrating = false }
+        defer {
+            isMigrating = false
+            if includeDatabaseKeychainUnlock {
+                hasCompletedInteractiveImport = true
+            }
+        }
 
         refreshDetection()
         var report = CotypistMigrationReport(foundInstallation: isCotypistInstalled)
@@ -108,7 +114,7 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
         let prefsImported = importCotypistPreferences()
         report.customInstructionsImported = prefsImported
 
-        // 3. Extract Writing History & App Overrides from cotypist.db (SQLCipher via GRDB + Keychain or fallback)
+        // 3. Extract Writing History & App Overrides from cotypist.db
         var migratedRecords: [WritingHistoryRecord] = []
         var importedRules: [AppRule] = []
         var decryptedOK = false
@@ -122,7 +128,6 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
             }
 
             if migratedRecords.isEmpty {
-                // Fallback: extract any unencrypted strings / WAL text snippets if Keychain wasn't unlocked
                 migratedRecords = extractReadableTextSnippetsFallback(from: cotypistSupportDir)
             }
         }
@@ -161,22 +166,24 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
             summaryParts.append("\(report.statsDaysImported) days of stats (\(report.totalWordsImported) words, \(report.totalCompletionsImported) completions)")
         }
         if report.writingRecordsImported > 0 {
-            summaryParts.append("\(report.writingRecordsImported) writing samples (\(report.learnedPhrasesExtracted) learned phrases, \(report.vocabularyWordsAdded) vocabulary terms)")
+            summaryParts.append("\(report.writingRecordsImported) writing samples (\(report.learnedPhrasesExtracted) phrases)")
         }
         if report.appRulesImported > 0 {
             summaryParts.append("\(report.appRulesImported) app rules")
         }
         if report.customInstructionsImported {
-            summaryParts.append("custom tone instructions")
+            summaryParts.append("custom style preferences")
         }
 
         if summaryParts.isEmpty {
-            report.statusMessage = "No new Cotypist records found to import (already up to date)."
+            report.statusMessage = "Cotypist profile & stats are already imported and active."
         } else {
-            report.statusMessage = "Imported " + summaryParts.joined(separator: ", ") + "."
+            report.statusMessage = "Successfully imported " + summaryParts.joined(separator: ", ") + "."
         }
 
-        self.lastMigrationReport = report
+        if includeDatabaseKeychainUnlock {
+            self.lastMigrationReport = report
+        }
         return report
     }
 

@@ -4,6 +4,15 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Ensure only one instance of FreeTypist runs at a time so older processes never duplicate menu bar icons or keyboard hooks
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        for runningApp in NSWorkspace.shared.runningApplications {
+            if runningApp.processIdentifier != myPID,
+               (runningApp.bundleIdentifier == "com.freetypist.app" || runningApp.localizedName == "FreeTypist") {
+                runningApp.terminate()
+            }
+        }
+
         // Run as a menu bar accessory application
         NSApp.setActivationPolicy(.accessory)
 
@@ -17,13 +26,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Start Deep Local Context Collector
         _ = DeepContextCollector.shared
 
-        // Auto-import Cotypist completion stats & preferences if installed
-        if CotypistMigrator.shared.isCotypistInstalled {
-            _ = CotypistMigrator.shared.migrateAllFromCotypist(includeDatabaseKeychainUnlock: false)
-        }
+        // Refresh Cotypist detection
+        CotypistMigrator.shared.refreshDetection()
 
-        // Scan local models and auto-boot (or auto-download) on-device Metal engine
-        LocalModelManager.shared.ensureDefaultModelReady()
+        // Scan local models and boot on-device Metal engine if a model is already downloaded
+        LocalModelManager.shared.scanLocalModels()
         if AppSettings.shared.activeProvider == .localEmbedded,
            let modelPath = LocalModelManager.shared.activeModelPath() {
             LocalInferenceService.shared.startServer(for: modelPath)
@@ -38,14 +45,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Start Keyboard Hook
         KeyboardHook.shared.start()
 
-        // If accessibility permission not yet granted, guide user
-        if !AccessibilityService.isAccessibilityGranted() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                MenuBarController.shared.openSettings()
-            }
+        // Open main window so user can immediately see Playground & Settings
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            MenuBarController.shared.openSettings(tab: 0)
         }
 
-        print("🚀 FreeTypist started.")
+        print("FreeTypist started.")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -70,7 +75,7 @@ struct FreeTypistAppMain {
             Options:
               --test-mock              Test offline predictive engine directly
               --test-ollama            Test local Ollama connection
-              --test-local-engine      Test on-device Metal engine with Gemma 4 / Qwen
+              --test-local-engine      Test on-device Metal engine
               --help, -h               Show this help message
             """)
             return
@@ -82,9 +87,9 @@ struct FreeTypistAppMain {
             let context = PromptContext(precedingText: "thank you for")
             do {
                 let (text, latency) = try await provider.complete(context: context, settings: settings)
-                print("✅ Mock Completion: '\(text)' (\(latency)ms)")
+                print("Mock Completion: '\(text)' (\(latency)ms)")
             } catch {
-                print("❌ Mock Error: \(error)")
+                print("Mock Error: \(error)")
             }
             return
         }
@@ -99,7 +104,8 @@ struct FreeTypistAppMain {
             if let activePath = LocalModelManager.shared.activeModelPath() {
                 print("Starting server for \(activePath)...")
                 LocalInferenceService.shared.startServer(for: activePath)
-                print("Server starting at \(LocalInferenceService.shared.baseURL)")
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                LocalInferenceService.shared.stopServer()
             }
             return
         }
@@ -107,8 +113,11 @@ struct FreeTypistAppMain {
         if args.contains("--test-ollama") {
             let provider = OllamaProvider()
             let settings = AppSettings.shared
-            if let res = try? await provider.testConnection(settings: settings) {
-                print("Ollama Connection Test: \(res.success ? "✅ SUCCESS" : "❌ FAILED") - \(res.message) (\(res.latencyMs)ms)")
+            do {
+                let res = try await provider.testConnection(settings: settings)
+                print("Ollama Connection Test: \(res.success ? "SUCCESS" : "FAILED") - \(res.message) (\(res.latencyMs)ms)")
+            } catch {
+                print("Ollama Error: \(error)")
             }
             return
         }

@@ -114,18 +114,22 @@ public final class CompletionEngine: ObservableObject {
                 self.currentSuggestion = CompletionItem(
                     fullText: slashMatch.expansion,
                     providerName: "Slash (\(slashMatch.trigger))",
-                    latencyMs: 0
+                    latencyMs: 0,
+                    replacementLength: slashMatch.replacementLength
                 )
                 self.lastRequestedText = precedingText
                 return
             } else {
                 self.activeSlashCommand = nil
+                if self.currentSuggestion?.providerName.hasPrefix("Slash") == true {
+                    self.currentSuggestion = nil
+                }
             }
         } else {
             self.activeSlashCommand = nil
         }
 
-        // 1. Check Emoji Shortcodes & Emoticons (Cotypist EmojiCompletionSupport)
+        // 1. Check Emoji Shortcodes & Emoticons
         let emojis = SmartWritingFeatures.matchEmoji(
             in: precedingText,
             enableShortcodes: settings.enableEmojiSuggestions,
@@ -140,13 +144,16 @@ public final class CompletionEngine: ObservableObject {
             self.currentSuggestion = CompletionItem(
                 fullText: topEmoji.emoji,
                 providerName: "Emoji (\(topEmoji.shortcode))",
-                latencyMs: 1
+                latencyMs: 1,
+                replacementLength: topEmoji.replacementLength
             )
             self.lastRequestedText = precedingText
             return
+        } else if self.currentSuggestion?.providerName.hasPrefix("Emoji") == true {
+            self.currentSuggestion = nil
         }
 
-        // 2. Check Inline Autocorrect (Cotypist ServedAutocorrectResolution)
+        // 2. Check Inline Autocorrect
         let appDisablesAutocorrect = settings.rule(for: bundleId)?.disableAutocorrect ?? false
         if !appDisablesAutocorrect && (settings.hideCompletionsOnSuspectedTypo || settings.showSuggestedTypoFixes) {
             if let typoFix = SmartWritingFeatures.detectAutocorrect(in: precedingText) {
@@ -156,8 +163,10 @@ public final class CompletionEngine: ObservableObject {
                     self.currentSuggestion = CompletionItem(
                         fullText: typoFix.correctedWord,
                         providerName: "Autocorrect",
-                        latencyMs: 1
+                        latencyMs: 1,
+                        replacementLength: typoFix.replacementLength
                     )
+                    self.lastRequestedText = precedingText
                 } else {
                     // Hold back completions when typo is suspected
                     dismiss()
@@ -165,9 +174,15 @@ public final class CompletionEngine: ObservableObject {
                 return
             } else {
                 self.activeAutocorrect = nil
+                if self.currentSuggestion?.providerName == "Autocorrect" {
+                    self.currentSuggestion = nil
+                }
             }
         } else {
             self.activeAutocorrect = nil
+            if self.currentSuggestion?.providerName == "Autocorrect" {
+                self.currentSuggestion = nil
+            }
         }
 
         let trimmed = precedingText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -177,7 +192,7 @@ public final class CompletionEngine: ObservableObject {
         }
 
         // 3. Optimization: If current suggestion starts with what user just typed, advance it inline in 0ms
-        if let current = currentSuggestion, !force {
+        if let current = currentSuggestion, current.replacementLength == 0, !force {
             if !lastRequestedText.isEmpty && precedingText.hasPrefix(lastRequestedText) {
                 let typedSuffix = String(precedingText.dropFirst(lastRequestedText.count))
                 if current.remainingText.hasPrefix(typedSuffix) {
@@ -188,7 +203,8 @@ public final class CompletionEngine: ObservableObject {
                         self.currentSuggestion = CompletionItem(
                             fullText: newRemaining,
                             providerName: current.providerName,
-                            latencyMs: 0
+                            latencyMs: 0,
+                            replacementLength: 0
                         )
                         self.lastRequestedText = precedingText
                     }
@@ -259,7 +275,8 @@ public final class CompletionEngine: ObservableObject {
                     self.currentSuggestion = CompletionItem(
                         fullText: cleaned,
                         providerName: self.settings.activeProvider.rawValue,
-                        latencyMs: latency
+                        latencyMs: latency,
+                        replacementLength: 0
                     )
                     self.stats.recordShown(latencyMs: latency, fromCache: latency <= 3)
 
@@ -307,20 +324,23 @@ public final class CompletionEngine: ObservableObject {
 
         guard let suggestion = currentSuggestion else { return nil }
         let textToInsert = suggestion.remainingText
+        let deleteCount = suggestion.replacementLength
         stats.recordAccepted(text: textToInsert, appName: lastAppName, source: suggestion.providerName)
-        learning.recordAcceptedCompletion(
-            precedingText: lastRequestedText,
-            acceptedText: textToInsert,
-            appName: lastAppName,
-            bundleId: lastBundleId,
-            domain: lastDomain,
-            windowTitle: lastWindowTitle
-        )
+        if deleteCount == 0 {
+            learning.recordAcceptedCompletion(
+                precedingText: lastRequestedText,
+                acceptedText: textToInsert,
+                appName: lastAppName,
+                bundleId: lastBundleId,
+                domain: lastDomain,
+                windowTitle: lastWindowTitle
+            )
+        }
         if settings.playSoundOnAccept {
             NSSound(named: "Tink")?.play()
         }
         dismiss()
-        return (textToInsert, 0)
+        return (textToInsert, deleteCount)
     }
 
     public func acceptNextWord() -> String? {

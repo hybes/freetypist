@@ -51,12 +51,6 @@ public struct ModelProviderFactory {
             return EmbeddedLocalProvider()
         case .ollama:
             return OllamaProvider()
-        case .lmStudio, .groq, .openAI, .deepseek, .custom:
-            return OpenAICompatibleProvider()
-        case .anthropic:
-            return AnthropicProvider()
-        case .gemini:
-            return GeminiProvider()
         case .mock:
             return MockProvider()
         }

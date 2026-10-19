@@ -4,14 +4,7 @@ import SwiftUI
 public enum AIProviderType: String, CaseIterable, Identifiable, Codable, Sendable {
     case localEmbedded = "On-Device Engine (Local Metal)"
     case ollama = "Ollama (Local)"
-    case lmStudio = "LM Studio / llama.cpp (Local)"
-    case groq = "Groq (Ultra-Fast Cloud)"
-    case openAI = "OpenAI"
-    case anthropic = "Anthropic Claude"
-    case gemini = "Google Gemini"
-    case deepseek = "DeepSeek"
-    case custom = "Custom OpenAI-Compatible"
-    case mock = "Smart Built-in Fallback (Offline)"
+    case mock = "Built-in Instant Predictor"
 
     public var id: String { rawValue }
 
@@ -19,13 +12,6 @@ public enum AIProviderType: String, CaseIterable, Identifiable, Codable, Sendabl
         switch self {
         case .localEmbedded: return "http://127.0.0.1:58855/v1"
         case .ollama: return "http://127.0.0.1:11434"
-        case .lmStudio: return "http://127.0.0.1:1234/v1"
-        case .groq: return "https://api.groq.com/openai/v1"
-        case .openAI: return "https://api.openai.com/v1"
-        case .anthropic: return "https://api.anthropic.com/v1"
-        case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
-        case .deepseek: return "https://api.deepseek.com/v1"
-        case .custom: return "http://127.0.0.1:8080/v1"
         case .mock: return ""
         }
     }
@@ -34,22 +20,12 @@ public enum AIProviderType: String, CaseIterable, Identifiable, Codable, Sendabl
         switch self {
         case .localEmbedded: return "default"
         case .ollama: return "qwen2.5:1.5b"
-        case .lmStudio: return "default"
-        case .groq: return "llama-3.3-70b-versatile"
-        case .openAI: return "gpt-4o-mini"
-        case .anthropic: return "claude-3-5-haiku-20241022"
-        case .gemini: return "gemini-2.0-flash"
-        case .deepseek: return "deepseek-chat"
-        case .custom: return "default"
         case .mock: return "offline-predictive"
         }
     }
 
     public var requiresAPIKey: Bool {
-        switch self {
-        case .localEmbedded, .ollama, .lmStudio, .mock: return false
-        default: return true
-        }
+        return false
     }
 }
 
@@ -332,16 +308,14 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         ]
 
         self.enableSlashCommands = defaults.object(forKey: "ft_enableSlashCommands") as? Bool ?? true
-        self.slashCommands = (defaults.dictionary(forKey: "ft_slashCommands") as? [String: String]) ?? [
+        self.slashCommands = (defaults.dictionary(forKey: "ft_slashCommands_v2") as? [String: String]) ?? [
             "/sig": "Best regards,\n\(NSFullUserName().isEmpty ? "Alex" : NSFullUserName())",
             "/followup": "Just following up on my previous message to see if you had any thoughts or questions.",
-            "/lgtm": "Looks good to me! Approved and ready to merge 🚀",
+            "/lgtm": "Looks good to me. Approved and ready to merge.",
             "/cal": "Feel free to grab any time on my calendar that works best for you.",
-            "/shrug": "¯\\_(ツ)_/¯",
             "/standup": "Yesterday: Completed core implementation & tests. Today: Polishing UI & benchmarks. Blockers: None.",
-            "/review": "Thanks for putting this together! I've reviewed the changes and left a few minor comments inline.",
-            "/meeting": "Let's sync briefly on this tomorrow afternoon to align on next steps.",
-            "/bug": "Steps to reproduce:\n1. \nExpected behavior:\nActual behavior:"
+            "/review": "Thanks for putting this together. I've reviewed the changes and left a few comments inline.",
+            "/meeting": "Let's sync briefly on this tomorrow afternoon to align on next steps."
         ]
 
         self.useClipboardContext = defaults.object(forKey: "ft_useClipboardContext") as? Bool ?? true
@@ -352,8 +326,8 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         self.includeSystemAndUserMetadata = defaults.object(forKey: "ft_includeSystemMetadata") as? Bool ?? true
         self.sanitizeSecretsLocally = defaults.object(forKey: "ft_sanitizeSecretsLocally") as? Bool ?? false
 
-        self.enableEmojiSuggestions = defaults.object(forKey: "ft_enableEmoji") as? Bool ?? true
-        self.suggestEmojiFromEmoticons = defaults.object(forKey: "ft_emojiEmoticons_v2") as? Bool ?? false
+        self.enableEmojiSuggestions = defaults.object(forKey: "ft_enableEmoji_v3") as? Bool ?? false
+        self.suggestEmojiFromEmoticons = defaults.object(forKey: "ft_emojiEmoticons_v3") as? Bool ?? false
         let skinRaw = defaults.string(forKey: "ft_emojiSkinTone") ?? EmojiSkinTone.neutral.rawValue
         self.preferredEmojiSkinTone = EmojiSkinTone(rawValue: skinRaw) ?? .neutral
         self.includeNeutralEmojiVariant = defaults.object(forKey: "ft_emojiNeutralVar") as? Bool ?? true
@@ -436,7 +410,7 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         defaults.set(personalDictionary, forKey: "ft_personalDictionary")
 
         defaults.set(enableSlashCommands, forKey: "ft_enableSlashCommands")
-        defaults.set(slashCommands, forKey: "ft_slashCommands")
+        defaults.set(slashCommands, forKey: "ft_slashCommands_v2")
 
         defaults.set(useClipboardContext, forKey: "ft_useClipboardContext")
         defaults.set(useWindowEnvironmentContext, forKey: "ft_useWindowContext")
@@ -446,8 +420,8 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         defaults.set(includeSystemAndUserMetadata, forKey: "ft_includeSystemMetadata")
         defaults.set(sanitizeSecretsLocally, forKey: "ft_sanitizeSecretsLocally")
 
-        defaults.set(enableEmojiSuggestions, forKey: "ft_enableEmoji")
-        defaults.set(suggestEmojiFromEmoticons, forKey: "ft_emojiEmoticons_v2")
+        defaults.set(enableEmojiSuggestions, forKey: "ft_enableEmoji_v3")
+        defaults.set(suggestEmojiFromEmoticons, forKey: "ft_emojiEmoticons_v3")
         defaults.set(preferredEmojiSkinTone.rawValue, forKey: "ft_emojiSkinTone")
         defaults.set(includeNeutralEmojiVariant, forKey: "ft_emojiNeutralVar")
         defaults.set(preferredEmojiGender.rawValue, forKey: "ft_emojiGender")
