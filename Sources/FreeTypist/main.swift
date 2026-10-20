@@ -133,6 +133,7 @@ struct FreeTypistAppMain {
                 let defaults = UserDefaults(suiteName: suite)!
                 let settings = AppSettings(defaults: defaults)
                 settings.personalizationStrength = .off
+                let tone = settings.effectiveTone(for: nil)
                 do {
                     for (prefix, expectedPrefix) in [
                         ("Thank you for ", ""),
@@ -148,7 +149,10 @@ struct FreeTypistAppMain {
                     ] {
                         let timing = DiagnosticPredictionTiming()
                         let result = try await EmbeddedLocalProvider(allowFallback: false).complete(
-                            context: PromptContext(precedingText: prefix, maxWords: 7), settings: settings) { _, ms in
+                            context: PromptContext(precedingText: prefix,
+                                personaDescription: settings.effectiveCustomInstructions(for: nil),
+                                toneInstruction: tone == .custom ? settings.customToneInstructions : tone.promptInstruction,
+                                maxWords: 7), settings: settings) { _, ms in
                                 await timing.record(ms)
                             }
                         guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,

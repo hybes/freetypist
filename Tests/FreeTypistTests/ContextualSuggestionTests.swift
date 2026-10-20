@@ -83,7 +83,9 @@ final class ContextualSuggestionTests: XCTestCase {
                        "The")
         let nextSentence = PromptContext(precedingText: "The code works.")
         XCTAssertEqual(PromptBuilder.completionMessages(context: nextSentence).last?["content"], "The code works.")
-        XCTAssertTrue(PromptBuilder.buildSystemPrompt(context: nextSentence).contains("next sentence"))
+        XCTAssertEqual(PromptBuilder.buildSystemPrompt(context: nextSentence),
+                       PromptBuilder.buildSystemPrompt(context: PromptContext(precedingText: "The code works")),
+                       "A sentence boundary must not invalidate the cached system instructions")
     }
 
     func testRegeneratingPartialWordsPreservesExactlyWhatTheWriterTyped() throws {

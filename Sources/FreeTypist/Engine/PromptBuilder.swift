@@ -82,9 +82,9 @@ public struct PromptBuilder {
 
     public static func buildSystemPrompt(context: PromptContext, includesDraft: Bool = false) -> String {
         var instructions: [String] = []
-        let task = startsNewSentence(context)
-            ? "Continue the draft with its next sentence."
-            : "Complete the unfinished draft with a brief, relevant continuation."
+        // Keep the system prefix stable across sentence boundaries so the
+        // server can reuse it instead of processing the whole prompt again.
+        let task = "Complete the unfinished draft with a brief, relevant continuation."
         let output = includesDraft
             ? "Return the draft with a few words added; no explanation."
             : "Return only the words to append; no explanation."
@@ -99,10 +99,6 @@ public struct PromptBuilder {
         }
 
         return instructions.joined(separator: "\n\n")
-    }
-
-    private static func startsNewSentence(_ context: PromptContext) -> Bool {
-        context.precedingText.trimmingCharacters(in: .whitespacesAndNewlines).last.map({ ".!?".contains($0) }) == true
     }
 
     public static func buildUserPrompt(context: PromptContext, continuationOnly: Bool = true) -> String {

@@ -236,7 +236,9 @@ public final class LocalInferenceService: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "messages": prompt.messages, "max_tokens": 1, "temperature": 0,
+            // One token only evaluates the prompt. Several tokens also warm
+            // the incremental decoder used by the first visible suggestion.
+            "messages": prompt.messages, "max_tokens": 4, "temperature": 0,
             "cache_prompt": true, "id_slot": 0, "stream": false,
             "reasoning_format": "none", "chat_template_kwargs": ["enable_thinking": false]
         ])
