@@ -15,9 +15,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.1</string>
+    <string>1.3.0</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>SUPublicEDKey</key>
     <string>wZBkayJXDKzXoGeP4JW8HVD7cI7W/2EwXOn2zeW6GUA=</string>
     <key>SUFeedURL</key>

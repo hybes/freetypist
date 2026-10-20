@@ -133,6 +133,7 @@ public struct SettingsView: View {
     private var generalTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                CotypistStatusView(showWhenInactive: true)
                 PermissionsView()
                 HStack {
                     Text("Run the guided setup to choose a local model and check typing.").font(.caption).foregroundColor(.secondary)

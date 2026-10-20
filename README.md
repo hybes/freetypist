@@ -55,6 +55,8 @@ First launch opens Setup: writing defaults, a local model download and real gene
 
 New installations select **Qwen 3.5 2B** on Macs with at least 16 GB RAM, or **Qwen 3.5 0.8B** on smaller Macs. The model is downloaded once and kept outside the app so updates do not download it again. Existing model choices are preserved. Emoji shortcuts default on; optional clipboard and surrounding-window collection default off. Existing preferences are preserved.
 
+FreeTypist detects Cotypist while it is running and offers **Quit Cotypist** in Setup and General. It requests a normal quit and reports a refusal or a pending dialog. To stop Cotypist reopening at login, disable its own **Launch automatically at login** option or use **Manage Login Items…** in General.
+
 Run `make test` for the regression suite. The tests use isolated settings and files. `FreeTypist --test-local-engine` waits for the selected model to load and checks a completion; it exits with an error if the engine cannot start.
 
 ## Downloads and updates
@@ -70,3 +72,25 @@ For each release:
 3. Run `node Scripts/publish_release.mjs dist/releases` with the existing authenticated MinIO `mc` alias `brth`. It reads every uploaded installer back to verify the checksum before activating the feed. Published versions cannot be overwritten with different contents.
 
 The signing key and notarisation credentials stay on the signing Mac. Run signing tools in its normal login session (for example Terminal on that Mac); an SSH security session may report a locked keychain even after it was unlocked in the GUI. The publisher needs Node 24+, `mc` and access to the existing bucket. Website changes use `cd website && npm ci && npm test && npm run deploy` with the existing Cloudflare login. To preview, use `npm run dev` in `website`.
+
+## Cotypist feature comparison
+
+Audit of the supplied Cotypist 2026.5 screenshots against FreeTypist's code on 20 October 2026. A saved preference alone does not count as a working feature. System-wide physical keyboard testing remains outstanding.
+
+| Area | FreeTypist status |
+| --- | --- |
+| Setup | Resumable wizard, real model test and live Accessibility/keyboard-hook checks. Cotypist conflict detection and normal quit request. macOS's built-in text-suggestion setting is not part of the wizard. |
+| Core typing | Inline suggestions, spelling fixes, typo suppression, mid-line completion and completion length are implemented and exposed. |
+| Model selection | Qwen 3.5 and older Qwen/Llama options. Hardware-based recommendation and verified downloads. Gemma is not yet offered or benchmarked against Qwen. |
+| Startup and appearance | Menu-bar app and word count. Launch-at-login is only a saved preference; hiding the menu icon and a separate floating accessory button are missing. |
+| Context | Clipboard and accessible window text are implemented, with a combined toggle. Separate controls, screenshot/OCR context and screenshot-based appearance matching are missing. |
+| Writing personalisation | Accepted-text learning, global writing instructions, app-specific instructions and searchable/deletable history. Background recording and personalisation strength are wired internally but lack controls. History is local JSON, **not app-encrypted**. |
+| Emoji | Shortcodes, emoticons and skin-tone control. Neutral variants are supported internally but lack a control; gender preference is stored without an implementation. The shortcode list is limited. |
+| Keyboard shortcuts | Fixed Tab/full, Option–Tab or backtick/word and Escape behaviour. Word spacing/punctuation and Escape policies exist internally. Shortcut recording, configurable bindings and system-wide force-completion/global-toggle shortcuts are missing. |
+| Battery | Shorter output and on-demand gating exist internally, but lack settings controls. Automatic smaller-model switching is not implemented. Manual engine sleep and idle sleep are implemented. |
+| Per-app settings | Exclusions, tone and custom instructions have controls. Per-app autocorrect, Tab, recording and mid-line restrictions are respected internally/imported but have no controls. Cotypist's per-option inherit/on/off selectors and compatibility mode are missing. |
+| Alternatives and synonyms | Basic local alternatives and dictionary synonyms; interactive choices in Playground. The system overlay can display synonym labels, but full system-wide numbered selection and model-based contextual synonyms are missing. |
+| Sync | No iCloud writing-history sync or end-to-end encrypted multi-Mac sync. |
+| Statistics | Local accepted-word/activity history, app breakdowns and date-range charts. No subscriptions, daily word cap or usage-reporting service. |
+
+Cotypist's [model guidance](https://cotypist.app/pricing) recommends a model the Mac can run smoothly, and its [press kit](https://cotypist.app/press) names Gemma 4 as its default. Google's [Gemma 4 overview](https://ai.google.dev/gemma/docs/core) describes E4B as an efficient on-device model with 4.5B effective parameters (8B total with embeddings). FreeTypist's Qwen 3.5 2B choice prioritises a smaller download and memory use; it is not a claim of better completion quality. A fair recommendation between the two needs the same writing prompts, latency measurements and acceptance-quality review on the target Mac.

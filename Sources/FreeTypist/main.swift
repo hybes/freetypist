@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Refresh Cotypist detection
         CotypistMigrator.shared.refreshDetection()
+        CotypistMonitor.shared.startMonitoring()
 
         // Scan local models and boot on-device Metal engine if a model is already downloaded
         LocalModelManager.shared.scanLocalModels()
@@ -58,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         KeyboardHook.shared.stop()
         PermissionManager.shared.stopMonitoring()
+        CotypistMonitor.shared.stopMonitoring()
         LocalInferenceService.shared.stopServer()
     }
 }

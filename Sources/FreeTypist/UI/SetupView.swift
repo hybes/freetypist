@@ -36,6 +36,7 @@ struct SetupView: View {
                 Spacer()
             }.padding(24)
             Divider()
+            CotypistStatusView(compact: true).padding(.horizontal, 24)
             Group {
                 switch setup.step {
                 case .welcome: welcome
