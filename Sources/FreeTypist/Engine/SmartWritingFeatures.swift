@@ -133,11 +133,14 @@ public struct SmartWritingFeatures: Sendable {
 
         guard enableShortcodes else { return [] }
         let lastToken = String(precedingText.suffix(24))
-        guard let colonIdx = lastToken.lastIndex(of: ":") else { return [] }
+        let searchToken = lastToken.hasSuffix(":") ? String(lastToken.dropLast()) : lastToken
+        guard let colonIdx = searchToken.lastIndex(of: ":") else { return [] }
 
-        let afterColon = String(lastToken[colonIdx...])
-        if colonIdx > lastToken.startIndex {
-            let beforeColonIdx = lastToken.index(before: colonIdx)
+        let offset = searchToken.distance(from: searchToken.startIndex, to: colonIdx)
+        let openingColon = lastToken.index(lastToken.startIndex, offsetBy: offset)
+        let afterColon = String(lastToken[openingColon...])
+        if openingColon > lastToken.startIndex {
+            let beforeColonIdx = lastToken.index(before: openingColon)
             let charBefore = lastToken[beforeColonIdx]
             if !charBefore.isWhitespace && charBefore != "(" && charBefore != "[" {
                 return []
@@ -145,9 +148,9 @@ public struct SmartWritingFeatures: Sendable {
         }
 
         // Require at least 3 chars after ':' (or closing ':') so normal colons never trigger
-        guard afterColon.count >= 4, !afterColon.contains(where: \.isWhitespace) else { return [] }
+        guard afterColon.count >= 2, !afterColon.contains(where: \.isWhitespace) else { return [] }
         let query = afterColon.trimmingCharacters(in: CharacterSet(charactersIn: ":")).lowercased()
-        guard query.count >= 3, query.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "+" }) else {
+        guard (afterColon.hasSuffix(":") ? !query.isEmpty : query.count >= 3), query.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "+" }) else {
             return []
         }
 
@@ -338,6 +341,7 @@ public struct SmartWritingFeatures: Sendable {
         let trimmed = hasTrailingSingleSpace ? String(precedingText.dropLast()) : precedingText
         let suffixSpace = hasTrailingSingleSpace ? " " : ""
 
+        guard trimmed.last?.isWhitespace != true else { return nil }
         let tokens = trimmed.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
         guard let lastWordSub = tokens.last else { return nil }
         let word = String(lastWordSub)
@@ -351,7 +355,7 @@ public struct SmartWritingFeatures: Sendable {
         if tokens.count >= 2 {
             let prevWord = String(tokens[tokens.count - 2]).lowercased()
             if prevWord == lower && ["the", "to", "a", "an", "is", "in", "on", "of", "for", "and", "we", "it", "be", "can", "will", "just"].contains(lower) {
-                let bothLen = prevWord.count + 1 + word.count + (hasTrailingSingleSpace ? 1 : 0)
+                let bothLen = trimmed.distance(from: tokens[tokens.count - 2].startIndex, to: trimmed.endIndex) + suffixSpace.count
                 return AutocorrectSuggestion(
                     misspelledWord: "\(tokens[tokens.count - 2]) \(word)",
                     correctedWord: String(tokens[tokens.count - 2]) + suffixSpace,
@@ -372,6 +376,7 @@ public struct SmartWritingFeatures: Sendable {
         // 1. Instant curated typo & contraction lookup
         if let fixed = fastCommonTypos[lower] {
             let casedFixed = fixed.contains("I'") ? fixed : preserveCase(original: word, replacement: fixed)
+            guard casedFixed != word else { return nil }
             return AutocorrectSuggestion(
                 misspelledWord: word,
                 correctedWord: casedFixed + suffixSpace,
@@ -579,20 +584,20 @@ public struct SmartWritingFeatures: Sendable {
                 candidates.append(shorter)
             }
         }
-        let fallbackPhrases = [
-            leadingSpace + "reaching out and sharing your thoughts.",
-            leadingSpace + "taking the time to review this today.",
-            leadingSpace + "following up on this with the team."
-        ]
-        for fb in fallbackPhrases where candidates.count < 3 {
-            if fb.trimmingCharacters(in: .whitespaces).lowercased() != cleanPrimary.lowercased() && !candidates.contains(fb) {
-                candidates.append(fb)
-            }
-        }
-
         return candidates.prefix(3).enumerated().map { idx, text in
             WordAlternativeItem(index: idx + 1, text: text, label: "Alt \(idx + 1)")
         }
+    }
+
+    public static func matchAbbreviation(in text: String, dictionary: [String: String])
+        -> (expansion: String, replacementLength: Int)? {
+        let trailingSpace = String(text.reversed().prefix(while: { $0.isWhitespace }).reversed())
+        let trimmed = text.dropLast(trailingSpace.count)
+        guard let token = trimmed.split(whereSeparator: \.isWhitespace).last,
+              let match = dictionary.sorted(by: { $0.key < $1.key }).first(where: {
+                  $0.key.caseInsensitiveCompare(String(token)) == .orderedSame
+              }), !match.value.isEmpty else { return nil }
+        return (match.value + trailingSpace, token.count + trailingSpace.count)
     }
 
     // MARK: - 5. Slash Commands & Snippets (/date, /time, /sig, /lgtm...)

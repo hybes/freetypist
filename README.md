@@ -9,10 +9,10 @@
 - **System-Wide Inline Ghost Text & Autocorrect**:
   - Real-time inline completions, typo corrections, contraction fixes (`dont` → `don't`, `im` → `I'm`), and `:shortcode` emoji expansions directly at your cursor across macOS apps.
 - **100% On-Device Metal Inference**:
-  - Automatically recommends and runs local `.gguf` models (`Qwen 2.5`, `Llama 3.2`, `Gemma 4`) on Apple Silicon Metal GPU, plus a zero-latency offline predictor fallback.
+  - Runs Qwen 3.5 0.8B, 2B and 4B GGUF models on Apple Silicon Metal GPU, with an instant offline predictor fallback. Older Qwen 2.5 and Llama 3.2 downloads remain available for compatibility.
 - **Constant Local Learning & Personalization**:
   - Continuously learns your vocabulary, phrases, and writing style per app.
-  - Includes a 1-click **Cotypist Migration** tool to import existing learned phrases, custom dictionary entries, and historical stats.
+  - Includes a 1-click **Cotypist Migration** tool to import readable writing history, style preferences, per-app rules and historical stats. Encrypted history requires the installed Cotypist framework and its database key in Keychain.
 - **Natural Keyboard Controls**:
   - `Tab`: Accept completion or inline correction.
   - `Option + Tab` (or `` ` ``): Accept next word.
@@ -23,6 +23,10 @@
 ---
 
 ## Quick Start
+
+Requires an Apple silicon Mac with macOS 14 or later and Swift 6 to build. App packaging downloads the official llama.cpp `b11669` engine, verifies its SHA-256 and bundles its libraries. The portable engine targets macOS 13.3; it avoids accidentally requiring the build machine's OS through Homebrew libraries. Set `LLAMA_SERVER_PATH` to override it with a compatible local build.
+
+Without the engine or a downloaded model, the built-in predictor, spelling corrections and snippets still work. Models download from Hugging Face; inference runs locally. The new Qwen 3.5 GGUFs are from [Unsloth](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF), based on [Qwen's models](https://huggingface.co/Qwen/Qwen3.5-0.8B).
 
 ```bash
 # 1. Build the macOS application bundle
@@ -36,3 +40,33 @@ make install
 ```
 
 On first launch, enable **Accessibility permissions** under **System Settings → Privacy & Security → Accessibility** so FreeTypist can provide inline completions across your macOS apps.
+
+Drag the app icon from the permission step into the Accessibility app list, then enable FreeTypist. The icon refers to the running app, so it adds the right copy. **Show in Finder** and the list's plus button are available if drag and drop is not accepted. If access still fails, remove the old entry and add this copy again, then reopen FreeTypist. Keep one installed copy at a stable path such as `/Applications/FreeTypist.app`.
+
+Local builds use ad-hoc signing by default. Each rebuilt executable has a different permission identity, so macOS may require you to add it again. To preserve the signing identity across builds, supply your existing Apple Development or Developer ID certificate:
+
+```bash
+SIGNING_IDENTITY="Apple Development: Your Name (TEAMID)" make app
+```
+
+Enable emoji shortcuts and emoticons in General settings. In the Playground, select a word to see synonyms; completions and replacements use the current cursor position. Analytics starts empty and records actual activity. Previously saved history and statistics are preserved.
+
+First launch opens Setup: writing defaults, a local model download and real generation test, Accessibility access, then a typing check. Reopen it from **Setup FreeTypist…** in the menu bar or General. It resumes after quitting, including a permission-recovery restart. Basic completions and Playground-only setup are explicit alternatives when a download or permission must wait.
+
+New installations select **Qwen 3.5 2B** on Macs with at least 16 GB RAM, or **Qwen 3.5 0.8B** on smaller Macs. The model is downloaded once and kept outside the app so updates do not download it again. Existing model choices are preserved. Emoji shortcuts default on; optional clipboard and surrounding-window collection default off. Existing preferences are preserved.
+
+Run `make test` for the regression suite. The tests use isolated settings and files. `FreeTypist --test-local-engine` waits for the selected model to load and checks a completion; it exits with an error if the engine cannot start.
+
+## Downloads and updates
+
+[type.cnnct.uk](https://type.cnnct.uk) serves the download page through Cloudflare Workers. Installers and Sparkle's signed update feed live in the existing MinIO store under `brth/connect-dorset/freetypist/releases`, separate from CNNCT Image. The app offers **Check for Updates…** in its menus and General settings. Sparkle asks about automatic checks; users can change the setting in General.
+
+One-time setup on the signing Mac: run Sparkle's `generate_keys --account com.freetypist.app` and copy its **public** key into `SUPublicEDKey` in `Scripts/Info.plist`. Keep the private key in Keychain. Development builds without a public key leave the updater disabled.
+
+For each release:
+
+1. Increase both version values in `Scripts/Info.plist`, run `make test` and `make app`.
+2. On the Mac with the Developer ID certificate, run `SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=your-existing-profile bash Scripts/release_app.sh`. `SPARKLE_TOOLS` can point to Sparkle's `bin` folder on that Mac. This signs, notarises and staples the app and DMG, creates a signed appcast and writes release checksums.
+3. Run `node Scripts/publish_release.mjs dist/releases` with the existing authenticated MinIO `mc` alias `brth`. It reads every uploaded installer back to verify the checksum before activating the feed. Published versions cannot be overwritten with different contents.
+
+The signing key and notarisation credentials stay on the signing Mac. Run signing tools in its normal login session (for example Terminal on that Mac); an SSH security session may report a locked keychain even after it was unlocked in the GUI. The publisher needs Node 24+, `mc` and access to the existing bucket. Website changes use `cd website && npm ci && npm test && npm run deploy` with the existing Cloudflare login. To preview, use `npm run dev` in `website`.

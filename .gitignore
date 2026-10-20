@@ -5,3 +5,6 @@ dist/
 *.xcuserdata
 *.xcworkspace
 DerivedData/
+node_modules/
+.wrangler/
+Scripts/__pycache__/

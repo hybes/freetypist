@@ -19,7 +19,10 @@ public final class CompletionLRUCache: @unchecked Sendable {
     public func get(forKey key: String) -> String? {
         lock.lock()
         defer { lock.unlock() }
-        return storage[key]
+        guard let value = storage[key] else { return nil }
+        order.removeAll { $0 == key }
+        order.append(key)
+        return value
     }
 
     public func set(_ value: String, forKey key: String) {
@@ -59,23 +62,39 @@ public struct ModelProviderFactory {
 
 // MARK: - On-Device Embedded Local Provider (Cotypist Replica Engine)
 public struct EmbeddedLocalProvider: ModelProvider {
-    public init() {}
+    private let allowFallback: Bool
+    public init(allowFallback: Bool = true) { self.allowFallback = allowFallback }
+
+    private func fallback(context: PromptContext, settings: AppSettings) async throws -> (text: String, latencyMs: Int) {
+        guard allowFallback else {
+            throw NSError(domain: "FreeTypist.LocalModel", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "The local model did not return a completion. Check that it is running, then retry."])
+        }
+        return try await MockProvider().complete(context: context, settings: settings)
+    }
 
     public func complete(context: PromptContext, settings: AppSettings) async throws -> (text: String, latencyMs: Int) {
-        let cacheKey = "\(settings.selectedTone.rawValue)|\(settings.completionLength.rawValue)|\(context.precedingText.suffix(120))"
-        if let cached = CompletionLRUCache.shared.get(forKey: cacheKey) {
-            return (cached, 1)
+        try Task.checkCancellation()
+        let modelIdentity = await MainActor.run {
+            LocalInferenceService.shared.currentLoadedModelPath ?? LocalModelManager.shared.selectedModel.id
         }
+        let onBattery = await MainActor.run { SystemResourceMonitor.shared.isOnBatteryPower }
+        let keyParts = [PromptBuilder.buildSystemPrompt(context: context), PromptBuilder.buildUserPrompt(context: context),
+                        modelIdentity, settings.selectedLoRAAdapterPath, String(settings.temperature), String(settings.topP),
+                        String(settings.topK), String(settings.repeatPenalty), settings.personalizationStrength.rawValue,
+                        String(onBattery && settings.batteryShorterCompletions)]
+        let cacheKey = String(decoding: try JSONEncoder().encode(keyParts), as: UTF8.self)
+        if allowFallback, let cached = CompletionLRUCache.shared.get(forKey: cacheKey) { return (cached, 1) }
 
         // Check if Constant Learning Booster has a strong personal phrase match
-        if settings.personalizationStrength == .strong,
+        if allowFallback, settings.personalizationStrength == .strong,
            let boosterMatch = LearningEngine.shared.predictFromLearnedHistory(
                precedingText: context.precedingText,
                strength: .strong
            ),
            !boosterMatch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            CompletionLRUCache.shared.set(boosterMatch, forKey: cacheKey)
-            return (boosterMatch, 2)
+            let cleaned = PromptBuilder.cleanCompletionText(boosterMatch, precedingText: context.precedingText, maxWords: context.maxWords)
+            return (cleaned, 2)
         }
 
         let serverReady = await MainActor.run {
@@ -84,24 +103,25 @@ public struct EmbeddedLocalProvider: ModelProvider {
         }
 
         if !serverReady {
-            let fallback = try await MockProvider().complete(context: context, settings: settings)
-            return fallback
+            return try await fallback(context: context, settings: settings)
         }
 
         let startTime = DispatchTime.now()
-        guard let url = URL(string: "http://127.0.0.1:58855/v1/chat/completions") else {
-            return try await MockProvider().complete(context: context, settings: settings)
+        let baseURL = await MainActor.run { LocalInferenceService.shared.baseURL }
+        guard let url = URL(string: baseURL + "/chat/completions") else {
+            return try await fallback(context: context, settings: settings)
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let token = await MainActor.run { LocalInferenceService.shared.authorizationToken }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 3.5
 
         let systemPrompt = PromptBuilder.buildSystemPrompt(context: context)
         let userPrompt = PromptBuilder.buildUserPrompt(context: context)
 
-        let onBattery = await MainActor.run { SystemResourceMonitor.shared.isOnBatteryPower }
         let effectiveMaxTokens: Int
         if onBattery && settings.batteryShorterCompletions {
             effectiveMaxTokens = min(14, settings.completionLength.maxTokens)
@@ -130,11 +150,12 @@ public struct EmbeddedLocalProvider: ModelProvider {
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             let (data, response) = try await URLSession.shared.data(for: request)
+            try Task.checkCancellation()
             let endTime = DispatchTime.now()
             let latencyMs = Int((endTime.uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
 
             guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
-                return try await MockProvider().complete(context: context, settings: settings)
+                return try await fallback(context: context, settings: settings)
             }
 
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -149,21 +170,24 @@ public struct EmbeddedLocalProvider: ModelProvider {
                 )
 
                 if !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    CompletionLRUCache.shared.set(cleaned, forKey: cacheKey)
+                    if allowFallback { CompletionLRUCache.shared.set(cleaned, forKey: cacheKey) }
                     return (cleaned, latencyMs)
                 }
             }
 
             // Never return an empty string; fall back to the fast local predictor
-            return try await MockProvider().complete(context: context, settings: settings)
+            return try await fallback(context: context, settings: settings)
         } catch {
-            return try await MockProvider().complete(context: context, settings: settings)
+            try Task.checkCancellation()
+            if !allowFallback { throw error }
+            return try await fallback(context: context, settings: settings)
         }
     }
 
     public func testConnection(settings: AppSettings) async throws -> (success: Bool, message: String, latencyMs: Int) {
         let startTime = DispatchTime.now()
-        guard let url = URL(string: "http://127.0.0.1:58855/health") else {
+        let port = await MainActor.run { LocalInferenceService.shared.serverPort }
+        guard let url = URL(string: "http://127.0.0.1:\(port)/health") else {
             return (false, "Invalid local URL", 0)
         }
 
@@ -181,7 +205,7 @@ public struct EmbeddedLocalProvider: ModelProvider {
                 return (false, "Local server returned status \((response as? HTTPURLResponse)?.statusCode ?? 0)", latencyMs)
             }
         } catch {
-            return (true, "Smart Local Predictor active (Metal LLM server standby)", 2)
+            return (false, "Metal engine is unavailable; the built-in predictor is available.", 0)
         }
     }
 }
@@ -192,7 +216,7 @@ public struct OllamaProvider: ModelProvider {
 
     public func complete(context: PromptContext, settings: AppSettings) async throws -> (text: String, latencyMs: Int) {
         let startTime = DispatchTime.now()
-        let baseURL = settings.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let baseURL = (settings.activeProvider == .ollama ? settings.baseURL : AIProviderType.ollama.defaultBaseURL).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(baseURL)/api/generate") else {
             throw URLError(.badURL)
         }
@@ -206,7 +230,7 @@ public struct OllamaProvider: ModelProvider {
         let userPrompt = PromptBuilder.buildUserPrompt(context: context)
 
         let body: [String: Any] = [
-            "model": settings.modelName.isEmpty ? "qwen2.5:1.5b" : settings.modelName,
+            "model": settings.activeProvider == .ollama && !settings.modelName.isEmpty ? settings.modelName : AIProviderType.ollama.defaultModel,
             "system": systemPrompt,
             "prompt": userPrompt,
             "stream": false,
@@ -240,7 +264,7 @@ public struct OllamaProvider: ModelProvider {
 
     public func testConnection(settings: AppSettings) async throws -> (success: Bool, message: String, latencyMs: Int) {
         let startTime = DispatchTime.now()
-        let baseURL = settings.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let baseURL = (settings.activeProvider == .ollama ? settings.baseURL : AIProviderType.ollama.defaultBaseURL).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(baseURL)/api/tags") else {
             return (false, "Invalid URL: \(baseURL)", 0)
         }
@@ -567,8 +591,9 @@ public struct MockProvider: ModelProvider {
     public init() {}
 
     public func complete(context: PromptContext, settings: AppSettings) async throws -> (text: String, latencyMs: Int) {
-        let text = OfflinePredictor().complete(context: context, tone: settings.selectedTone)
-        return (text, 3)
+        try Task.checkCancellation()
+        let text = OfflinePredictor().complete(context: context, tone: settings.effectiveTone(for: context.bundleIdentifier))
+        return (PromptBuilder.cleanCompletionText(text, precedingText: context.precedingText, maxWords: context.maxWords), 3)
     }
 
     public func testConnection(settings: AppSettings) async throws -> (success: Bool, message: String, latencyMs: Int) {

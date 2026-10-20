@@ -244,11 +244,13 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
     @Published public var appRules: [AppRule] { didSet { save() } }
 
     // Runtime Temporary Pause State
-    public var pausedUntilDate: Date?
-    public var pausedAppBundleId: String?
+    @Published public var pausedUntilDate: Date?
+    @Published public var pausedAppBundleId: String?
 
-    private init() {
-        let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = AppStorage.defaults) {
+        self.defaults = defaults
 
         self.isEnabled = defaults.object(forKey: "ft_isEnabled") as? Bool ?? true
         self.launchAtLogin = defaults.object(forKey: "ft_launchAtLogin") as? Bool ?? false
@@ -277,11 +279,11 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         self.apiKey = defaults.string(forKey: "ft_apiKey") ?? ""
         self.modelName = defaults.string(forKey: "ft_modelName") ?? provider.defaultModel
         self.maxTokens = defaults.object(forKey: "ft_maxTokens") as? Int ?? 24
-        self.temperature = defaults.object(forKey: "ft_temperature") as? Double ?? 0.25
+        self.temperature = defaults.object(forKey: "ft_temperature") as? Double ?? 0.1
         self.topP = defaults.object(forKey: "ft_topP") as? Double ?? 0.90
         self.topK = defaults.object(forKey: "ft_topK") as? Int ?? 40
         self.repeatPenalty = defaults.object(forKey: "ft_repeatPenalty") as? Double ?? 1.10
-        self.contextWindowSize = defaults.object(forKey: "ft_contextWindowSize") as? Int ?? 1024
+        self.contextWindowSize = defaults.object(forKey: "ft_contextWindowSize") as? Int ?? 4096
         self.gpuLayers = defaults.object(forKey: "ft_gpuLayers") as? Int ?? 99
         self.cpuThreads = defaults.object(forKey: "ft_cpuThreads") as? Int ?? 2
         self.kvCacheQuantization = defaults.string(forKey: "ft_kvCacheQuant") ?? "q8_0"
@@ -318,15 +320,15 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
             "/meeting": "Let's sync briefly on this tomorrow afternoon to align on next steps."
         ]
 
-        self.useClipboardContext = defaults.object(forKey: "ft_useClipboardContext") as? Bool ?? true
+        self.useClipboardContext = defaults.object(forKey: "ft_useClipboardContext") as? Bool ?? false
         self.useWindowEnvironmentContext = defaults.object(forKey: "ft_useWindowContext") as? Bool ?? true
-        self.readSurroundingWindowText = defaults.object(forKey: "ft_readSurroundingWindowText") as? Bool ?? true
-        self.trackCrossAppContext = defaults.object(forKey: "ft_trackCrossAppContext") as? Bool ?? true
-        self.trackMultiClipboardHistory = defaults.object(forKey: "ft_trackMultiClipboardHistory") as? Bool ?? true
-        self.includeSystemAndUserMetadata = defaults.object(forKey: "ft_includeSystemMetadata") as? Bool ?? true
+        self.readSurroundingWindowText = defaults.object(forKey: "ft_readSurroundingWindowText") as? Bool ?? false
+        self.trackCrossAppContext = defaults.object(forKey: "ft_trackCrossAppContext") as? Bool ?? false
+        self.trackMultiClipboardHistory = defaults.object(forKey: "ft_trackMultiClipboardHistory") as? Bool ?? false
+        self.includeSystemAndUserMetadata = defaults.object(forKey: "ft_includeSystemMetadata") as? Bool ?? false
         self.sanitizeSecretsLocally = defaults.object(forKey: "ft_sanitizeSecretsLocally") as? Bool ?? false
 
-        self.enableEmojiSuggestions = defaults.object(forKey: "ft_enableEmoji_v3") as? Bool ?? false
+        self.enableEmojiSuggestions = defaults.object(forKey: "ft_enableEmoji_v3") as? Bool ?? true
         self.suggestEmojiFromEmoticons = defaults.object(forKey: "ft_emojiEmoticons_v3") as? Bool ?? false
         let skinRaw = defaults.string(forKey: "ft_emojiSkinTone") ?? EmojiSkinTone.neutral.rawValue
         self.preferredEmojiSkinTone = EmojiSkinTone(rawValue: skinRaw) ?? .neutral
@@ -368,7 +370,6 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
     }
 
     public func save() {
-        let defaults = UserDefaults.standard
         defaults.set(isEnabled, forKey: "ft_isEnabled")
         defaults.set(launchAtLogin, forKey: "ft_launchAtLogin")
         defaults.set(showWordCountInMenuBar, forKey: "ft_showWordCountInMenuBar")

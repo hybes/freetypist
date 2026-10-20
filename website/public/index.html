@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="FreeTypist is a free typing assistant for Mac. Local suggestions, spelling fixes and emoji shortcuts, with your writing kept on your device.">
+  <meta name="theme-color" content="#f8f7f3">
+  <title>FreeTypist — a little less typing.</title>
+  <link rel="icon" href="/icon.png">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="wrap"><a class="brand" href="/" aria-label="FreeTypist home"><img src="/icon.png" width="36" height="36" alt="">FreeTypist</a><a href="https://github.com/hybes/freetypist">Source code <span aria-hidden="true">↗</span></a></header>
+  <main class="wrap">
+    <section class="intro" aria-labelledby="title">
+      <div>
+        <p class="eyebrow">A free typing assistant for Mac</p>
+        <h1 id="title">A little<br>less typing.</h1>
+        <p class="lead">FreeTypist suggests the next few words as you write. Press Tab to accept them, correct a misspelling or turn <code>:rocket:</code> into 🚀. Everything runs on your Mac.</p>
+        <a class="button" id="download" href="/download">Download for Mac <span aria-hidden="true">↓</span></a>
+        <p class="download-detail" id="release-status" aria-live="polite">Apple silicon · Checking the latest release…</p>
+        <noscript><p>Apple silicon. The download link serves the latest available release.</p></noscript>
+        <p class="small">Free to use. No account or subscription.</p>
+      </div>
+      <div class="example" aria-label="Illustration of FreeTypist suggestions">
+        <div class="example-heading"><span>While you’re writing</span><span class="example-label">Example</span></div>
+        <p class="example-line" aria-live="polite"><span id="example-typed">Thank you for </span><span class="caret" aria-hidden="true"></span><span class="ghost" id="example-ghost">your help with this.</span></p>
+        <div class="example-controls"><span id="example-hint">Accept a suggestion with Tab</span><button id="example-accept" type="button" aria-label="Accept the example suggestion">Tab <span aria-hidden="true">⇥</span></button></div>
+        <div class="example-tabs" aria-label="Choose an example"><button type="button" data-example="completion" aria-pressed="true">Complete</button><button type="button" data-example="spelling" aria-pressed="false">Correct</button><button type="button" data-example="emoji" aria-pressed="false">Emoji</button></div>
+      </div>
+    </section>
+    <section class="details" aria-labelledby="local-title">
+      <div><p class="eyebrow">Local by design</p><h2 id="local-title">Your words stay <br>on your Mac.</h2></div>
+      <div class="detail-copy"><p>Writing suggestions run on your device. Choose a Qwen 3.5 model in Settings, or use the built-in predictor, spelling fixes and shortcuts without downloading one.</p><p>Adjust the tone, add your own abbreviations and choose which apps FreeTypist works in. Its Playground lets you try suggestions before using them elsewhere.</p><p class="small">Model downloads and update checks need an internet connection. Optional clipboard and window context are processed locally. You control these in Settings.</p></div>
+    </section>
+<section class="setup" aria-labelledby="setup-title"><h2 id="setup-title">Up and typing.</h2><ol><li><strong>Install FreeTypist.</strong><span>Open the download and drag FreeTypist into Applications.</span></li><li><strong>Follow the setup wizard.</strong><span>Download and test the recommended local model, then allow Accessibility access for your installed copy.</span></li><li><strong>Try it in Playground.</strong><span>Press Tab for the full suggestion, Option–Tab for the next word, or Escape to dismiss it. New installations enable emoji shortcuts by default.</span></li></ol><p class="small">Future releases arrive through the app’s signed updater. Find “Check for Updates…” in the menu bar, or enable automatic checks in General.</p></section>
+  </main>
+  <footer class="wrap"><span>FreeTypist</span><div><a href="https://github.com/hybes/freetypist">GitHub</a><a href="https://github.com/hybes/freetypist/issues">Report an issue</a></div></footer>
+</body>
+</html>

@@ -7,29 +7,39 @@ public final class LocalModelManager: ObservableObject {
     public static let shared = LocalModelManager()
 
     @Published public var availableModels: [LocalModelInfo] = LocalModelInfo.catalog
-    @Published public var selectedModel: LocalModelInfo
+    @Published public var selectedModel: LocalModelInfo {
+        didSet {
+            userDefaults.set(selectedModel.id, forKey: "ft_selectedLocalModelID")
+            CompletionLRUCache.shared.clear()
+        }
+    }
     @Published public var downloadedModelPaths: [String: String] = [:]
     @Published public var isDownloading: Bool = false
     @Published public var downloadProgress: Double = 0.0
     @Published public var downloadStatusMessage: String = ""
+    @Published public private(set) var downloadError: String?
 
+    private let modelsDirectory: URL
+    private let userDefaults: UserDefaults
+    private let memoryGB: Int
+    private let sessionConfiguration: URLSessionConfiguration
     private var downloadTask: URLSessionDownloadTask?
     private var downloadSession: URLSession?
-    private var activeDownloadingModel: LocalModelInfo?
+    private var downloadID: UUID?
     private var downloadDelegate: InternalDownloadDelegate?
 
     public var recommendedModel: LocalModelInfo {
-        availableModels[0] // Qwen 2.5 1.5B (1.1 GB) is fast, light, and great for instant completions
+        LocalModelInfo.recommended(forMemoryGB: memoryGB, models: availableModels)
     }
 
     public var freeTypistModelsDirectory: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("FreeTypist/Models", isDirectory: true)
+        let dir = modelsDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
     public var cotypistModelsDirectory: URL? {
+        guard !AppStorage.isIsolated else { return nil }
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir = appSupport.appendingPathComponent("app.cotypist.Cotypist/Models", isDirectory: true)
         if FileManager.default.fileExists(atPath: dir.path) {
@@ -38,8 +48,17 @@ public final class LocalModelManager: ObservableObject {
         return nil
     }
 
-    private init() {
-        self.selectedModel = LocalModelInfo.catalog[0]
+    init(models: [LocalModelInfo] = LocalModelInfo.catalog, directory: URL? = nil,
+         sessionConfiguration: URLSessionConfiguration = .default, defaults: UserDefaults = AppStorage.defaults,
+         memoryGB: Int = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024 * 1024))) {
+        precondition(!models.isEmpty)
+        self.userDefaults = defaults
+        self.memoryGB = memoryGB
+        self.modelsDirectory = directory ?? AppStorage.directory.appendingPathComponent("Models", isDirectory: true)
+        self.sessionConfiguration = sessionConfiguration
+        self.availableModels = models
+        let savedID = defaults.string(forKey: "ft_selectedLocalModelID")
+        self.selectedModel = models.first { $0.id == savedID } ?? LocalModelInfo.recommended(forMemoryGB: memoryGB, models: models)
         scanLocalModels()
     }
 
@@ -57,7 +76,7 @@ public final class LocalModelManager: ObservableObject {
 
         let freeDir = freeTypistModelsDirectory
         if let files = try? fm.contentsOfDirectory(atPath: freeDir.path) {
-            for file in files where file.hasSuffix(".gguf") {
+            for file in files where file.lowercased().hasSuffix(".gguf") {
                 let fullPath = freeDir.appendingPathComponent(file).path
                 guard Self.isValidStandardGGUF(atPath: fullPath) else { continue }
                 for model in availableModels {
@@ -69,7 +88,7 @@ public final class LocalModelManager: ObservableObject {
         }
 
         if let coDir = cotypistModelsDirectory, let files = try? fm.contentsOfDirectory(atPath: coDir.path) {
-            for file in files where file.hasSuffix(".gguf") {
+            for file in files where file.lowercased().hasSuffix(".gguf") {
                 let fullPath = coDir.appendingPathComponent(file).path
                 guard Self.isValidStandardGGUF(atPath: fullPath) else { continue }
                 for model in availableModels {
@@ -82,11 +101,7 @@ public final class LocalModelManager: ObservableObject {
 
         self.downloadedModelPaths = found
 
-        if downloadedModelPaths[selectedModel.id] == nil,
-           let firstAvailableId = downloadedModelPaths.keys.first,
-           let model = availableModels.first(where: { $0.id == firstAvailableId }) {
-            self.selectedModel = model
-        }
+
     }
 
     public func isModelDownloaded(_ model: LocalModelInfo) -> Bool {
@@ -104,15 +119,17 @@ public final class LocalModelManager: ObservableObject {
 
     public func startDownload(model: LocalModelInfo) {
         // Cancel any previous download so clicking Download always responds immediately
-        downloadTask?.cancel()
-        downloadSession?.invalidateAndCancel()
+        cancelDownload()
+        downloadError = nil
 
         guard let url = URL(string: model.downloadURLString) else {
             self.downloadStatusMessage = "Invalid model URL."
+            self.downloadError = downloadStatusMessage
             return
         }
 
-        self.activeDownloadingModel = model
+        let id = UUID()
+        self.downloadID = id
         self.isDownloading = true
         self.downloadProgress = 0.02
         self.downloadStatusMessage = "Starting download of \(model.name) (\(model.sizeText))..."
@@ -121,7 +138,7 @@ public final class LocalModelManager: ObservableObject {
         let delegate = InternalDownloadDelegate(
             onProgress: { [weak self] written, total in
                 Task { @MainActor [weak self] in
-                    guard let self = self, self.isDownloading else { return }
+                    guard let self = self, self.downloadID == id else { return }
                     let effectiveTotal = total > 0 ? total : expectedBytes
                     let progress = min(max(Double(written) / Double(max(1, effectiveTotal)), 0.02), 0.99)
                     let mbDownloaded = Double(written) / (1024 * 1024)
@@ -143,14 +160,16 @@ public final class LocalModelManager: ObservableObject {
                 let movedTemp = (try? fm.moveItem(at: location, to: tempCopy)) != nil
 
                 Task { @MainActor [weak self] in
-                    guard let self = self, let model = self.activeDownloadingModel else { return }
                     defer { try? FileManager.default.removeItem(at: tempCopy) }
+                    guard let self = self, self.downloadID == id else { return }
+                    defer { self.finishDownloadSession() }
 
-                    if statusCode >= 400 {
+                    if !(200...299).contains(statusCode) {
                         self.isDownloading = false
                         self.downloadProgress = 0.0
                         self.downloadStatusMessage = "Download failed (HTTP \(statusCode)). Please try another model."
-                        self.activeDownloadingModel = nil
+                        self.downloadError = self.downloadStatusMessage
+                        self.downloadID = nil
                         return
                     }
 
@@ -158,45 +177,59 @@ public final class LocalModelManager: ObservableObject {
                         self.isDownloading = false
                         self.downloadProgress = 0.0
                         self.downloadStatusMessage = "Downloaded file was not a valid GGUF model."
-                        self.activeDownloadingModel = nil
+                        self.downloadError = self.downloadStatusMessage
+                        self.downloadID = nil
                         return
                     }
 
+                    let receivedBytes = (try? FileManager.default.attributesOfItem(atPath: tempCopy.path)[.size] as? NSNumber)?.int64Value ?? 0
+                    guard receivedBytes == model.expectedSizeBytes else {
+                        self.downloadProgress = 0
+                        self.downloadStatusMessage = "Downloaded model was incomplete (\(receivedBytes) of \(model.expectedSizeBytes) bytes). Please retry."
+                        self.downloadError = self.downloadStatusMessage
+                        return
+                    }
                     let targetURL = self.freeTypistModelsDirectory.appendingPathComponent(model.filename)
                     do {
                         if FileManager.default.fileExists(atPath: targetURL.path) {
-                            try FileManager.default.removeItem(at: targetURL)
+                            _ = try FileManager.default.replaceItemAt(targetURL, withItemAt: tempCopy)
+                        } else {
+                            try FileManager.default.moveItem(at: tempCopy, to: targetURL)
                         }
-                        try FileManager.default.moveItem(at: tempCopy, to: targetURL)
 
+                        self.selectedModel = model
                         self.scanLocalModels()
                         self.isDownloading = false
                         self.downloadProgress = 1.0
                         self.downloadStatusMessage = "\(model.name) downloaded and ready."
-                        self.activeDownloadingModel = nil
+                        self.downloadID = nil
 
-                        LocalInferenceService.shared.startServer(for: targetURL.path)
+                        if AppSettings.shared.activeProvider == .localEmbedded {
+                            LocalInferenceService.shared.startServer(for: targetURL.path)
+                        }
                     } catch {
                         self.isDownloading = false
                         self.downloadStatusMessage = "Error saving model: \(error.localizedDescription)"
+                        self.downloadError = self.downloadStatusMessage
                     }
                 }
             },
             onError: { [weak self] error in
                 Task { @MainActor [weak self] in
-                    guard let self = self else { return }
+                    guard let self = self, self.downloadID == id else { return }
                     if let err = error as NSError?, err.code != NSURLErrorCancelled {
                         self.isDownloading = false
                         self.downloadProgress = 0.0
                         self.downloadStatusMessage = "Download failed: \(err.localizedDescription)"
-                        self.activeDownloadingModel = nil
+                        self.downloadError = self.downloadStatusMessage
+                        self.finishDownloadSession()
                     }
                 }
             }
         )
 
         self.downloadDelegate = delegate
-        let config = URLSessionConfiguration.default
+        let config = sessionConfiguration.copy() as! URLSessionConfiguration
         config.timeoutIntervalForRequest = 30
         config.waitsForConnectivity = false
         let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
@@ -209,6 +242,15 @@ public final class LocalModelManager: ObservableObject {
         task.resume()
     }
 
+    private func finishDownloadSession() {
+        downloadSession?.finishTasksAndInvalidate()
+        downloadSession = nil
+        downloadTask = nil
+        downloadDelegate = nil
+        downloadID = nil
+        isDownloading = false
+    }
+
     public func cancelDownload() {
         downloadTask?.cancel()
         downloadSession?.invalidateAndCancel()
@@ -217,7 +259,8 @@ public final class LocalModelManager: ObservableObject {
         isDownloading = false
         downloadProgress = 0.0
         downloadStatusMessage = "Download cancelled."
-        activeDownloadingModel = nil
+        downloadError = nil
+        downloadID = nil
         downloadDelegate = nil
     }
 }

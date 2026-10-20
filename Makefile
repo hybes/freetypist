@@ -12,6 +12,7 @@ release:
 
 test:
 	CLANG_MODULE_CACHE_PATH=/tmp/clang-module-cache swift test -j 4 $(SWIFTPM_FLAGS)
+	node --test website/worker.test.mjs Scripts/publish_release.test.mjs
 
 app:
 	chmod +x Scripts/build_app.sh

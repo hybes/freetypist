@@ -62,10 +62,8 @@ public final class GhostOverlayPanel: NSPanel {
 
     public func updatePosition(caretScreenRect: CGRect, fontSize: CGFloat = 13.5) {
         guard caretScreenRect != .zero,
-              !caretScreenRect.origin.x.isNaN,
-              !caretScreenRect.origin.y.isNaN,
-              caretScreenRect.origin.x > 4,
-              caretScreenRect.origin.y > 4 else {
+              caretScreenRect.origin.x.isFinite,
+              caretScreenRect.origin.y.isFinite else {
             invalidateCaretPosition()
             return
         }
@@ -119,15 +117,13 @@ public final class GhostOverlayPanel: NSPanel {
         // Refresh cursor position from Accessibility
         if let caretInfo = AccessibilityService.shared.getCurrentCaretInfo(), caretInfo.hasValidCaretRect {
             updatePosition(caretScreenRect: caretInfo.screenRect, fontSize: caretInfo.estimatedFontSize)
-        } else if hasValidCaretPosition && lastCaretRect.origin.x > 4 && lastCaretRect.origin.y > 4 {
-            updatePosition(caretScreenRect: lastCaretRect, fontSize: detectedFontSize)
         } else {
             // Never display a floating modal at (0,0) bottom-left corner when cursor bounds are unavailable!
             hideOverlay()
             return
         }
 
-        guard hasValidCaretPosition, lastCaretRect.origin.x > 4, lastCaretRect.origin.y > 4 else {
+        guard hasValidCaretPosition else {
             hideOverlay()
             return
         }

@@ -3,12 +3,14 @@ import Combine
 import SwiftUI
 
 @MainActor
-public final class MenuBarController: NSObject {
+public final class MenuBarController: NSObject, NSMenuItemValidation {
     public static let shared = MenuBarController()
 
     private var statusItem: NSStatusItem!
     private var settingsWindow: NSWindow?
+    private var setupWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
+    private var pauseTimer: Timer?
 
     override private init() {
         super.init()
@@ -22,6 +24,7 @@ public final class MenuBarController: NSObject {
     }
 
     public func setup() {
+        setupApplicationMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         updateStatusButton()
@@ -50,6 +53,50 @@ public final class MenuBarController: NSObject {
                 self?.rebuildMenu()
             }
             .store(in: &cancellables)
+
+        AppSettings.shared.$pausedUntilDate
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusButton()
+                self?.rebuildMenu()
+            }
+            .store(in: &cancellables)
+        pauseTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            Task { @MainActor in
+                if let until = AppSettings.shared.pausedUntilDate, until <= Date() {
+                    AppSettings.shared.pausedUntilDate = nil
+                }
+            }
+        }
+    }
+
+    private func setupApplicationMenu() {
+        let menu = NSMenu()
+        let appItem = NSMenuItem(title: "FreeTypist", action: nil, keyEquivalent: "")
+        let appMenu = NSMenu(title: "FreeTypist")
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openAISettings), keyEquivalent: ",")
+        settings.target = self
+        appMenu.addItem(settings)
+        let setup = NSMenuItem(title: "Setup FreeTypist…", action: #selector(showSetup), keyEquivalent: "")
+        setup.target = self
+        appMenu.addItem(setup)
+        appMenu.addItem(updateMenuItem())
+        appMenu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit FreeTypist", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        appMenu.addItem(quit)
+        appItem.submenu = appMenu
+        menu.addItem(appItem)
+
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        let editMenu = NSMenu(title: "Edit")
+        for (title, action, key) in [("Undo", "undo:", "z"), ("Cut", "cut:", "x"),
+                                     ("Copy", "copy:", "c"), ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] {
+            editMenu.addItem(NSMenuItem(title: title, action: Selector(action), keyEquivalent: key))
+        }
+        editItem.submenu = editMenu
+        menu.addItem(editItem)
+        NSApp.mainMenu = menu
     }
 
     public func updateStatusButton() {
@@ -83,6 +130,10 @@ public final class MenuBarController: NSObject {
             statusTitle = "FreeTypist: Paused"
         } else if isTemporarilyPaused {
             statusTitle = "FreeTypist: Snoozed"
+        } else if PermissionManager.shared.readiness == .needsAccess {
+            statusTitle = "FreeTypist: Accessibility Access Needed"
+        } else if !PermissionManager.shared.isReady {
+            statusTitle = "FreeTypist: Keyboard Access Needed"
         } else if monitor.isSecureInputActive {
             statusTitle = "FreeTypist: Protected Field Active"
         } else {
@@ -131,6 +182,10 @@ public final class MenuBarController: NSObject {
         let prefsItem = NSMenuItem(title: "Settings...", action: #selector(openAISettings), keyEquivalent: ",")
         prefsItem.target = self
         menu.addItem(prefsItem)
+        let setupItem = NSMenuItem(title: "Setup FreeTypist…", action: #selector(showSetup), keyEquivalent: "")
+        setupItem.target = self
+        menu.addItem(setupItem)
+        menu.addItem(updateMenuItem())
 
         menu.addItem(NSMenuItem.separator())
 
@@ -140,6 +195,20 @@ public final class MenuBarController: NSObject {
         menu.addItem(quitItem)
 
         self.statusItem.menu = menu
+    }
+
+    private func updateMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    @objc private func checkForUpdates() {
+        AppUpdater.shared.checkForUpdates()
+    }
+
+    public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        menuItem.action != #selector(checkForUpdates) || AppUpdater.shared.canCheckForUpdates
     }
 
     @objc private func toggleEnabled() {
@@ -169,6 +238,25 @@ public final class MenuBarController: NSObject {
 
     @objc private func openStats() {
         openSettings(tab: 4)
+    }
+
+    @objc private func showSetup() { openSetup() }
+
+    public func openSetup() {
+        if setupWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 680),
+                                  styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            window.title = "Set up FreeTypist"
+            window.center()
+            window.isReleasedWhenClosed = false
+            setupWindow = window
+        }
+        setupWindow?.contentView = NSHostingView(rootView: SetupView(onFinish: { [weak self] in
+            self?.setupWindow?.close()
+            self?.openSettings(tab: 0)
+        }))
+        NSApp.activate(ignoringOtherApps: true)
+        setupWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc public func openSettings(tab: Int = 0) {

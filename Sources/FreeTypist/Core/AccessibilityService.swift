@@ -3,6 +3,8 @@ import ApplicationServices
 import Foundation
 
 public struct CaretInfo: Sendable {
+    public let elementHash: UInt
+    public let hasReadableText: Bool
     public let screenRect: CGRect
     public let hasValidCaretRect: Bool
     public let estimatedFontSize: CGFloat
@@ -24,10 +26,13 @@ public final class AccessibilityService: @unchecked Sendable {
     private init() {}
 
     public static func isAccessibilityGranted() -> Bool {
-        return AXIsProcessTrusted()
+        // A successful query for public AX metadata (such as the frontmost app)
+        // does not establish authorisation to read or edit another app's text.
+        return AXIsProcessTrustedWithOptions(nil)
     }
 
     public static func requestAccessibilityPermission() {
+        // The SDK exposes this key as a mutable C global, which is unavailable under Swift 6 concurrency.
         let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
     }
@@ -107,7 +112,8 @@ public final class AccessibilityService: @unchecked Sendable {
         // 1. Get entire text value
         var valueObj: AnyObject?
         _ = AXUIElementCopyAttributeValue(axElement, kAXValueAttribute as CFString, &valueObj)
-        let fullText = (valueObj as? String) ?? (valueObj as? NSAttributedString)?.string ?? ""
+        let readableText = (valueObj as? String) ?? (valueObj as? NSAttributedString)?.string
+        let fullText = readableText ?? ""
 
         // 2. Get selected text range (or cursor location)
         var rangeObj: AnyObject?
@@ -121,6 +127,7 @@ public final class AccessibilityService: @unchecked Sendable {
             selectedRange = CFRange(location: (fullText as NSString).length, length: 0)
         }
 
+        guard ["AXTextField", "AXTextArea", "AXComboBox"].contains(roleObj as? String ?? "") || rangeResult == .success else { return nil }
         let nsText = fullText as NSString
         let loc = max(0, min(selectedRange.location, nsText.length))
         let selLen = max(0, min(selectedRange.length, nsText.length - loc))
@@ -155,8 +162,10 @@ public final class AccessibilityService: @unchecked Sendable {
         }
 
         return CaretInfo(
+            elementHash: CFHash(axElement),
+            hasReadableText: readableText != nil,
             screenRect: convertedRect,
-            hasValidCaretRect: isValidCaret && convertedRect.origin.x > 4 && convertedRect.origin.y > 4,
+            hasValidCaretRect: isValidCaret && NSScreen.screens.contains { $0.frame.intersects(convertedRect) },
             estimatedFontSize: estimatedFontSize,
             precedingText: precedingText,
             followingText: followingText,
@@ -174,11 +183,15 @@ public final class AccessibilityService: @unchecked Sendable {
         precedingText: String,
         loc: Int
     ) -> (rect: CGRect, valid: Bool) {
+        if let rect = queryBoundsForRange(axElement: axElement, location: loc, length: 0),
+           Self.isPlausibleAXRect(rect) { return (rect, true) }
+
         // Strategy A: Bounds of the character immediately before the cursor (most accurate for inline placement!)
         if loc > 0 && loc <= nsText.length {
-            let prevChar = nsText.substring(with: NSRange(location: loc - 1, length: 1))
+            let previousRange = nsText.rangeOfComposedCharacterSequence(at: loc - 1)
+            let prevChar = nsText.substring(with: previousRange)
             if prevChar != "\n" && prevChar != "\r" {
-                if let prevRect = queryBoundsForRange(axElement: axElement, location: loc - 1, length: 1),
+                if let prevRect = queryBoundsForRange(axElement: axElement, location: previousRange.location, length: previousRange.length),
                    Self.isPlausibleAXRect(prevRect) {
                     let caretAtRightEdge = CGRect(
                         x: prevRect.origin.x + prevRect.width,
@@ -244,7 +257,7 @@ public final class AccessibilityService: @unchecked Sendable {
             AXValueGetValue(sObj as! AXValue, .cgSize, &size)
         }
 
-        if pos.x > 8 && pos.y > 8 && !pos.x.isNaN && !pos.y.isNaN && size.width > 24 && size.height > 12 {
+        if pos.x.isFinite && pos.y.isFinite && size.width > 24 && size.height > 12 {
             // Estimate character column and line inside the input field
             let lines = precedingText.components(separatedBy: .newlines)
             let currentLine = lines.last ?? ""
@@ -286,13 +299,13 @@ public final class AccessibilityService: @unchecked Sendable {
         return rect
     }
 
-    private static func isPlausibleAXRect(_ rect: CGRect) -> Bool {
-        guard !rect.origin.x.isNaN, !rect.origin.y.isNaN,
-              !rect.width.isNaN, !rect.height.isNaN else {
+    static func isPlausibleAXRect(_ rect: CGRect) -> Bool {
+        guard rect.origin.x.isFinite, rect.origin.y.isFinite,
+              rect.width.isFinite, rect.height.isFinite else {
             return false
         }
         // Reject (0,0) origin or zero-height rects
-        guard rect.origin.x > 4 && rect.origin.y > 4 && rect.height >= 8 && rect.height <= 120 else {
+        guard rect.width >= 0 && rect.height >= 8 && rect.height <= 120 else {
             return false
         }
         return true
@@ -311,7 +324,11 @@ public final class AccessibilityService: @unchecked Sendable {
     }
 
     public static let syntheticEventMarker: Int64 = 0x46545950
-    public private(set) var isPerformingSyntheticInsertion: Bool = false
+    private var inserting = false
+    public private(set) var isPerformingSyntheticInsertion: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return inserting }
+        set { lock.lock(); inserting = newValue; lock.unlock() }
+    }
     private let syntheticQueue = DispatchQueue(label: "com.freetypist.syntheticInput", qos: .userInteractive)
 
     public func insertText(_ text: String, deleteBackwardsCount: Int = 0) {
@@ -340,10 +357,14 @@ public final class AccessibilityService: @unchecked Sendable {
                 var selectedRange = CFRange(location: 0, length: 0)
                 AXValueGetValue(rObj as! AXValue, .cfRange, &selectedRange)
 
-                if deleteBackwardsCount > 0 && selectedRange.location >= deleteBackwardsCount {
+                let deletionUnits = beforeValue.map {
+                    TextEditingContext(text: $0, selection: NSRange(location: selectedRange.location, length: selectedRange.length))
+                        .precedingText.suffix(max(0, deleteBackwardsCount)).utf16.count
+                } ?? deleteBackwardsCount
+                if deleteBackwardsCount > 0 && selectedRange.location >= deletionUnits {
                     var replaceRange = CFRange(
-                        location: selectedRange.location - deleteBackwardsCount,
-                        length: deleteBackwardsCount
+                        location: selectedRange.location - deletionUnits,
+                        length: deletionUnits + selectedRange.length
                     )
                     if let axRange = AXValueCreate(.cfRange, &replaceRange) {
                         if AXUIElementSetAttributeValue(axElement, kAXSelectedTextRangeAttribute as CFString, axRange) == .success {
@@ -354,7 +375,7 @@ public final class AccessibilityService: @unchecked Sendable {
                                CFGetTypeID(vObj) == AXValueGetTypeID() {
                                 var verifiedRange = CFRange(location: 0, length: 0)
                                 AXValueGetValue(vObj as! AXValue, .cfRange, &verifiedRange)
-                                if verifiedRange.length == deleteBackwardsCount {
+                                if verifiedRange.location == replaceRange.location && verifiedRange.length == replaceRange.length {
                                     wordAlreadySelectedViaAX = true
                                 }
                             }
@@ -368,7 +389,7 @@ public final class AccessibilityService: @unchecked Sendable {
                         _ = AXUIElementCopyAttributeValue(axElement, kAXValueAttribute as CFString, &afterValObj)
                         let afterValue = (afterValObj as? String) ?? (afterValObj as? NSAttributedString)?.string
                         // Confirm the underlying text value actually changed
-                        if let beforeValue, let afterValue, afterValue != beforeValue {
+                        if beforeValue == nil || afterValue == nil || afterValue != beforeValue {
                             return
                         }
                     }
@@ -378,8 +399,10 @@ public final class AccessibilityService: @unchecked Sendable {
 
         // 2. Reliable Paced Keyboard Replacement (never mixes unmodified Backspaces with Cmd+V modifier flags)
         let backspacesToSend = wordAlreadySelectedViaAX ? 1 : deleteBackwardsCount
+        let targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         syntheticQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, let targetPID,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else { return }
             self.isPerformingSyntheticInsertion = true
             defer {
                 usleep(18_000)
@@ -397,17 +420,13 @@ public final class AccessibilityService: @unchecked Sendable {
                 usleep(20_000)
             }
 
-            self.postUnicodeString(text, source: source)
+            self.postUnicodeString(text, source: source, targetPID: targetPID)
         }
     }
 
-    private func postUnicodeString(_ text: String, source: CGEventSource?) {
+    private func postUnicodeString(_ text: String, source: CGEventSource?, targetPID: pid_t) {
         for char in text {
-            if char == "\n" || char == "\r" {
-                postKey(keyCode: 36, flags: [], source: source)
-                usleep(2_500)
-                continue
-            }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else { return }
             var utf16Units = Array(String(char).utf16)
             guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
                   let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {

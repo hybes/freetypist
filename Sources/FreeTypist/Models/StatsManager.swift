@@ -43,7 +43,7 @@ public struct DayStatsRecord: Identifiable, Codable, Equatable, Sendable {
         completionsShown: Int = 0,
         wordsSaved: Int = 0,
         charactersSaved: Int = 0,
-        avgLatencyMs: Int = 24,
+        avgLatencyMs: Int = 0,
         cacheHits: Int = 0
     ) {
         self.dateString = dateString
@@ -75,17 +75,14 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
         "150ms+": 0
     ]
 
-    private let userDefaults = UserDefaults.standard
+    private let userDefaults: UserDefaults
     private var lastDateString: String
 
-    private var statsFileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("FreeTypist", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("completionStats.json")
-    }
+    private let statsFileURL: URL
 
-    private init() {
+    init(userDefaults: UserDefaults = AppStorage.defaults, statsFileURL: URL? = nil) {
+        self.userDefaults = userDefaults
+        self.statsFileURL = statsFileURL ?? AppStorage.directory.appendingPathComponent("completionStats.json")
         let todayStr = StatsManager.currentDayString()
         self.lastDateString = userDefaults.string(forKey: "ft_stats_lastDate") ?? todayStr
 
@@ -114,11 +111,12 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
         }
 
         loadDailyHistory()
-        ensureRichHistoricalBaseline()
     }
 
     public static func currentDayString(for date: Date = Date()) -> String {
         let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: date)
     }
@@ -141,11 +139,10 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
 
         let today = Self.currentDayString()
         if let idx = dailyHistory.firstIndex(where: { $0.dateString == today }) {
+            let count = dailyHistory[idx].completionsShown
+            dailyHistory[idx].avgLatencyMs = (dailyHistory[idx].avgLatencyMs * count + max(0, latencyMs)) / (count + 1)
             dailyHistory[idx].completionsShown += 1
             if fromCache { dailyHistory[idx].cacheHits += 1 }
-            if latencyMs > 0 {
-                dailyHistory[idx].avgLatencyMs = (dailyHistory[idx].avgLatencyMs + latencyMs) / 2
-            }
         } else {
             dailyHistory.append(
                 DayStatsRecord(
@@ -154,7 +151,7 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
                     completionsShown: 1,
                     wordsSaved: 0,
                     charactersSaved: 0,
-                    avgLatencyMs: max(1, latencyMs),
+                    avgLatencyMs: max(0, latencyMs),
                     cacheHits: fromCache ? 1 : 0
                 )
             )
@@ -165,7 +162,8 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
 
     public func recordAccepted(text: String, appName: String = "App", source: String = "On-Device Engine") {
         checkDayRollover()
-        let words = max(1, text.split { $0.isWhitespace }.count)
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let words = text.split { $0.isWhitespace }.count
         let chars = text.count
 
         totalWordsSaved += words
@@ -186,10 +184,10 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
                 DayStatsRecord(
                     dateString: today,
                     completionsAccepted: 1,
-                    completionsShown: 1,
+                    completionsShown: 0,
                     wordsSaved: words,
                     charactersSaved: chars,
-                    avgLatencyMs: 22,
+                    avgLatencyMs: 0,
                     cacheHits: 0
                 )
             )
@@ -200,10 +198,10 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
 
     /// Always returns a continuous calendar series for the requested range so the bar chart never renders a single stretched bar.
     public func records(for range: StatsTimeRange) -> [DayStatsRecord] {
-        let count = min(range.daysCount, 30)
+        let count = range.daysCount
         let cal = Calendar.current
         let now = Date()
-        let byDate = Dictionary(uniqueKeysWithValues: dailyHistory.map { ($0.dateString, $0) })
+        let byDate = Dictionary(dailyHistory.map { ($0.dateString, $0) }, uniquingKeysWith: { _, last in last })
 
         var result: [DayStatsRecord] = []
         for offset in stride(from: count - 1, through: 0, by: -1) {
@@ -221,32 +219,29 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
 
     public var dailyAverageWords: Int {
         let activeDays = dailyHistory.filter { $0.wordsSaved > 0 }
-        guard !activeDays.isEmpty else { return max(1, todayWordsSaved) }
+        guard !activeDays.isEmpty else { return todayWordsSaved }
         let sum = activeDays.reduce(0) { $0 + $1.wordsSaved }
         return sum / activeDays.count
     }
 
     public var currentStreakDays: Int {
-        let sorted = dailyHistory.sorted { $0.dateString > $1.dateString }
-        var streak = 0
-        for rec in sorted {
-            if rec.wordsSaved > 0 {
-                streak += 1
-            } else {
-                break
-            }
+        let byDate = Dictionary(dailyHistory.map { ($0.dateString, $0.wordsSaved) }, uniquingKeysWith: max)
+        let calendar = Calendar.current
+        var day = calendar.startOfDay(for: Date())
+        if (byDate[Self.currentDayString(for: day)] ?? 0) == 0 {
+            day = calendar.date(byAdding: .day, value: -1, to: day)!
         }
-        return max(1, streak)
-    }
-
-    public var estimatedWPMBoost: Int {
-        let avg = dailyAverageWords
-        return min(65, max(18, 22 + (avg / 25)))
+        var streak = 0
+        while (byDate[Self.currentDayString(for: day)] ?? 0) > 0 {
+            streak += 1
+            day = calendar.date(byAdding: .day, value: -1, to: day)!
+        }
+        return streak
     }
 
     public var acceptanceRatePercentage: Int {
-        guard totalCompletionsShown > 0 else { return 68 }
-        return min(100, Int((Double(totalCompletionsAccepted) / Double(max(totalCompletionsAccepted, totalCompletionsShown))) * 100.0))
+        guard totalCompletionsShown > 0 else { return 0 }
+        return min(100, Int(Double(totalCompletionsAccepted) / Double(totalCompletionsShown) * 100))
     }
 
     public var estimatedTimeSavedMinutes: Double {
@@ -313,153 +308,62 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func ensureRichHistoricalBaseline() {
-        // Backfill 30 days of historical activity if fewer than 14 days exist so charts are always rich and multi-bar
-        guard dailyHistory.count < 14 else { return }
-
-        let cal = Calendar.current
-        let now = Date()
-        let sampleWords = [
-            142, 198, 165, 240, 212, 118, 95,
-            210, 265, 288, 194, 312, 155, 110,
-            234, 276, 305, 248, 290, 140, 88,
-            185, 232, 260, 318, 275, 164, 128,
-            245, 192
-        ]
-
-        var byDate = Dictionary(uniqueKeysWithValues: dailyHistory.map { ($0.dateString, $0) })
-
-        for i in 0..<30 {
-            let offset = -(29 - i)
-            guard let date = cal.date(byAdding: .day, value: offset, to: now) else { continue }
-            let dStr = Self.currentDayString(for: date)
-            if byDate[dStr] == nil || (byDate[dStr]?.wordsSaved ?? 0) == 0 {
-                let words = sampleWords[i % sampleWords.count]
-                let comps = max(6, words / 6)
-                let shown = comps + (i % 5) + 3
-                let chars = words * 5 + (i * 4)
-                byDate[dStr] = DayStatsRecord(
-                    dateString: dStr,
-                    completionsAccepted: comps,
-                    completionsShown: shown,
-                    wordsSaved: words,
-                    charactersSaved: chars,
-                    avgLatencyMs: 14 + (i % 14),
-                    cacheHits: comps / 3
-                )
-            }
-        }
-
-        self.dailyHistory = byDate.values.sorted { $0.dateString < $1.dateString }
-
-        let sumWords = self.dailyHistory.reduce(0) { $0 + $1.wordsSaved }
-        let sumChars = self.dailyHistory.reduce(0) { $0 + $1.charactersSaved }
-        let sumAccepted = self.dailyHistory.reduce(0) { $0 + $1.completionsAccepted }
-        let sumShown = self.dailyHistory.reduce(0) { $0 + $1.completionsShown }
-
-        if self.totalWordsSaved < sumWords { self.totalWordsSaved = sumWords }
-        if self.totalCharactersSaved < sumChars { self.totalCharactersSaved = sumChars }
-        if self.totalCompletionsAccepted < sumAccepted { self.totalCompletionsAccepted = sumAccepted }
-        if self.totalCompletionsShown < sumShown { self.totalCompletionsShown = sumShown }
-
-        if let todayRec = self.dailyHistory.last {
-            if self.todayWordsSaved < todayRec.wordsSaved { self.todayWordsSaved = todayRec.wordsSaved }
-            if self.todayCompletionsAccepted < todayRec.completionsAccepted { self.todayCompletionsAccepted = todayRec.completionsAccepted }
-        }
-
-        let defaultApps: [String: Int] = [
-            "Slack": 1840,
-            "Apple Mail": 1520,
-            "Cursor / Xcode": 1290,
-            "Apple Notes": 940,
-            "Safari": 680,
-            "FreeTypist Playground": 490
-        ]
-        for (app, count) in defaultApps {
-            if (self.appWordsBreakdown[app] ?? 0) < count {
-                self.appWordsBreakdown[app] = count
-            }
-        }
-
-        let defaultSources: [String: Int] = [
-            "On-Device Engine (Local Metal)": 3420,
-            "Constant Learning N-Gram Booster": 1890,
-            "Deep Window & Cross-App Context": 840,
-            "Autocorrect & Emoji": 390,
-            "Slash Snippets": 220
-        ]
-        for (src, count) in defaultSources {
-            if (self.sourceBreakdown[src] ?? 0) < count {
-                self.sourceBreakdown[src] = count
-            }
-        }
-
-        if (self.latencyBuckets["15–50ms (Metal)"] ?? 0) == 0 {
-            self.latencyBuckets = [
-                "<15ms (Instant)": 540,
-                "15–50ms (Metal)": 620,
-                "50–150ms": 95,
-                "150ms+": 12
-            ]
-        }
-
-        saveDailyHistory()
-        save()
-    }
-
     public func importCotypistStats(
         dailyRecords: [DayStatsRecord],
         appBreakdown: [String: Int] = [:]
     ) -> (daysImported: Int, wordsImported: Int, completionsImported: Int) {
-        var byDate = Dictionary(uniqueKeysWithValues: dailyHistory.map { ($0.dateString, $0) })
+        var byDate = Dictionary(dailyHistory.map { ($0.dateString, $0) }, uniquingKeysWith: { _, last in last })
+        var imported = (userDefaults.data(forKey: "ft_cotypistImportedStats").flatMap {
+            try? JSONDecoder().decode([String: DayStatsRecord].self, from: $0)
+        }) ?? [:]
         var daysAdded = 0
         var wordsAdded = 0
         var compsAdded = 0
+        var charsAdded = 0
+        var shownAdded = 0
 
         for rec in dailyRecords {
-            guard rec.wordsSaved > 0 || rec.completionsAccepted > 0 else { continue }
+            let old = imported[rec.dateString] ?? DayStatsRecord(dateString: rec.dateString)
+            let words = max(0, rec.wordsSaved - old.wordsSaved)
+            let comps = max(0, rec.completionsAccepted - old.completionsAccepted)
+            let chars = max(0, rec.charactersSaved - old.charactersSaved)
+            let shown = max(0, rec.completionsShown - old.completionsShown)
+            guard words > 0 || comps > 0 || chars > 0 || shown > 0 else { continue }
+            var day = byDate[rec.dateString] ?? DayStatsRecord(dateString: rec.dateString)
+            day.wordsSaved += words
+            day.completionsAccepted += comps
+            day.charactersSaved += chars
+            day.completionsShown += shown
+            byDate[rec.dateString] = day
+            imported[rec.dateString] = DayStatsRecord(
+                dateString: rec.dateString,
+                completionsAccepted: max(old.completionsAccepted, rec.completionsAccepted),
+                completionsShown: max(old.completionsShown, rec.completionsShown),
+                wordsSaved: max(old.wordsSaved, rec.wordsSaved),
+                charactersSaved: max(old.charactersSaved, rec.charactersSaved)
+            )
             daysAdded += 1
-            wordsAdded += rec.wordsSaved
-            compsAdded += rec.completionsAccepted
-
-            if let existing = byDate[rec.dateString] {
-                byDate[rec.dateString] = DayStatsRecord(
-                    dateString: rec.dateString,
-                    completionsAccepted: max(existing.completionsAccepted, rec.completionsAccepted),
-                    completionsShown: max(existing.completionsShown, rec.completionsShown),
-                    wordsSaved: max(existing.wordsSaved, rec.wordsSaved),
-                    charactersSaved: max(existing.charactersSaved, rec.charactersSaved),
-                    avgLatencyMs: existing.avgLatencyMs,
-                    cacheHits: max(existing.cacheHits, rec.cacheHits)
-                )
-            } else {
-                byDate[rec.dateString] = rec
-            }
+            wordsAdded += words
+            compsAdded += comps
+            charsAdded += chars
+            shownAdded += shown
         }
-
         for (app, words) in appBreakdown where words > 0 {
             appWordsBreakdown[app] = max(appWordsBreakdown[app] ?? 0, words)
         }
-
-        self.dailyHistory = byDate.values.sorted { $0.dateString < $1.dateString }
-
-        let sumWords = self.dailyHistory.reduce(0) { $0 + $1.wordsSaved }
-        let sumChars = self.dailyHistory.reduce(0) { $0 + $1.charactersSaved }
-        let sumAccepted = self.dailyHistory.reduce(0) { $0 + $1.completionsAccepted }
-        let sumShown = self.dailyHistory.reduce(0) { $0 + $1.completionsShown }
-
-        self.totalWordsSaved = max(self.totalWordsSaved + wordsAdded, sumWords)
-        self.totalCharactersSaved = max(self.totalCharactersSaved, sumChars)
-        self.totalCompletionsAccepted = max(self.totalCompletionsAccepted + compsAdded, sumAccepted)
-        self.totalCompletionsShown = max(self.totalCompletionsShown + compsAdded, sumShown)
-
-        let todayStr = Self.currentDayString()
-        if let todayRec = byDate[todayStr] {
-            self.todayWordsSaved = max(self.todayWordsSaved, todayRec.wordsSaved)
-            self.todayCompletionsAccepted = max(self.todayCompletionsAccepted, todayRec.completionsAccepted)
+        dailyHistory = byDate.values.sorted { $0.dateString < $1.dateString }
+        totalWordsSaved += wordsAdded
+        totalCharactersSaved += charsAdded
+        totalCompletionsAccepted += compsAdded
+        totalCompletionsShown += shownAdded
+        if let today = byDate[Self.currentDayString()] {
+            todayWordsSaved = today.wordsSaved
+            todayCompletionsAccepted = today.completionsAccepted
         }
-
-        sourceBreakdown["Migrated from Cotypist", default: 0] += max(wordsAdded, compsAdded * 3)
+        sourceBreakdown["Migrated from Cotypist", default: 0] += wordsAdded
+        if let data = try? JSONEncoder().encode(imported) {
+            userDefaults.set(data, forKey: "ft_cotypistImportedStats")
+        }
         saveDailyHistory()
         save()
         return (daysAdded, wordsAdded, compsAdded)
@@ -481,6 +385,7 @@ public final class StatsManager: ObservableObject, @unchecked Sendable {
             "50–150ms": 0,
             "150ms+": 0
         ]
+        userDefaults.removeObject(forKey: "ft_cotypistImportedStats")
         try? FileManager.default.removeItem(at: statsFileURL)
         save()
     }

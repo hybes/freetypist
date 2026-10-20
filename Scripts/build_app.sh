@@ -7,6 +7,7 @@ export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-/tmp/clang-module-cac
 SCRATCH_PATH="${SCRATCH_PATH:-/tmp/freetypist-build}"
 
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
+SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
 if [ "$1" = "--debug" ]; then
     BUILD_CONFIG="debug"
 fi
@@ -42,53 +43,23 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp -X "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp -X "Scripts/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
-# Bundle llama-server into app bundle only if missing or updated (saves ~30MB copy & codesign CPU)
-LLAMA_BIN=""
-if [ -f "/opt/homebrew/bin/llama-server" ]; then
-    LLAMA_BIN="/opt/homebrew/bin/llama-server"
-elif [ -f "/usr/local/bin/llama-server" ]; then
-    LLAMA_BIN="/usr/local/bin/llama-server"
-fi
+# Use a pinned portable engine; local Homebrew builds may require the build Mac's OS.
+LLAMA_BIN="${LLAMA_SERVER_PATH:-$(bash Scripts/fetch_engine.sh)}"
+rm -rf "$APP_BUNDLE/Contents/lib" "$APP_BUNDLE/Contents/Frameworks"
+python3 Scripts/bundle_llama.py "$LLAMA_BIN" "$APP_BUNDLE"
 
-NEED_DEEP_SIGN=0
-if [ -n "$LLAMA_BIN" ]; then
-    BUNDLED_LLAMA="$APP_BUNDLE/Contents/MacOS/llama-server"
-    if [ ! -f "$BUNDLED_LLAMA" ] || [ "$LLAMA_BIN" -nt "$BUNDLED_LLAMA" ]; then
-        echo "📦 Updating embedded llama-server engine in $APP_NAME.app..."
-        rm -f "$BUNDLED_LLAMA"
-        cp -X -L "$LLAMA_BIN" "$BUNDLED_LLAMA"
-        chmod +x "$BUNDLED_LLAMA"
-        NEED_DEEP_SIGN=1
-    fi
-
-    # llama-server is a stub that loads @rpath dylibs from ../lib
-    LLAMA_LIB=""
-    if [ -d "/opt/homebrew/opt/llama.cpp/lib" ]; then
-        LLAMA_LIB="/opt/homebrew/opt/llama.cpp/lib"
-    else
-        RESOLVED_BIN="$(python3 -c "import os; print(os.path.realpath('$LLAMA_BIN'))" 2>/dev/null || true)"
-        if [ -n "$RESOLVED_BIN" ]; then
-            CANDIDATE="$(dirname "$RESOLVED_BIN")/../lib"
-            if [ -d "$CANDIDATE" ]; then
-                LLAMA_LIB="$CANDIDATE"
-            fi
-        fi
-    fi
-
-    if [ -n "$LLAMA_LIB" ]; then
-        mkdir -p "$APP_BUNDLE/Contents/lib"
-        for lib in libllama-server-impl.dylib libllama-common.0.dylib libllama.0.dylib libmtmd.0.dylib libggml.0.dylib libggml-base.0.dylib libggml-cpu.0.dylib libggml-metal.0.dylib libggml-blas.0.dylib; do
-            if [ -f "$LLAMA_LIB/$lib" ]; then
-                DEST_LIB="$APP_BUNDLE/Contents/lib/$lib"
-                if [ ! -f "$DEST_LIB" ] || [ "$LLAMA_LIB/$lib" -nt "$DEST_LIB" ]; then
-                    rm -f "$DEST_LIB"
-                    cp -X -L "$LLAMA_LIB/$lib" "$DEST_LIB"
-                    chmod u+w "$DEST_LIB" 2>/dev/null || true
-                    NEED_DEEP_SIGN=1
-                fi
-            fi
-        done
-    fi
+# SwiftPM links binary frameworks but our manual .app packager must embed them.
+SPARKLE_ROOT="$SCRATCH_PATH/artifacts/sparkle/Sparkle"
+mkdir -p "$APP_BUNDLE/Contents/Frameworks"
+ditto "$SPARKLE_ROOT/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework" \
+    "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+mkdir -p "$APP_BUNDLE/Contents/Resources/Licenses"
+rm -f "$APP_BUNDLE/Contents/Resources/Licenses/Sparkle.txt" "$APP_BUNDLE/Contents/Resources/Licenses/llama.cpp.txt"
+cp -X "$SCRATCH_PATH/checkouts/Sparkle/LICENSE" "$APP_BUNDLE/Contents/Resources/Licenses/Sparkle.txt"
+if [ -f "$(dirname "$LLAMA_BIN")/LICENSE" ]; then
+    cp -X "$(dirname "$LLAMA_BIN")/LICENSE" "$APP_BUNDLE/Contents/Resources/Licenses/llama.cpp.txt"
+else
+    cp -X Resources/Licenses/llama.cpp.txt "$APP_BUNDLE/Contents/Resources/Licenses/llama.cpp.txt"
 fi
 
 # Generate App Icon if present
@@ -100,12 +71,13 @@ fi
 
 echo "🔐 Codesigning application bundle..."
 strip_disallowed_xattrs "$APP_BUNDLE"
-if [ "$NEED_DEEP_SIGN" -eq 1 ]; then
-    codesign --force --deep --sign - "$APP_BUNDLE"
-else
-    # Fast incremental sign of just the updated main executable + bundle wrapper
-    codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-    codesign --force --sign - "$APP_BUNDLE"
+SIGNING_IDENTITY="$SIGNING_IDENTITY" bash Scripts/sign_app.sh "$APP_BUNDLE"
+if [ -f "$APP_BUNDLE/Contents/MacOS/llama-server" ]; then
+    "$APP_BUNDLE/Contents/MacOS/llama-server" --version
+fi
+if [ "$SIGNING_IDENTITY" = "-" ]; then
+    echo "Accessibility: this build is ad-hoc signed. Re-add this app in System Settings after rebuilding if permission stops working."
+    echo "Set SIGNING_IDENTITY to your Apple Development or Developer ID certificate to keep a stable signing identity."
 fi
 
 echo "✅ Successfully built $APP_BUNDLE"

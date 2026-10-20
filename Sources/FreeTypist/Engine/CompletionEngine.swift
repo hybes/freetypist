@@ -23,11 +23,30 @@ public final class CompletionEngine: ObservableObject {
     private var lastDomain: String?
     private var lastWindowTitle: String?
 
-    private let settings = AppSettings.shared
-    private let stats = StatsManager.shared
-    private let learning = LearningEngine.shared
+    private let settings: AppSettings
+    private let stats: StatsManager
+    private let learning: LearningEngine
+    private let providerOverride: (any ModelProvider)?
+    private var requestID = UUID()
+    private var lastFollowingText = ""
+    private var settingsObserver: AnyCancellable?
+    private var modelObserver: AnyCancellable?
 
-    private init() {}
+    init(settings: AppSettings = .shared, stats: StatsManager = .shared,
+         learning: LearningEngine = .shared, provider: (any ModelProvider)? = nil) {
+        self.settings = settings
+        self.stats = stats
+        self.learning = learning
+        self.providerOverride = provider
+        settingsObserver = settings.objectWillChange
+            .sink { [weak self] in
+                self?.dismiss()
+                CompletionLRUCache.shared.clear()
+            }
+        modelObserver = LocalModelManager.shared.$selectedModel.dropFirst().sink { [weak self] _ in
+            self?.dismiss()
+        }
+    }
 
     public func onTextSelectionChanged(selectedText: String) {
         guard settings.isEnabled && settings.enableContextualSynonyms else {
@@ -70,7 +89,7 @@ public final class CompletionEngine: ObservableObject {
             let firstLineAfter = followingText.prefix(while: { $0 != "\n" && $0 != "\r" })
             return !firstLineAfter.trimmingCharacters(in: .whitespaces).isEmpty
         }()
-        if hasSameLineFollowingText && !force {
+        if hasSameLineFollowingText && selectedText.isEmpty && !force {
             let appDisablesMidLine = settings.rule(for: bundleId)?.disableMidLineCompletions ?? false
             if !settings.enableMidLineCompletions || appDisablesMidLine {
                 dismiss()
@@ -78,16 +97,28 @@ public final class CompletionEngine: ObservableObject {
             }
         }
 
+        if !force, selectedText.isEmpty, precedingText == lastRequestedText,
+           followingText == lastFollowingText, bundleId == lastBundleId, windowTitle == lastWindowTitle,
+           activeTask != nil || currentSuggestion != nil {
+            return
+        }
+
+        let previousSuggestion = currentSuggestion
+        let previousText = lastRequestedText
+        let sameEnvironment = lastBundleId == bundleId && lastWindowTitle == windowTitle
+            && lastFollowingText == followingText
+        dismiss()
+        lastLatencyMs = 0
         self.lastAppName = appName
         self.lastBundleId = bundleId
         self.lastDomain = domain
         self.lastWindowTitle = windowTitle
+        self.lastFollowingText = followingText
+        self.lastRequestedText = precedingText
 
-        // If user selected a word/phrase, check contextual synonyms
-        if !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !selectedText.isEmpty {
             onTextSelectionChanged(selectedText: selectedText)
-        } else {
-            activeSynonyms = []
+            return
         }
 
         // Record passive sentence completion for Constant Learning
@@ -118,6 +149,7 @@ public final class CompletionEngine: ObservableObject {
                     replacementLength: slashMatch.replacementLength
                 )
                 self.lastRequestedText = precedingText
+                stats.recordShown(latencyMs: 0)
                 return
             } else {
                 self.activeSlashCommand = nil
@@ -148,9 +180,17 @@ public final class CompletionEngine: ObservableObject {
                 replacementLength: topEmoji.replacementLength
             )
             self.lastRequestedText = precedingText
+            stats.recordShown(latencyMs: 1)
             return
         } else if self.currentSuggestion?.providerName.hasPrefix("Emoji") == true {
             self.currentSuggestion = nil
+        }
+
+        if let abbreviation = SmartWritingFeatures.matchAbbreviation(in: precedingText, dictionary: settings.personalDictionary) {
+            currentSuggestion = CompletionItem(fullText: abbreviation.expansion, providerName: "Abbreviation",
+                                               replacementLength: abbreviation.replacementLength)
+            stats.recordShown(latencyMs: 0)
+            return
         }
 
         // 2. Check Inline Autocorrect
@@ -167,6 +207,7 @@ public final class CompletionEngine: ObservableObject {
                         replacementLength: typoFix.replacementLength
                     )
                     self.lastRequestedText = precedingText
+                    stats.recordShown(latencyMs: 1)
                 } else {
                     // Hold back completions when typo is suspected
                     dismiss()
@@ -192,9 +233,9 @@ public final class CompletionEngine: ObservableObject {
         }
 
         // 3. Optimization: If current suggestion starts with what user just typed, advance it inline in 0ms
-        if let current = currentSuggestion, current.replacementLength == 0, !force {
-            if !lastRequestedText.isEmpty && precedingText.hasPrefix(lastRequestedText) {
-                let typedSuffix = String(precedingText.dropFirst(lastRequestedText.count))
+        if sameEnvironment, let current = previousSuggestion, current.replacementLength == 0, !force {
+            if !previousText.isEmpty && precedingText.hasPrefix(previousText) {
+                let typedSuffix = String(precedingText.dropFirst(previousText.count))
                 if current.remainingText.hasPrefix(typedSuffix) {
                     let newRemaining = String(current.remainingText.dropFirst(typedSuffix.count))
                     if newRemaining.isEmpty {
@@ -217,8 +258,8 @@ public final class CompletionEngine: ObservableObject {
         activeTask?.cancel()
         lastRequestedText = precedingText
 
-        let debounceDelay = force ? 0 : settings.debounceMs
-        let provider = ModelProviderFactory.provider(for: settings.activeProvider)
+        let debounceDelay = force ? 0 : max(0, settings.debounceMs)
+        let provider = providerOverride ?? ModelProviderFactory.provider(for: settings.activeProvider)
         let tone = settings.effectiveTone(for: bundleId)
         let customInstructions = settings.effectiveCustomInstructions(for: bundleId)
 
@@ -251,6 +292,21 @@ public final class CompletionEngine: ObservableObject {
             maxWords: settings.completionLength.maxWords
         )
 
+        if providerOverride == nil, settings.activeProvider == .localEmbedded {
+            let started = DispatchTime.now().uptimeNanoseconds
+            let instant = PromptBuilder.cleanCompletionText(
+                OfflinePredictor().complete(context: context, tone: tone),
+                precedingText: precedingText, maxWords: context.maxWords
+            )
+            if !instant.isEmpty {
+                let latency = Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+                lastLatencyMs = latency
+                currentSuggestion = CompletionItem(fullText: instant, providerName: AIProviderType.mock.rawValue, latencyMs: latency)
+                stats.recordShown(latencyMs: latency)
+            }
+        }
+
+        let id = requestID
         activeTask = Task { [weak self] in
             guard let self = self else { return }
 
@@ -258,7 +314,7 @@ public final class CompletionEngine: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(debounceDelay) * 1_000_000)
             }
 
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, self.requestID == id else { return }
 
             self.isGenerating = true
             self.lastError = nil
@@ -266,19 +322,22 @@ public final class CompletionEngine: ObservableObject {
             do {
                 let (completionText, latency) = try await provider.complete(context: context, settings: self.settings)
 
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.requestID == id else { return }
                 self.isGenerating = false
                 self.lastLatencyMs = latency
 
                 let cleaned = completionText.trimmingCharacters(in: .newlines)
                 if !cleaned.isEmpty {
+                    let alreadyShown = self.currentSuggestion?.remainingText == cleaned
+                    let source = self.settings.activeProvider == .localEmbedded && latency <= 3
+                        ? "Instant Predictor / Local Cache" : self.settings.activeProvider.rawValue
                     self.currentSuggestion = CompletionItem(
                         fullText: cleaned,
-                        providerName: self.settings.activeProvider.rawValue,
+                        providerName: source,
                         latencyMs: latency,
                         replacementLength: 0
                     )
-                    self.stats.recordShown(latencyMs: latency, fromCache: latency <= 3)
+                    if !alreadyShown { self.stats.recordShown(latencyMs: latency, fromCache: latency <= 3) }
 
                     if self.settings.enableWordAlternatives {
                         self.activeWordAlternatives = SmartWritingFeatures.generateWordAlternatives(
@@ -294,7 +353,7 @@ public final class CompletionEngine: ObservableObject {
                     self.activeWordAlternatives = []
                 }
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.requestID == id else { return }
                 self.isGenerating = false
                 self.lastError = error.localizedDescription
                 self.currentSuggestion = nil
@@ -304,6 +363,7 @@ public final class CompletionEngine: ObservableObject {
     }
 
     public func acceptFull() -> (textToInsert: String, deleteBackwardsCount: Int)? {
+        guard canAccept else { dismiss(); return nil }
         if let slash = activeSlashCommand {
             stats.recordAccepted(text: slash.expansion, appName: lastAppName, source: "Slash Snippets")
             dismiss()
@@ -344,7 +404,12 @@ public final class CompletionEngine: ObservableObject {
     }
 
     public func acceptNextWord() -> String? {
-        guard var suggestion = currentSuggestion else { return nil }
+        guard canAccept, let current = currentSuggestion, current.replacementLength == 0 else { return nil }
+        activeTask?.cancel()
+        activeTask = nil
+        requestID = UUID()
+        isGenerating = false
+        var suggestion = current
         guard var word = suggestion.advanceOneWord() else {
             dismiss()
             return nil
@@ -357,7 +422,13 @@ public final class CompletionEngine: ObservableObject {
             word.removeLast()
         }
 
-        stats.recordAccepted(text: word, appName: lastAppName)
+        var remaining = suggestion.remainingText
+        if settings.includeTrailingSpaceOnWordAccept {
+            let spacing = String(remaining.prefix(while: { $0.isWhitespace }))
+            word += spacing
+            remaining = String(remaining.dropFirst(spacing.count))
+        }
+        stats.recordAccepted(text: word, appName: lastAppName, source: suggestion.providerName)
         learning.recordAcceptedCompletion(
             precedingText: lastRequestedText,
             acceptedText: word,
@@ -368,16 +439,18 @@ public final class CompletionEngine: ObservableObject {
         )
         lastRequestedText += word
 
-        if suggestion.remainingText.isEmpty {
+        activeWordAlternatives = []
+        if remaining.isEmpty {
             dismiss()
         } else {
-            self.currentSuggestion = suggestion
+            self.currentSuggestion = CompletionItem(fullText: remaining, providerName: suggestion.providerName, latencyMs: suggestion.latencyMs)
         }
 
         return word
     }
 
     public func acceptAlternative(at index: Int) -> String? {
+        guard canAccept, currentSuggestion?.replacementLength == 0 else { return nil }
         if let alt = activeWordAlternatives.first(where: { $0.index == index }) {
             stats.recordAccepted(text: alt.text, appName: lastAppName)
             learning.recordAcceptedCompletion(
@@ -393,13 +466,20 @@ public final class CompletionEngine: ObservableObject {
         return nil
     }
 
+    private var canAccept: Bool {
+        settings.isEnabled && !settings.isAppExcluded(bundleIdentifier: lastBundleId)
+    }
+
     public func dismiss() {
+        requestID = UUID()
+        lastError = nil
         activeTask?.cancel()
         activeTask = nil
         currentSuggestion = nil
         activeAutocorrect = nil
         activeEmojiCandidates = []
         activeWordAlternatives = []
+        activeSynonyms = []
         activeSlashCommand = nil
         isGenerating = false
     }

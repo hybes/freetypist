@@ -12,8 +12,12 @@ public final class LocalInferenceService: ObservableObject {
     @Published public var serverStatus: String = "Ready"
     @Published public var serverPort: Int = 58855
     @Published public var lastInferenceDate: Date = Date()
+    private(set) var authorizationToken = UUID().uuidString
 
     private var serverProcess: Process?
+    private var startupTask: Task<Void, Never>?
+    private var generation = UUID()
+    private var engineLog: FileHandle?
     private var healthCheckTask: Task<Void, Never>?
     private var idleWatchTimer: Timer?
 
@@ -26,20 +30,7 @@ public final class LocalInferenceService: ObservableObject {
     }
 
     public func locateLlamaServerBinary() -> String? {
-        // 1. Prefer Homebrew's latest llama-server first (supports Gemma 4 & has matched system @rpath dylibs)
-        let homebrewPaths = [
-            "/opt/homebrew/bin/llama-server",
-            "/opt/homebrew/opt/llama.cpp/bin/llama-server",
-            "/usr/local/bin/llama-server"
-        ]
-
-        for path in homebrewPaths {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
-        }
-
-        // 2. Fallback to App Bundle (MacOS or Resources)
+        // Prefer the engine packaged and verified with this app.
         if let execURL = Bundle.main.executableURL {
             let bundleBin = execURL.deletingLastPathComponent().appendingPathComponent("llama-server").path
             if FileManager.default.isExecutableFile(atPath: bundleBin) {
@@ -51,6 +42,19 @@ public final class LocalInferenceService: ObservableObject {
             let resBin = resURL.appendingPathComponent("llama-server").path
             if FileManager.default.isExecutableFile(atPath: resBin) {
                 return resBin
+            }
+        }
+
+        // Development builds can use a local Homebrew installation.
+        let homebrewPaths = [
+            "/opt/homebrew/bin/llama-server",
+            "/opt/homebrew/opt/llama.cpp/bin/llama-server",
+            "/usr/local/bin/llama-server"
+        ]
+
+        for path in homebrewPaths {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
             }
         }
 
@@ -67,24 +71,25 @@ public final class LocalInferenceService: ObservableObject {
     }
 
     public func startServer(for modelPath: String) {
-        guard FileManager.default.fileExists(atPath: modelPath) else {
-            self.serverStatus = "Model file not found"
-            self.isServerRunning = false
-            self.isStarting = false
+        if (isServerRunning || isStarting) && currentLoadedModelPath == modelPath { return }
+        stopServer()
+        guard LocalModelManager.isValidStandardGGUF(atPath: modelPath) else {
+            serverStatus = "Model is missing or is not a valid GGUF file"
             return
         }
-
-        if (isServerRunning || isStarting) && currentLoadedModelPath == modelPath {
-            return
-        }
-
-        // First check if a healthy llama-server is already listening on port 58855
-        Task { @MainActor in
-            if await self.checkExistingHealthyServer() && self.currentLoadedModelPath == nil {
-                self.currentLoadedModelPath = modelPath
-                self.isServerRunning = true
+        isStarting = true
+        authorizationToken = UUID().uuidString
+        currentLoadedModelPath = modelPath
+        serverStatus = "Starting local engine…"
+        let id = generation
+        startupTask = Task { [weak self] in
+            guard let self else { return }
+            let occupied = await self.checkExistingHealthyServer()
+            guard !Task.isCancelled, self.generation == id else { return }
+            guard !occupied else {
                 self.isStarting = false
-                self.serverStatus = "Active (Metal GPU • Low-Memory KV)"
+                self.currentLoadedModelPath = nil
+                self.serverStatus = "Engine port is already in use. Stop the other server and retry."
                 return
             }
             self.launchProcess(for: modelPath)
@@ -103,10 +108,9 @@ public final class LocalInferenceService: ObservableObject {
     }
 
     private func launchProcess(for modelPath: String) {
-        stopServer()
 
         guard let binaryPath = locateLlamaServerBinary() else {
-            self.serverStatus = "Built-in Fast Engine (No llama-server binary)"
+            self.serverStatus = "Engine not installed. Run brew install llama.cpp, then rebuild FreeTypist."
             self.isServerRunning = false
             self.isStarting = false
             return
@@ -116,18 +120,21 @@ public final class LocalInferenceService: ObservableObject {
         self.serverStatus = "Loading model into Metal GPU..."
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
+        process.environment = ProcessInfo.processInfo.environment.merging(["LLAMA_API_KEY": authorizationToken]) { _, new in new }
 
         let settings = AppSettings.shared
         // Optimized for ultra-low RAM & CPU footprint + disables Gemma 4 / Qwen 3 thinking trace overhead
         var args = [
             "-m", modelPath,
             "--port", "\(serverPort)",
+            "--host", "127.0.0.1",
             "-ngl", "\(settings.gpuLayers)",          // Offload layers to Apple Metal GPU
             "-c", "\(settings.contextWindowSize)",    // Configurable context size for autocomplete
             "-np", "1",                               // Single parallel slot (cuts KV RAM by 75%)
             "-ctk", settings.kvCacheQuantization,     // Quantized K cache (q8_0 / q4_0 / f16)
             "-ctv", settings.kvCacheQuantization,     // Quantized V cache
             "-fa", "on",                              // Metal Flash Attention
+            "--reasoning", "off",
             "--reasoning-budget", "0",                // Disable thinking tokens so completion begins immediately
             "--reasoning-format", "none",
             "--threads", "\(settings.cpuThreads)"     // Configurable CPU threads
@@ -140,16 +147,21 @@ public final class LocalInferenceService: ObservableObject {
 
         process.arguments = args
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        let logURL = AppStorage.directory.appendingPathComponent("engine.log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        engineLog = try? FileHandle(forWritingTo: logURL)
+        process.standardError = engineLog ?? FileHandle.nullDevice
 
-        process.terminationHandler = { [weak self] _ in
+        process.terminationHandler = { [weak self] terminated in
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
+                guard let self = self, self.serverProcess === terminated else { return }
+                self.healthCheckTask?.cancel()
+                self.serverProcess = nil
+                try? self.engineLog?.close()
+                self.engineLog = nil
                 self.isServerRunning = false
                 self.isStarting = false
-                if self.serverStatus != "Sleeping (Idle Memory Saver)" {
-                    self.serverStatus = "Stopped"
-                }
+                self.serverStatus = "Engine exited (code \(terminated.terminationStatus)). See \(logURL.path)."
             }
         }
 
@@ -167,13 +179,14 @@ public final class LocalInferenceService: ObservableObject {
 
     private func pollHealthCheck() {
         healthCheckTask?.cancel()
+        let id = generation
         healthCheckTask = Task { [weak self] in
             guard let self = self else { return }
             let healthURL = URL(string: "http://127.0.0.1:\(self.serverPort)/health")!
 
-            // Poll up to 60 * 350ms (~21 seconds for large 6.2GB models to map into Metal)
-            for _ in 0..<60 {
-                if Task.isCancelled { return }
+            // Allow larger models time to load; stop cleanly if startup never completes.
+            for _ in 0..<180 {
+                if Task.isCancelled || self.generation != id { return }
                 if let proc = self.serverProcess, !proc.isRunning {
                     self.isServerRunning = false
                     self.isStarting = false
@@ -181,13 +194,15 @@ public final class LocalInferenceService: ObservableObject {
                     return
                 }
 
-                try? await Task.sleep(nanoseconds: 350_000_000)
-
+                do { try await Task.sleep(nanoseconds: 350_000_000) } catch { return }
+                guard self.generation == id else { return }
                 var req = URLRequest(url: healthURL)
                 req.timeoutInterval = 1.0
 
                 if let (_, response) = try? await URLSession.shared.data(for: req),
-                   let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                   let http = response as? HTTPURLResponse, http.statusCode == 200,
+                   !Task.isCancelled, self.generation == id,
+                   self.serverProcess?.isRunning == true {
                     self.isServerRunning = true
                     self.isStarting = false
                     self.serverStatus = "Active (Metal GPU • Low-Memory KV)"
@@ -195,14 +210,8 @@ public final class LocalInferenceService: ObservableObject {
                 }
             }
 
-            if let proc = self.serverProcess, proc.isRunning {
-                self.isStarting = false
-                self.serverStatus = "Warming up model..."
-            } else {
-                self.isServerRunning = false
-                self.isStarting = false
-                self.serverStatus = "Offline (Using Smart Local Predictor)"
-            }
+            guard !Task.isCancelled, self.generation == id else { return }
+            self.stopServer(reason: "Model startup timed out. See engine.log for details.")
         }
     }
 
@@ -224,13 +233,17 @@ public final class LocalInferenceService: ObservableObject {
     }
 
     public func stopServer(reason: String = "Stopped") {
+        generation = UUID()
+        startupTask?.cancel()
+        startupTask = nil
         healthCheckTask?.cancel()
         healthCheckTask = nil
 
-        if let proc = serverProcess, proc.isRunning {
-            proc.terminate()
-        }
+        let oldProcess = serverProcess
         serverProcess = nil
+        if let oldProcess, oldProcess.isRunning { oldProcess.terminate() }
+        try? engineLog?.close()
+        engineLog = nil
         isServerRunning = false
         isStarting = false
         currentLoadedModelPath = nil

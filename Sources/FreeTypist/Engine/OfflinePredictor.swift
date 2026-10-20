@@ -30,11 +30,6 @@ public struct OfflinePredictor: Sendable {
             }
         }
 
-        // 1. Personal Dictionary Expansion (exact shortcut trigger)
-        if let expansion = dictionaryExpansion(in: trimmed, dictionary: context.dictionary) {
-            return spaced(expansion, after: preceding)
-        }
-
         // 2. Constant Learning Engine (Personalization Booster N-grams & Vocabulary from user's own history)
         if let learned = LearningEngine.shared.predictFromLearnedHistory(
             precedingText: preceding,
@@ -218,17 +213,6 @@ public struct OfflinePredictor: Sendable {
     }
 
     // MARK: - Helpers
-
-    private func dictionaryExpansion(in trimmed: String, dictionary: [String: String]) -> String? {
-        guard !dictionary.isEmpty else { return nil }
-        let last = trimmed.split { $0.isWhitespace || $0.isNewline }.last.map(String.init)?.lowercased() ?? ""
-        guard let expansion = dictionary.first(where: { $0.key.lowercased() == last })?.value else { return nil }
-        let lowerExpansion = expansion.lowercased()
-        if lowerExpansion.hasPrefix(last) {
-            return String(expansion.dropFirst(last.count))
-        }
-        return expansion
-    }
 
     private func alreadyUsed(_ completion: String, in text: String) -> Bool {
         let needle = completion.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)

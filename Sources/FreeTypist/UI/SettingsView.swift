@@ -8,6 +8,7 @@ public struct SettingsView: View {
     @ObservedObject var learningEngine = LearningEngine.shared
     @ObservedObject var resourceMonitor = SystemResourceMonitor.shared
     @ObservedObject var cotypistMigrator = CotypistMigrator.shared
+    @ObservedObject var appUpdater = AppUpdater.shared
 
     @State private var selectedTab: Int = 0
     @State private var newDictKey: String = ""
@@ -133,6 +134,11 @@ public struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 PermissionsView()
+                HStack {
+                    Text("Run the guided setup to choose a local model and check typing.").font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Button("Setup FreeTypist…") { MenuBarController.shared.openSetup() }
+                }
 
                 if cotypistMigrator.isCotypistInstalled {
                     cotypistMigrationCard
@@ -179,9 +185,30 @@ public struct SettingsView: View {
                             .font(.caption)
                         Toggle("Hold back completions when a typo is detected", isOn: $settings.hideCompletionsOnSuspectedTypo)
                             .font(.caption)
-                        Toggle("Use surrounding window & clipboard context", isOn: $settings.readSurroundingWindowText)
+                        Toggle("Use surrounding window & clipboard context", isOn: Binding(
+                            get: { settings.readSurroundingWindowText && settings.useClipboardContext && settings.trackCrossAppContext },
+                            set: { enabled in
+                                settings.readSurroundingWindowText = enabled
+                                settings.useClipboardContext = enabled
+                                settings.trackCrossAppContext = enabled
+                                settings.trackMultiClipboardHistory = enabled
+                            }
+                        ))
                             .font(.caption)
                     }
+
+                    Divider()
+                    HStack(spacing: 20) {
+                        Toggle("Suggest :emoji: shortcuts", isOn: $settings.enableEmojiSuggestions)
+                        Toggle("Convert emoticons such as :-)", isOn: $settings.suggestEmojiFromEmoticons)
+                        Picker("Skin tone", selection: $settings.preferredEmojiSkinTone) {
+                            ForEach(EmojiSkinTone.allCases) { tone in
+                                Text(tone.rawValue).tag(tone)
+                            }
+                        }
+                        .frame(width: 190)
+                    }
+                    .font(.caption)
                 }
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -212,6 +239,8 @@ public struct SettingsView: View {
                         .onChange(of: modelManager.selectedModel) { _, newModel in
                             if let path = modelManager.downloadedModelPaths[newModel.id] {
                                 inferenceService.startServer(for: path)
+                            } else {
+                                inferenceService.stopServer(reason: "Selected model is not downloaded")
                             }
                         }
                     }
@@ -283,11 +312,12 @@ public struct SettingsView: View {
                                 .controlSize(.small)
                                 .buttonStyle(.bordered)
                             } else if let path = modelManager.activeModelPath() {
-                                Button("Start Engine") {
+                                Button(inferenceService.isStarting ? "Loading Model…" : "Start Engine") {
                                     inferenceService.startServer(for: path)
                                 }
                                 .controlSize(.small)
                                 .buttonStyle(.borderedProminent)
+                                .disabled(inferenceService.isStarting)
                             }
                         }
                     }
@@ -295,6 +325,22 @@ public struct SettingsView: View {
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.04)))
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("App Updates").font(.headline)
+                        Text("FreeTypist \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development") · Signed updates from type.cnnct.uk")
+                            .font(.caption).foregroundColor(.secondary)
+                        Toggle("Check for updates automatically", isOn: Binding(
+                            get: { appUpdater.automaticallyChecksForUpdates },
+                            set: { appUpdater.setAutomaticChecks($0) }
+                        ))
+                        .disabled(appUpdater.controller == nil)
+                    }
+                    Spacer()
+                    Button("Check for Updates…") { appUpdater.checkForUpdates() }
+                        .disabled(!appUpdater.canCheckForUpdates)
+                }
+                .padding(14)
             }
             .padding(14)
         }
@@ -500,7 +546,7 @@ public struct SettingsView: View {
                     let name = newAppName.trimmingCharacters(in: .whitespaces)
                     let bundle = newAppBundleId.trimmingCharacters(in: .whitespaces)
                     if !name.isEmpty && !bundle.isEmpty {
-                        settings.appRules.append(AppRule(bundleIdentifier: bundle, appName: name, isExcluded: false))
+                        settings.mergeImportedAppRule(AppRule(bundleIdentifier: bundle, appName: name, isExcluded: false))
                         newAppName = ""
                         newAppBundleId = ""
                     }
@@ -527,13 +573,13 @@ public struct SettingsView: View {
                     statCard(
                         title: "Estimated Time Saved",
                         value: stats.estimatedTimeSavedFormatted,
-                        subtitle: "+\(stats.estimatedWPMBoost) WPM effective boost",
+                        subtitle: "Based on typing 40 words per minute",
                         icon: "clock.badge.checkmark",
                         color: .green
                     )
                     statCard(
                         title: "Active Streak",
-                        value: "\(stats.currentStreakDays) days",
+                        value: "\(stats.currentStreakDays) \(stats.currentStreakDays == 1 ? "day" : "days")",
                         subtitle: "\(stats.todayWordsSaved) words today",
                         icon: "flame.fill",
                         color: .orange
@@ -572,14 +618,22 @@ public struct SettingsView: View {
                     }
 
                     let records = stats.records(for: statsRange)
-                    let maxVal = max(1, records.map { metricValue(for: $0) }.max() ?? 1)
+                    let peakValue = records.map { metricValue(for: $0) }.max() ?? 0
+                    let maxVal = max(1, peakValue)
 
-                    HStack(alignment: .bottom, spacing: 4) {
+                    if peakValue == 0 {
+                        Text("No activity in this period.").font(.caption).foregroundColor(.secondary)
+                    } else if records.count > 14 {
+                        Text("Peak: \(peakValue) \(statsMetric.rawValue.lowercased())")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+
+                    HStack(alignment: .bottom, spacing: records.count > 30 ? 1 : 4) {
                         ForEach(records) { rec in
                             let val = metricValue(for: rec)
                             let barHeight = max(6, CGFloat(val) / CGFloat(maxVal) * 100.0)
                             VStack(spacing: 3) {
-                                if records.count <= 14 || val == maxVal {
+                                if records.count <= 14 {
                                     Text("\(val)")
                                         .font(.system(size: 8, design: .monospaced))
                                         .foregroundColor(.secondary)
@@ -588,15 +642,27 @@ public struct SettingsView: View {
                                 RoundedRectangle(cornerRadius: 4)
                                     .fill(val > 0 ? Color.accentColor : Color.secondary.opacity(0.15))
                                     .frame(maxWidth: 22, minHeight: 6, maxHeight: barHeight)
-                                Text(String(rec.dateString.suffix(2)))
-                                    .font(.system(size: 8, design: .monospaced))
-                                    .foregroundColor(.secondary)
+                                if records.count <= 14 {
+                                    Text(String(rec.dateString.suffix(2)))
+                                        .font(.system(size: 8, design: .monospaced))
+                                        .foregroundColor(.secondary).lineLimit(1)
+                                }
                             }
                             .frame(maxWidth: .infinity)
+                            .help("\(rec.dateString): \(val) \(statsMetric.rawValue.lowercased())")
+                            .accessibilityLabel("\(rec.dateString): \(val) \(statsMetric.rawValue.lowercased())")
                         }
                     }
                     .frame(height: 130)
                     .padding(.top, 4)
+                    if records.count > 14 {
+                        HStack {
+                            Text(records.first?.dateString ?? "")
+                            Spacer()
+                            Text(records.last?.dateString ?? "")
+                        }
+                        .font(.caption2).foregroundColor(.secondary)
+                    }
                 }
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)

@@ -15,9 +15,15 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.2.1</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>4</string>
+    <key>SUPublicEDKey</key>
+    <string>wZBkayJXDKzXoGeP4JW8HVD7cI7W/2EwXOn2zeW6GUA=</string>
+    <key>SUFeedURL</key>
+    <string>https://type.cnnct.uk/appcast.xml</string>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>

@@ -9,41 +9,35 @@ public final class KeyboardHook: @unchecked Sendable {
     private var runLoopSource: CFRunLoopSource?
     private var globalKeyMonitor: Any?
     private var workspaceObserver: NSObjectProtocol?
-    private var reconnectTimer: Timer?
-    public private(set) var isRunning: Bool = false
+    public var isRunning: Bool {
+        guard let eventTap else { return false }
+        return CGEvent.tapIsEnabled(tap: eventTap)
+    }
     private let typingBuffer = TypingBuffer()
+    private var lastFieldHash: UInt?
 
     private init() {}
+
+    private func trace(_ message: String) {
+        guard ProcessInfo.processInfo.environment["FREETYPIST_DEBUG_KEYBOARD"] == "1" else { return }
+        FileHandle.standardError.write(Data(("FreeTypist keyboard: " + message + "\n").utf8))
+    }
 
     public func start() {
         setupWorkspaceObserver()
         setupGlobalFallbackMonitor()
-        tryStartEventTap()
+        if AccessibilityService.isAccessibilityGranted() { tryStartEventTap() }
 
-        // If Accessibility permission isn't granted yet, poll lightly until granted
-        if !isRunning {
-            reconnectTimer?.invalidate()
-            let timer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] t in
-                guard let self = self else {
-                    t.invalidate()
-                    return
-                }
-                if AccessibilityService.isAccessibilityGranted() {
-                    self.tryStartEventTap()
-                    if self.isRunning {
-                        t.invalidate()
-                    }
-                }
-            }
-            timer.tolerance = 0.5
-            self.reconnectTimer = timer
-        }
+        // PermissionManager owns authorisation monitoring and reconnects.
     }
 
     private func tryStartEventTap() {
         guard !isRunning else { return }
+        if let source = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        eventTap = nil
+        runLoopSource = nil
 
-        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
         let observer = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
@@ -53,7 +47,7 @@ public final class KeyboardHook: @unchecked Sendable {
             eventsOfInterest: CGEventMask(eventMask),
             callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
                 guard let refcon = refcon else {
-                    return Unmanaged.passRetained(event)
+                    return Unmanaged.passUnretained(event)
                 }
                 let hook = Unmanaged<KeyboardHook>.fromOpaque(refcon).takeUnretainedValue()
                 return hook.handleEvent(proxy: proxy, type: type, event: event)
@@ -68,7 +62,6 @@ public final class KeyboardHook: @unchecked Sendable {
         self.runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        self.isRunning = true
         print("FreeTypist: KeyboardHook event tap active.")
     }
 
@@ -80,7 +73,9 @@ public final class KeyboardHook: @unchecked Sendable {
             queue: .main
         ) { [weak self] _ in
             self?.typingBuffer.reset()
-            AppSettings.shared.pausedAppBundleId = nil
+            if AppSettings.shared.pausedAppBundleId != nil {
+                AppSettings.shared.pausedAppBundleId = nil
+            }
             Task { @MainActor in
                 CompletionEngine.shared.dismiss()
             }
@@ -92,7 +87,7 @@ public final class KeyboardHook: @unchecked Sendable {
         globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self = self else { return }
             // Only use fallback monitor when CGEventTap isn't active
-            guard !self.isRunning else { return }
+            guard !self.isRunning, AccessibilityService.isAccessibilityGranted(), AppSettings.shared.isEnabled else { return }
             if AccessibilityService.shared.isPerformingSyntheticInsertion { return }
             if self.isTypingInFreeTypist() { return }
             if let cgEvent = event.cgEvent {
@@ -109,8 +104,6 @@ public final class KeyboardHook: @unchecked Sendable {
     }
 
     public func stop() {
-        reconnectTimer?.invalidate()
-        reconnectTimer = nil
         if let obs = workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
             workspaceObserver = nil
@@ -119,7 +112,6 @@ public final class KeyboardHook: @unchecked Sendable {
             NSEvent.removeMonitor(mon)
             globalKeyMonitor = nil
         }
-        guard isRunning else { return }
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
             if let source = runLoopSource {
@@ -128,7 +120,6 @@ public final class KeyboardHook: @unchecked Sendable {
         }
         eventTap = nil
         runLoopSource = nil
-        isRunning = false
     }
 
     private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -136,31 +127,49 @@ public final class KeyboardHook: @unchecked Sendable {
             if let tap = eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
-            return Unmanaged.passRetained(event)
+            return Unmanaged.passUnretained(event)
         }
 
-        guard type == .keyDown else {
-            return Unmanaged.passRetained(event)
+        if type == .leftMouseDown || type == .rightMouseDown {
+            typingBuffer.reset()
+            lastFieldHash = nil
+            Task { @MainActor in
+                CompletionEngine.shared.dismiss()
+                GhostOverlayPanel.shared.invalidateCaretPosition()
+            }
         }
+        guard type == .keyDown else {
+            return Unmanaged.passUnretained(event)
+        }
+        trace("Key event received")
 
         // Ignore synthetic keystrokes posted by AccessibilityService during replacements
         if event.getIntegerValueField(.eventSourceUserData) == AccessibilityService.syntheticEventMarker ||
            AccessibilityService.shared.isPerformingSyntheticInsertion {
-            return Unmanaged.passRetained(event)
+            return Unmanaged.passUnretained(event)
         }
 
         if isTypingInFreeTypist() {
-            return Unmanaged.passRetained(event)
+            trace("Own application; using Playground controls")
+            return Unmanaged.passUnretained(event)
         }
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
-        let hasActiveSuggestion = hasSuggestion()
+        let hasActiveSuggestion = hasSuggestion() && AppSettings.shared.isEnabled
         let frontBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let tabDisabledInApp = AppSettings.shared.rule(for: frontBundleId)?.disableTabKey ?? false
 
-        // Keycode 48 = Tab
-        if keyCode == 48 && hasActiveSuggestion && !tabDisabledInApp {
+        // Tab accepts a suggestion; an unmodified backtick accepts its next word.
+        let plainBacktick = keyCode == 50 && flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty
+        if ((keyCode == 48 && !tabDisabledInApp) || plainBacktick) && hasActiveSuggestion
+            && !flags.contains(.maskCommand) && !flags.contains(.maskControl) {
+            guard !AppSettings.shared.isAppExcluded(bundleIdentifier: frontBundleId),
+                  let caret = AccessibilityService.shared.getCurrentCaretInfo(),
+                  caret.elementHash == lastFieldHash, caret.selectedText.isEmpty else {
+                Task { @MainActor in CompletionEngine.shared.dismiss() }
+                return Unmanaged.passUnretained(event)
+            }
             let isOptionPressed = flags.contains(.maskAlternate)
             let isShiftPressed = flags.contains(.maskShift)
 
@@ -171,7 +180,7 @@ public final class KeyboardHook: @unchecked Sendable {
                     || !CompletionEngine.shared.activeEmojiCandidates.isEmpty
                     || (CompletionEngine.shared.currentSuggestion?.replacementLength ?? 0) > 0
 
-                if (isOptionPressed || isShiftPressed) && !isReplacement {
+                if (isOptionPressed || isShiftPressed || plainBacktick) && !isReplacement {
                     if let word = CompletionEngine.shared.acceptNextWord() {
                         self.typingBuffer.append(word)
                         AccessibilityService.shared.insertText(word)
@@ -198,7 +207,7 @@ public final class KeyboardHook: @unchecked Sendable {
         if keyCode == 53 && hasActiveSuggestion {
             let escBehavior = AppSettings.shared.escapeBehavior
             if escBehavior == .passToApp {
-                return Unmanaged.passRetained(event)
+                return Unmanaged.passUnretained(event)
             }
             Task { @MainActor in
                 switch escBehavior {
@@ -219,7 +228,14 @@ public final class KeyboardHook: @unchecked Sendable {
 
         if flags.contains(.maskCommand) || flags.contains(.maskControl) {
             typingBuffer.handleCommandKey(keyCode: keyCode)
-            return Unmanaged.passRetained(event)
+            Task { @MainActor [weak self] in
+                CompletionEngine.shared.dismiss()
+                if [0, 6, 7, 9, 51, 123, 124, 125, 126].contains(keyCode) {
+                    try? await Task.sleep(nanoseconds: 25_000_000)
+                    self?.requestCompletionFromContext()
+                }
+            }
+            return Unmanaged.passUnretained(event)
         }
 
         typingBuffer.handle(event: event)
@@ -230,34 +246,42 @@ public final class KeyboardHook: @unchecked Sendable {
             self?.requestCompletionFromContext()
         }
 
-        return Unmanaged.passRetained(event)
+        return Unmanaged.passUnretained(event)
     }
 
     @MainActor
     private func requestCompletionFromContext() {
         guard !AccessibilityService.shared.isPerformingSyntheticInsertion else { return }
+        let settings = AppSettings.shared
+        guard settings.isEnabled,
+              !settings.isAppExcluded(bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier) else {
+            typingBuffer.reset()
+            CompletionEngine.shared.dismiss()
+            return
+        }
         let bufferSnapshot = typingBuffer.snapshot()
         let caretInfo = AccessibilityService.shared.getCurrentCaretInfo()
 
         // Require a valid inline cursor rect on screen so we never show an unanchored floating modal at (0,0)
         guard let caretInfo, caretInfo.hasValidCaretRect else {
+            trace(caretInfo == nil ? "No accessible text field" : "Text field has no valid caret bounds")
             GhostOverlayPanel.shared.invalidateCaretPosition()
             CompletionEngine.shared.dismiss()
             return
         }
 
-        let axText = caretInfo.precedingText
-        let axTrimmed = axText.trimmingCharacters(in: .whitespacesAndNewlines)
         let preceding: String
-        if axTrimmed.count >= AppSettings.shared.minTriggerCharacters {
-            preceding = axText
-            typingBuffer.replace(with: axText)
-        } else if bufferSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).count >= AppSettings.shared.minTriggerCharacters {
+        if caretInfo.hasReadableText {
+            preceding = caretInfo.precedingText
+            typingBuffer.replace(with: preceding)
+        } else if lastFieldHash == caretInfo.elementHash {
             preceding = bufferSnapshot
         } else {
-            CompletionEngine.shared.dismiss()
-            return
+            typingBuffer.reset()
+            preceding = ""
         }
+        lastFieldHash = caretInfo.elementHash
+        trace("Accessible context: \(preceding.count) characters")
 
         GhostOverlayPanel.shared.updatePosition(
             caretScreenRect: caretInfo.screenRect,
@@ -362,7 +386,7 @@ final class TypingBuffer: @unchecked Sendable {
             return
         }
 
-        if (123...126).contains(keyCode) { return }
+        if (123...126).contains(keyCode) { reset(); return }
 
         guard let nsEvent = NSEvent(cgEvent: event),
               let chars = nsEvent.characters else { return }

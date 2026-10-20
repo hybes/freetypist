@@ -73,14 +73,8 @@ public struct PromptBuilder {
         var instructions: [String] = []
 
         instructions.append("""
-        You are Cotypist, an on-device inline autocomplete engine for macOS.
-        Now, please complete the following text that I am typing. Write full, grammatically correct sentences in the language and style of the existing text. Avoid using placeholders. Do not mention that your task is to provide completions, or e.g. the fact that I am typing, etc.; just try to complete the sentence.
-
-        CRITICAL OUTPUT RULES:
-        1. Output ONLY the immediate continuation text (maximum \(context.maxWords) words).
-        2. Do NOT repeat any part of the preceding text.
-        3. Do NOT output <think> or reasoning steps.
-        4. Do NOT include conversational filler, explanations, or surrounding quotes.
+        You are FreeTypist, an on-device inline autocomplete engine for macOS.
+        Complete the unfinished sentence in its existing language and style. Output only the missing words, at most \(context.maxWords). Finish a partial word first if needed. Do not reply to the writer. Do not repeat the input, explain, add quotes, or output reasoning.
         """)
 
         if !context.appName.isEmpty {
@@ -95,24 +89,24 @@ public struct PromptBuilder {
         }
 
         if !context.deepContextSummary.isEmpty {
-            instructions.append("DEEP ON-DEVICE MULTI-WINDOW & CLIPBOARD CONTEXT:\n\(context.deepContextSummary)")
+            instructions.append("DEEP ON-DEVICE MULTI-WINDOW & CLIPBOARD CONTEXT:\n\(context.deepContextSummary.prefix(1500))")
         }
 
         if !context.toneInstruction.isEmpty {
-            instructions.append("Tone & Style: \(context.toneInstruction)")
+            instructions.append("Tone & Style: \(context.toneInstruction.prefix(300))")
         }
 
         if !context.personaDescription.isEmpty {
-            instructions.append("Custom AI Instructions: \(context.personaDescription)")
+            instructions.append("Custom AI Instructions: \(context.personaDescription.prefix(600))")
         }
 
         if !context.dictionary.isEmpty {
-            let dictPairs = context.dictionary.map { "\($0.key) -> \($0.value)" }.joined(separator: ", ")
+            let dictPairs = context.dictionary.sorted { $0.key < $1.key }.map { "\($0.key) -> \($0.value)" }.joined(separator: ", ").prefix(600)
             instructions.append("Preferred vocabulary and expansions: \(dictPairs)")
         }
 
         if !context.learnedSamples.isEmpty {
-            let formatted = context.learnedSamples.prefix(5).map { "- \"\($0.suffix(180))\"" }.joined(separator: "\n")
+            let formatted = context.learnedSamples.prefix(3).map { "- \"\($0.suffix(180))\"" }.joined(separator: "\n")
             instructions.append("Recent examples of the user's personal writing style:\n\(formatted)")
         }
 
@@ -120,6 +114,7 @@ public struct PromptBuilder {
             instructions.append("Current clipboard context (for reference if relevant):\n\"\(clip)\"")
         }
 
+        instructions.append("Complete the given sentence. Respond with ONLY the missing words, never the original sentence or an explanation.")
         return instructions.joined(separator: "\n\n")
     }
 
@@ -129,7 +124,7 @@ public struct PromptBuilder {
         let sanitizedBefore = shouldSanitize ? SecretSanitizer.sanitize(beforeSlice).sanitized : beforeSlice
 
         if context.followingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "<TEXT_BEFORE_CURSOR>\n\(sanitizedBefore)\n</TEXT_BEFORE_CURSOR>\n\nImmediate continuation (\(context.maxWords) words max):"
+            return "Sentence: \(sanitizedBefore)"
         } else {
             let afterSlice = String(context.followingText.prefix(240))
             let sanitizedAfter = shouldSanitize ? SecretSanitizer.sanitize(afterSlice).sanitized : afterSlice
@@ -194,17 +189,16 @@ public struct PromptBuilder {
             }
         }
 
-        // 5. If the model repeated the entire preceding text or last word, strip the duplicate
+        // 5. Strip the longest repeated suffix at a word boundary. Small local models
+        // sometimes echo several words of the prompt before their continuation.
         let trimmedPreceding = precedingText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPreceding.isEmpty {
-            if text.lowercased().hasPrefix(trimmedPreceding.lowercased()) {
-                text = String(text.dropFirst(trimmedPreceding.count))
-            } else {
-                let words = trimmedPreceding.components(separatedBy: .whitespaces)
-                if let lastWord = words.last, !lastWord.isEmpty {
-                    if text.hasPrefix(lastWord + " ") || text == lastWord {
-                        text = String(text.dropFirst(lastWord.count))
-                    }
+            let words = trimmedPreceding.split(whereSeparator: \.isWhitespace).suffix(40).map(String.init)
+            for start in words.indices {
+                let repeated = words[start...].map(NSRegularExpression.escapedPattern(for:)).joined(separator: "\\s+")
+                if let range = text.range(of: "^\\s*" + repeated + "(?=\\s|$)", options: [.regularExpression, .caseInsensitive]) {
+                    text = String(text[range.upperBound...])
+                    break
                 }
             }
         }

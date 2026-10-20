@@ -21,7 +21,7 @@ public final class GhostAwareNSTextView: NSTextView {
         let active = !ghostSuggestion.isEmpty || hasInterceptableAction
 
         // Tab (keyCode 48)
-        if keyCode == 48 && active {
+        if keyCode == 48 && active && !flags.contains(.command) && !flags.contains(.control) {
             if flags.contains(.option) || flags.contains(.shift) {
                 if onAcceptNextWord?() == true { return }
             } else {
@@ -30,7 +30,7 @@ public final class GhostAwareNSTextView: NSTextView {
         }
 
         // Backtick ` (keyCode 50) - word/full shortcut when suggestion is active
-        if keyCode == 50 && !ghostSuggestion.isEmpty && flags.isEmpty {
+        if keyCode == 50 && active && flags.isEmpty {
             if onAcceptNextWord?() == true { return }
         }
 
@@ -97,7 +97,7 @@ public final class GhostAwareNSTextView: NSTextView {
 
 public struct PlaygroundEditorRepresentable: NSViewRepresentable {
     @Binding public var text: String
-    @Binding public var selectedText: String
+    @Binding public var selection: NSRange
     public var ghostSuggestion: String
     public var hasInterceptableAction: Bool
     public var ghostOpacity: Double
@@ -133,6 +133,8 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         textView.delegate = context.coordinator
 
         textView.string = text
+        textView.setSelectedRange(selection)
+        if textView.selectedRange() != selection { textView.setSelectedRange(selection) }
         textView.ghostSuggestion = ghostSuggestion
         textView.hasInterceptableAction = hasInterceptableAction
         textView.ghostOpacity = ghostOpacity
@@ -147,12 +149,13 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
     public func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? GhostAwareNSTextView else { return }
         context.coordinator.parent = self
+        context.coordinator.isUpdating = true
+        defer { context.coordinator.isUpdating = false }
 
         if textView.string != text {
-            textView.string = text
-            let endLoc = (text as NSString).length
-            textView.setSelectedRange(NSRange(location: endLoc, length: 0))
+            textView.insertText(text, replacementRange: NSRange(location: 0, length: (textView.string as NSString).length))
         }
+        if textView.selectedRange() != selection { textView.setSelectedRange(selection) }
         textView.ghostSuggestion = ghostSuggestion
         textView.hasInterceptableAction = hasInterceptableAction
         textView.ghostOpacity = ghostOpacity
@@ -164,13 +167,15 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
 
     public final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: PlaygroundEditorRepresentable
+        var isUpdating = false
 
         init(_ parent: PlaygroundEditorRepresentable) {
             self.parent = parent
         }
 
         public func textDidChange(_ notification: Notification) {
-            guard let tv = notification.object as? NSTextView else { return }
+            guard !isUpdating, let tv = notification.object as? NSTextView else { return }
+            parent.selection = tv.selectedRange()
             let newStr = tv.string
             if parent.text != newStr {
                 parent.text = newStr
@@ -179,17 +184,8 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         }
 
         public func textViewDidChangeSelection(_ notification: Notification) {
-            guard let tv = notification.object as? NSTextView else { return }
-            let range = tv.selectedRange()
-            let nsStr = tv.string as NSString
-            if range.length > 0 && range.location + range.length <= nsStr.length {
-                let sel = nsStr.substring(with: range)
-                if parent.selectedText != sel {
-                    parent.selectedText = sel
-                }
-            } else if !parent.selectedText.isEmpty {
-                parent.selectedText = ""
-            }
+            guard !isUpdating, let tv = notification.object as? NSTextView else { return }
+            if parent.selection != tv.selectedRange() { parent.selection = tv.selectedRange() }
             tv.needsDisplay = true
         }
     }
@@ -204,15 +200,28 @@ public struct PlaygroundView: View {
     @ObservedObject var deepContext = DeepContextCollector.shared
 
     @State private var inputText: String = "Thank you for "
-    @State private var selectedText: String = ""
-    @State private var playgroundSuggestion: String = ""
-    @State private var activeTypoFix: AutocorrectSuggestion?
-    @State private var activeEmojis: [EmojiCandidate] = []
-    @State private var activeSlashMatch: (trigger: String, expansion: String, replacementLength: Int)?
-    @State private var wordAlternatives: [WordAlternativeItem] = []
-    @State private var synonyms: [WordAlternativeItem] = []
-    @State private var lastLatency: Int = 0
-    @State private var lastSourceLabel: String = "Ready"
+    @State private var selection = NSRange(location: 14, length: 0)
+    @StateObject private var engine = CompletionEngine()
+    private let isSetup: Bool
+    private let onAccepted: (() -> Void)?
+
+    private var editorContext: TextEditingContext { TextEditingContext(text: inputText, selection: selection) }
+    private var selectedText: String { editorContext.selectedText }
+    private var playgroundSuggestion: String {
+        guard engine.currentSuggestion?.replacementLength == 0 else { return "" }
+        return engine.currentSuggestion?.remainingText ?? ""
+    }
+    private var activeTypoFix: AutocorrectSuggestion? { engine.activeAutocorrect }
+    private var activeEmojis: [EmojiCandidate] { engine.activeEmojiCandidates }
+    private var activeSlashMatch: (trigger: String, expansion: String, replacementLength: Int)? { engine.activeSlashCommand }
+    private var wordAlternatives: [WordAlternativeItem] { engine.activeWordAlternatives }
+    private var synonyms: [WordAlternativeItem] { engine.activeSynonyms }
+    private var lastLatency: Int { engine.lastLatencyMs }
+    private var lastSourceLabel: String {
+        if let error = engine.lastError { return error }
+        if engine.isGenerating { return "Generating…" }
+        return engine.currentSuggestion?.providerName ?? "Ready"
+    }
 
     private let samplePrompts: [(label: String, text: String)] = [
         ("Email Reply", "Thank you for "),
@@ -222,16 +231,19 @@ public struct PlaygroundView: View {
         ("Learned Phrase", "In order to keep CPU and memory usage minimal, ")
     ]
 
-    public init() {}
+    public init(isSetup: Bool = false, onAccepted: (() -> Void)? = nil) {
+        self.isSetup = isSetup
+        self.onAccepted = onAccepted
+    }
 
     private var hasAnyActiveAction: Bool {
-        !playgroundSuggestion.isEmpty || activeTypoFix != nil || !activeEmojis.isEmpty || activeSlashMatch != nil
+        engine.currentSuggestion != nil
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Clean Header
-            HStack(spacing: 12) {
+            if !isSetup { HStack(spacing: 12) {
                 if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
                    let nsImg = NSImage(contentsOf: iconURL) {
                     Image(nsImage: nsImg)
@@ -268,6 +280,7 @@ public struct PlaygroundView: View {
                 .background(Capsule().fill(Color.primary.opacity(0.06)))
             }
 
+            }
             // Sample Prompts Bar
             HStack(spacing: 8) {
                 Text("Try:")
@@ -279,6 +292,7 @@ public struct PlaygroundView: View {
                 ForEach(samplePrompts, id: \.label) { item in
                     Button(action: {
                         inputText = item.text
+                        selection = NSRange(location: (item.text as NSString).length, length: 0)
                         generateSuggestion(for: item.text, force: true)
                     }) {
                         Text(item.label)
@@ -292,6 +306,7 @@ public struct PlaygroundView: View {
 
                 Button("Clear") {
                     inputText = ""
+                    selection = NSRange(location: 0, length: 0)
                     dismissSuggestion()
                 }
                 .buttonStyle(.plain)
@@ -302,7 +317,7 @@ public struct PlaygroundView: View {
             // Main Ghost-Aware Text Editor
             PlaygroundEditorRepresentable(
                 text: $inputText,
-                selectedText: $selectedText,
+                selection: $selection,
                 ghostSuggestion: playgroundSuggestion,
                 hasInterceptableAction: hasAnyActiveAction,
                 ghostOpacity: settings.ghostTextOpacity,
@@ -331,8 +346,8 @@ public struct PlaygroundView: View {
             .onChange(of: inputText) { _, newText in
                 generateSuggestion(for: newText)
             }
-            .onChange(of: selectedText) { _, newSel in
-                synonyms = SmartWritingFeatures.lookupSynonyms(for: newSel)
+            .onChange(of: selection) { _, _ in
+                generateSuggestion(for: inputText)
             }
 
             // Clean Action & Correction Bar
@@ -387,6 +402,10 @@ public struct PlaygroundView: View {
                             .controlSize(.small)
                         }
                     }
+                } else if let suggestion = engine.currentSuggestion, suggestion.replacementLength > 0 {
+                    Text("Expand to: " + suggestion.remainingText)
+                        .font(.caption)
+                        .lineLimit(1)
                 } else if !synonyms.isEmpty {
                     HStack(spacing: 6) {
                         Text("Replace \"\(selectedText)\":")
@@ -437,7 +456,7 @@ public struct PlaygroundView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(playgroundSuggestion.isEmpty)
+                .disabled(!hasAnyActiveAction)
 
                 Button(action: dismissSuggestion) {
                     Text("Dismiss (Esc)")
@@ -515,242 +534,61 @@ public struct PlaygroundView: View {
         .onAppear {
             generateSuggestion(for: inputText)
         }
+        .onDisappear { engine.dismiss() }
     }
 
     private func generateSuggestion(for text: String, force: Bool = false) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            playgroundSuggestion = ""
-            activeTypoFix = nil
-            activeEmojis = []
-            activeSlashMatch = nil
-            wordAlternatives = []
-            return
-        }
-
-        // 0. Check Slash Commands (/date, /time, /sig, /lgtm...)
-        if settings.enableSlashCommands {
-            let clips = deepContext.clipboardHistory.map(\.text)
-            if let slashMatch = SmartWritingFeatures.matchSlashCommand(
-                in: text,
-                customCommands: settings.slashCommands,
-                recentClips: clips
-            ) {
-                self.activeSlashMatch = slashMatch
-                self.activeTypoFix = nil
-                self.activeEmojis = []
-                self.playgroundSuggestion = ""
-                self.lastLatency = 0
-                self.lastSourceLabel = "Slash Snippet"
-                return
-            } else {
-                self.activeSlashMatch = nil
-            }
-        } else {
-            self.activeSlashCommandCleared()
-        }
-
-        // 1. Check Inline Autocorrect FIRST (so typos like "focuso" or "expeexperience" are immediately caught)
-        if settings.showSuggestedTypoFixes, let typo = SmartWritingFeatures.detectAutocorrect(in: text) {
-            self.activeTypoFix = typo
-            self.activeEmojis = []
-            self.playgroundSuggestion = ""
-            self.wordAlternatives = []
-            self.lastLatency = 1
-            self.lastSourceLabel = "Autocorrect"
-            return
-        } else {
-            self.activeTypoFix = nil
-        }
-
-        // 2. Check Emoji Shortcodes (:joy, :crylaugh, :rocket)
-        let emojis = SmartWritingFeatures.matchEmoji(
-            in: text,
-            enableShortcodes: settings.enableEmojiSuggestions,
-            enableEmoticons: settings.suggestEmojiFromEmoticons,
-            skinTone: settings.preferredEmojiSkinTone,
-            includeNeutralSkinTone: settings.includeNeutralEmojiVariant
-        )
-        self.activeEmojis = emojis
-        if let firstEmoji = emojis.first {
-            self.playgroundSuggestion = " " + firstEmoji.emoji
-            self.wordAlternatives = []
-            self.lastLatency = 1
-            self.lastSourceLabel = "Shortcode"
-            return
-        }
-
-        let tone = settings.selectedTone
-        let ragSamples = learningEngine.relevantWritingSamples(
-            for: text,
-            appBundleId: "com.freetypist.playground",
-            domain: nil,
-            strength: settings.personalizationStrength
-        )
-        let deepSummary = deepContext.buildSynthesizedContextSummary(
-            currentAppName: "FreeTypist Playground",
-            currentBundleId: "com.freetypist.playground",
-            activeFieldText: text
-        )
-
-        let context = PromptContext(
-            precedingText: text,
-            followingText: "",
+        let context = TextEditingContext(text: text, selection: selection)
+        engine.onTextContextChanged(
+            precedingText: context.precedingText,
+            followingText: context.followingText,
+            selectedText: context.selectedText,
             appName: "FreeTypist Playground",
-            bundleIdentifier: "com.freetypist.playground",
-            clipboardSnippet: deepContext.clipboardHistory.first?.text,
-            deepContextSummary: deepSummary,
-            personaDescription: settings.personaDescription,
-            toneInstruction: tone == .custom ? settings.customToneInstructions : tone.promptInstruction,
-            dictionary: settings.personalDictionary,
-            learnedSamples: ragSamples,
-            maxWords: settings.completionLength.maxWords
+            bundleId: "com.freetypist.playground",
+            force: force
         )
-
-        if let learned = learningEngine.predictFromLearnedHistory(precedingText: text, strength: settings.personalizationStrength) {
-            self.playgroundSuggestion = PromptBuilder.cleanCompletionText(learned, precedingText: text, maxWords: settings.completionLength.maxWords)
-            self.lastLatency = 1
-            self.lastSourceLabel = "Learned Style"
-            self.wordAlternatives = SmartWritingFeatures.generateWordAlternatives(
-                primarySuggestion: self.playgroundSuggestion,
-                precedingText: text,
-                tone: tone
-            )
-        } else {
-            let instant = OfflinePredictor().complete(context: context, tone: tone)
-            self.playgroundSuggestion = PromptBuilder.cleanCompletionText(instant, precedingText: text, maxWords: settings.completionLength.maxWords)
-            self.lastLatency = 2
-            self.lastSourceLabel = inferenceService.isServerRunning ? "Metal Engine" : "On-Device Predictor"
-            self.wordAlternatives = SmartWritingFeatures.generateWordAlternatives(
-                primarySuggestion: self.playgroundSuggestion,
-                precedingText: text,
-                tone: tone
-            )
-        }
-
-        let provider = ModelProviderFactory.provider(for: settings.activeProvider)
-        Task {
-            do {
-                let (completion, latency) = try await provider.complete(context: context, settings: settings)
-                await MainActor.run {
-                    guard self.inputText == text else { return }
-                    if !completion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        self.playgroundSuggestion = completion
-                        self.lastLatency = latency
-                        self.lastSourceLabel = self.inferenceService.isServerRunning
-                            ? "\(self.modelManager.selectedModel.name)"
-                            : "On-Device Predictor"
-                        self.wordAlternatives = SmartWritingFeatures.generateWordAlternatives(
-                            primarySuggestion: completion,
-                            precedingText: text,
-                            tone: tone
-                        )
-                    }
-                }
-            } catch {}
-        }
     }
 
-    private func activeSlashCommandCleared() {
-        self.activeSlashMatch = nil
+    private func applyInsertion(_ insertion: String, deleteBackwardsCount: Int = 0) {
+        let result = editorContext.replacingSelection(with: insertion, deleteBackwardsCount: deleteBackwardsCount)
+        inputText = result.text
+        selection = result.selection
+        onAccepted?()
     }
 
     private func applyEmoji(_ candidate: EmojiCandidate) {
-        if inputText.count >= candidate.replacementLength {
-            inputText.removeLast(candidate.replacementLength)
-        }
-        inputText += candidate.emoji + " "
+        applyInsertion(candidate.emoji, deleteBackwardsCount: candidate.replacementLength)
         StatsManager.shared.recordAccepted(text: candidate.emoji, appName: "FreeTypist Playground", source: "Autocorrect & Emoji")
-        activeEmojis = []
-        playgroundSuggestion = ""
+        engine.dismiss()
     }
 
     private func acceptFull() {
-        if let slash = activeSlashMatch {
-            if inputText.count >= slash.replacementLength {
-                inputText.removeLast(slash.replacementLength)
-            }
-            inputText += slash.expansion
-            StatsManager.shared.recordAccepted(text: slash.expansion, appName: "FreeTypist Playground", source: "Slash Snippets")
-            activeSlashMatch = nil
-            playgroundSuggestion = ""
-            return
-        }
-        if let typo = activeTypoFix {
-            if inputText.count >= typo.replacementLength {
-                inputText.removeLast(typo.replacementLength)
-            }
-            inputText += typo.correctedWord
-            StatsManager.shared.recordAccepted(text: typo.correctedWord, appName: "FreeTypist Playground", source: "Autocorrect & Emoji")
-            activeTypoFix = nil
-            playgroundSuggestion = ""
-            return
-        }
-        if let emoji = activeEmojis.first {
-            applyEmoji(emoji)
-            return
-        }
-        guard !playgroundSuggestion.isEmpty else { return }
-        let accepted = playgroundSuggestion
-        let before = inputText
-        inputText += accepted
-        StatsManager.shared.recordAccepted(text: accepted, appName: "FreeTypist Playground", source: lastSourceLabel)
-        learningEngine.recordAcceptedCompletion(
-            precedingText: before,
-            acceptedText: accepted,
-            appName: "FreeTypist Playground",
-            bundleId: "com.freetypist.playground"
-        )
-        if settings.playSoundOnAccept {
-            NSSound(named: "Tink")?.play()
-        }
-        playgroundSuggestion = ""
+        guard let accepted = engine.acceptFull() else { return }
+        applyInsertion(accepted.textToInsert, deleteBackwardsCount: accepted.deleteBackwardsCount)
     }
 
     private func acceptWord() {
-        guard !playgroundSuggestion.isEmpty else { return }
-        var item = CompletionItem(fullText: playgroundSuggestion)
-        if let word = item.advanceOneWord() {
-            let before = inputText
-            inputText += word
-            StatsManager.shared.recordAccepted(text: word, appName: "FreeTypist Playground", source: lastSourceLabel)
-            learningEngine.recordAcceptedCompletion(
-                precedingText: before,
-                acceptedText: word,
-                appName: "FreeTypist Playground",
-                bundleId: "com.freetypist.playground"
-            )
-            playgroundSuggestion = item.remainingText
+        if (engine.currentSuggestion?.replacementLength ?? 0) > 0 {
+            acceptFull()
+        } else if let word = engine.acceptNextWord() {
+            applyInsertion(word)
         }
     }
 
-    private func acceptAlternativeString(_ alt: String) {
-        let before = inputText
-        inputText += alt
-        StatsManager.shared.recordAccepted(text: alt, appName: "FreeTypist Playground", source: lastSourceLabel)
-        learningEngine.recordAcceptedCompletion(
-            precedingText: before,
-            acceptedText: alt,
-            appName: "FreeTypist Playground",
-            bundleId: "com.freetypist.playground"
-        )
-        playgroundSuggestion = ""
-        wordAlternatives = []
+    private func acceptAlternativeString(_ alternative: String) {
+        guard let item = engine.activeWordAlternatives.first(where: { $0.text == alternative }),
+              let accepted = engine.acceptAlternative(at: item.index) else { return }
+        applyInsertion(accepted)
     }
 
-    private func replaceSelectedWithSynonym(_ syn: String) {
-        guard !selectedText.isEmpty, let range = inputText.range(of: selectedText, options: .backwards) else { return }
-        inputText.replaceSubrange(range, with: syn)
-        StatsManager.shared.recordAccepted(text: syn, appName: "FreeTypist Playground", source: "Contextual Synonyms")
-        selectedText = ""
-        synonyms = []
+    private func replaceSelectedWithSynonym(_ synonym: String) {
+        guard !editorContext.selectedText.isEmpty else { return }
+        applyInsertion(synonym)
+        StatsManager.shared.recordAccepted(text: synonym, appName: "FreeTypist Playground", source: "Contextual Synonyms")
+        engine.dismiss()
     }
 
     private func dismissSuggestion() {
-        playgroundSuggestion = ""
-        activeTypoFix = nil
-        activeEmojis = []
-        activeSlashMatch = nil
-        wordAlternatives = []
+        engine.dismiss()
     }
 }

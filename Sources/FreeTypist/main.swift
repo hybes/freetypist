@@ -38,16 +38,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Initialize Menubar
         MenuBarController.shared.setup()
+        AppUpdater.shared.start()
 
         // Initialize Floating Ghost Overlay
         _ = GhostOverlayPanel.shared
 
         // Start Keyboard Hook
-        KeyboardHook.shared.start()
+        PermissionManager.shared.startMonitoring()
 
         // Open main window so user can immediately see Playground & Settings
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            MenuBarController.shared.openSettings(tab: 0)
+            if SetupState.shared.isCompleted { MenuBarController.shared.openSettings(tab: 0) }
+            else { MenuBarController.shared.openSetup() }
         }
 
         print("FreeTypist started.")
@@ -55,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         KeyboardHook.shared.stop()
+        PermissionManager.shared.stopMonitoring()
         LocalInferenceService.shared.stopServer()
     }
 }
@@ -64,6 +67,17 @@ struct FreeTypistAppMain {
     @MainActor
     static func main() async {
         let args = CommandLine.arguments
+        // A user-requested relaunch waits for the previous process to release its
+        // keyboard tap and inference port before starting the replacement.
+        if let arg = args.first(where: { $0.hasPrefix("--wait-for-pid=") }),
+           let pid = Int32(arg.dropFirst("--wait-for-pid=".count)), pid > 1 {
+            for _ in 0..<200 {
+                if kill(pid, 0) != 0 { break }
+                // Do not enter Swift's main-queue executor before installing the
+                // AppKit delegate: launch events could otherwise finish first.
+                usleep(50_000)
+            }
+        }
 
         if args.contains("--help") || args.contains("-h") {
             print("""
@@ -104,8 +118,36 @@ struct FreeTypistAppMain {
             if let activePath = LocalModelManager.shared.activeModelPath() {
                 print("Starting server for \(activePath)...")
                 LocalInferenceService.shared.startServer(for: activePath)
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                for _ in 0..<750 {
+                    if LocalInferenceService.shared.isServerRunning || !LocalInferenceService.shared.isStarting { break }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                guard LocalInferenceService.shared.isServerRunning else {
+                    print("Engine test failed: \(LocalInferenceService.shared.serverStatus)")
+                    LocalInferenceService.shared.stopServer()
+                    exit(EXIT_FAILURE)
+                }
+                let suite = "com.freetypist.diagnostic.\(UUID().uuidString)"
+                let defaults = UserDefaults(suiteName: suite)!
+                let settings = AppSettings(defaults: defaults)
+                settings.personalizationStrength = .off
+                do {
+                    for prefix in ["Thank you for ", "I think we should ", "The next step is to "] {
+                        let result = try await EmbeddedLocalProvider(allowFallback: false).complete(
+                            context: PromptContext(precedingText: prefix, maxWords: 4), settings: settings)
+                        print("Engine completion: '\(prefix)' + '\(result.text)' (\(result.latencyMs)ms)")
+                    }
+                } catch {
+                    print("Engine completion failed: \(error.localizedDescription)")
+                    LocalInferenceService.shared.stopServer()
+                    defaults.removePersistentDomain(forName: suite)
+                    exit(EXIT_FAILURE)
+                }
+                defaults.removePersistentDomain(forName: suite)
                 LocalInferenceService.shared.stopServer()
+            } else {
+                print("No downloaded model is selected. Download one in General settings first.")
+                exit(EXIT_FAILURE)
             }
             return
         }
@@ -125,6 +167,6 @@ struct FreeTypistAppMain {
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
-        app.run()
+        withExtendedLifetime(delegate) { app.run() }
     }
 }

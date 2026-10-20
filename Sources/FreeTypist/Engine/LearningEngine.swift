@@ -106,18 +106,11 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
     private var saveWorkItem: DispatchWorkItem?
     private let maxHistoryRecords = 1500
 
-    private var storageURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("FreeTypist", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("writing_history_v2.json")
-    }
+    private let storageURL: URL
 
-    private init() {
+    init(storageURL: URL? = nil) {
+        self.storageURL = storageURL ?? AppStorage.directory.appendingPathComponent("writing_history_v2.json")
         loadFromDisk()
-        if historyRecords.isEmpty {
-            seedInitialLearningData()
-        }
         rebuildIndices()
     }
 
@@ -168,10 +161,9 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         if let firstIdx = historyRecords.indices.first,
            historyRecords[firstIdx].appBundleIdentifier == record.appBundleIdentifier,
            Date().timeIntervalSince(historyRecords[firstIdx].updatedAt) < 8.0,
-           sanitizedPreceding.hasPrefix(historyRecords[firstIdx].textUpToCursor) {
+           (historyRecords[firstIdx].textUpToCursor + (historyRecords[firstIdx].acceptedCompletion ?? "")) == sanitizedPreceding {
             let prevAccepted = historyRecords[firstIdx].acceptedCompletion ?? ""
             historyRecords[firstIdx].acceptedCompletion = prevAccepted + sanitizedAccepted
-            historyRecords[firstIdx].textUpToCursor = sanitizedPreceding
             historyRecords[firstIdx].updatedAt = Date()
             historyRecords[firstIdx].wordCount = combined.split(whereSeparator: \.isWhitespace).count
         } else {
@@ -483,6 +475,7 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         historyRecords.removeAll { $0.id == id }
         lock.unlock()
         rebuildIndices()
+        CompletionLRUCache.shared.clear()
         scheduleSave()
     }
 
@@ -491,6 +484,7 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         historyRecords.removeAll { $0.appBundleIdentifier == bundleId }
         lock.unlock()
         rebuildIndices()
+        CompletionLRUCache.shared.clear()
         scheduleSave()
     }
 
@@ -500,13 +494,23 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         let initialVocabCount = vocabularyCounts.count
 
         lock.lock()
-        var existingTexts = Set(historyRecords.map { $0.textUpToCursor.trimmingCharacters(in: .whitespacesAndNewlines) })
+        func recordKey(_ record: WritingHistoryRecord) -> String {
+            record.appBundleIdentifier + "|" + (record.textUpToCursor + (record.acceptedCompletion ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        var existingTexts = Set(historyRecords.map(recordKey))
         var addedCount = 0
         var newlyAdded: [WritingHistoryRecord] = []
 
-        for rec in records {
-            let key = rec.textUpToCursor.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard key.count >= 8, !existingTexts.contains(key) else { continue }
+        for source in records {
+            guard !AppSettings.shared.isAppRecordingExcluded(bundleIdentifier: source.appBundleIdentifier) else { continue }
+            var rec = source
+            let before = SecretSanitizer.sanitize(rec.textUpToCursor)
+            let accepted = rec.acceptedCompletion.map { SecretSanitizer.sanitize($0) }
+            rec.textUpToCursor = before.sanitized
+            rec.acceptedCompletion = accepted?.sanitized
+            rec.redactedSecretsCount += before.redactedTypes.count + (accepted?.redactedTypes.count ?? 0)
+            let key = recordKey(rec)
+            guard rec.textUpToCursor.count >= 8, !existingTexts.contains(key) else { continue }
             existingTexts.insert(key)
             historyRecords.append(rec)
             newlyAdded.append(rec)
@@ -550,13 +554,18 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         sortedVocabulary.removeAll()
         totalLearnedTokens = 0
         lock.unlock()
-        try? FileManager.default.removeItem(at: storageURL)
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        CompletionLRUCache.shared.clear()
+        saveToDisk()
     }
 
     // MARK: - Persistence
     private func rebuildIndices() {
         lock.lock()
         ngramMap.removeAll()
+        learnedPhrases.removeAll()
+        sortedVocabulary.removeAll()
         vocabularyCounts.removeAll()
         totalLearnedTokens = 0
         let snapshot = historyRecords
@@ -597,33 +606,4 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         self.historyRecords = decoded
     }
 
-    private func seedInitialLearningData() {
-        let now = Date()
-        let samples: [(String, String, String?, String, String, TimeInterval)] = [
-            ("com.apple.mail", "Apple Mail", nil, "Hi team, thank you for ", "sending over the updated roadmap and architecture notes.", -3600 * 18),
-            ("com.tinyspeck.slackmacgap", "Slack", "slack.com", "Sounds good to me, ", "let's sync on the deployment checklist right after standup.", -3600 * 14),
-            ("com.apple.Notes", "Notes", nil, "In order to keep CPU and memory usage minimal, ", "we reuse the KV cache prefix and quantize attention buffers on Metal.", -3600 * 10),
-            ("com.apple.Safari", "Safari", "github.com", "Could you please review the ", "latest pull request when you have a few minutes?", -3600 * 6),
-            ("com.apple.mail", "Apple Mail", nil, "Please let me know if ", "you have any questions or would like to adjust the timeline.", -3600 * 3),
-            ("com.tinyspeck.slackmacgap", "Slack", "slack.com", "Just following up on our call about ", "the release build pipeline and local inference benchmarks.", -1800)
-        ]
-
-        self.historyRecords = samples.map { bundleId, appName, domain, before, accepted, offset in
-            WritingHistoryRecord(
-                createdAt: now.addingTimeInterval(offset),
-                updatedAt: now.addingTimeInterval(offset),
-                appBundleIdentifier: bundleId,
-                appName: appName,
-                domain: domain,
-                windowTitle: "\(appName) — Workspace",
-                textUpToCursor: before,
-                acceptedCompletion: accepted,
-                textLanguage: "en",
-                wordCount: (before + accepted).split(whereSeparator: \.isWhitespace).count,
-                wasAcceptedCompletion: true,
-                redactedSecretsCount: 0
-            )
-        }
-        saveToDisk()
-    }
 }

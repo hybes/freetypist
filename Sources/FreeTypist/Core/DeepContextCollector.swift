@@ -65,24 +65,32 @@ public final class DeepContextCollector: ObservableObject {
 
     private var lastPasteboardChangeCount: Int = 0
     private var clipboardTimer: Timer?
+    private var appSwitchObserver: NSObjectProtocol?
+    private var settingsObserver: AnyCancellable?
     private var cachedWindowContextKey: String = ""
     private var cachedWindowSnippets: [String] = []
     private var cachedWindowTimestamp: Date = .distantPast
 
     private init() {
         self.lastPasteboardChangeCount = NSPasteboard.general.changeCount
-        seedInitialRichContext()
-        startMonitoring()
-    }
-
-    private func seedInitialRichContext() {
-        let now = Date()
-        if let liveClip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !liveClip.isEmpty {
-            clipboardHistory.append(ClipboardHistoryEntry(text: String(liveClip.prefix(400)), sourceApp: "Clipboard", copiedAt: now))
+        if !AppStorage.isIsolated {
+            captureSafeClipboard()
+            startMonitoring()
         }
-        crossAppTrail = []
-        activeWindowSurroundingText = []
+        settingsObserver = AppSettings.shared.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in
+                guard let self else { return }
+                let settings = AppSettings.shared
+                if !settings.useClipboardContext { self.clipboardHistory = [] }
+                if !settings.trackCrossAppContext { self.crossAppTrail = [] }
+                if !settings.readSurroundingWindowText {
+                    self.activeWindowSurroundingText = []
+                    self.activeDocumentOrURL = nil
+                    self.cachedWindowSnippets = []
+                    self.cachedWindowContextKey = ""
+                }
+            }
     }
 
     public func startMonitoring() {
@@ -96,7 +104,8 @@ public final class DeepContextCollector: ObservableObject {
         timer.tolerance = 0.8
         self.clipboardTimer = timer
 
-        NSWorkspace.shared.notificationCenter.addObserver(
+        if let appSwitchObserver { NSWorkspace.shared.notificationCenter.removeObserver(appSwitchObserver) }
+        appSwitchObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
@@ -115,16 +124,15 @@ public final class DeepContextCollector: ObservableObject {
         guard pb.changeCount != lastPasteboardChangeCount else { return }
         lastPasteboardChangeCount = pb.changeCount
 
-        guard let raw = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else { return }
+        captureSafeClipboard()
+    }
 
+    private func captureSafeClipboard() {
         let settings = AppSettings.shared
-        let finalClip: String
-        if settings.sanitizeSecretsLocally {
-            finalClip = SecretSanitizer.sanitize(String(raw.prefix(600))).sanitized
-        } else {
-            finalClip = String(raw.prefix(600))
-        }
+        guard settings.isEnabled, settings.useClipboardContext,
+              !settings.isAppRecordingExcluded(bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier),
+              let raw = PromptBuilder.readSafeClipboardSnippet(enabled: true) else { return }
+        let finalClip = raw
 
         let frontApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Clipboard"
         clipboardHistory.removeAll { $0.text == finalClip }
@@ -132,12 +140,16 @@ public final class DeepContextCollector: ObservableObject {
             ClipboardHistoryEntry(text: finalClip, sourceApp: frontApp, copiedAt: Date()),
             at: 0
         )
-        if clipboardHistory.count > 10 {
-            clipboardHistory.removeLast(clipboardHistory.count - 10)
+        let limit = settings.trackMultiClipboardHistory ? 10 : 1
+        if clipboardHistory.count > limit {
+            clipboardHistory.removeLast(clipboardHistory.count - limit)
         }
     }
 
     private func handleAppSwitch(to app: NSRunningApplication) {
+        let settings = AppSettings.shared
+        guard settings.isEnabled, settings.trackCrossAppContext,
+              !settings.isAppRecordingExcluded(bundleIdentifier: app.bundleIdentifier) else { return }
         let appName = app.localizedName ?? "App"
         let bundleId = app.bundleIdentifier ?? "unknown"
         // Don't overwrite trail when opening FreeTypist's own settings window
@@ -163,6 +175,9 @@ public final class DeepContextCollector: ObservableObject {
         domainOrURL: String?,
         snippet: String
     ) {
+        let settings = AppSettings.shared
+        guard settings.isEnabled, settings.trackCrossAppContext,
+              !settings.isAppRecordingExcluded(bundleIdentifier: bundleId) else { return }
         let cleanSnippet = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanSnippet.isEmpty || !windowTitle.isEmpty else { return }
 
@@ -187,7 +202,7 @@ public final class DeepContextCollector: ObservableObject {
     /// Uses a 2.5-second cache per window so rapid typing never re-walks the AX tree on every keystroke.
     public func gatherRichWindowContext(activeFieldText: String) -> (surroundingSnippets: [String], documentOrURL: String?) {
         let settings = AppSettings.shared
-        guard settings.readSurroundingWindowText else {
+        guard settings.isEnabled, settings.readSurroundingWindowText else {
             return ([], nil)
         }
 
@@ -195,6 +210,7 @@ public final class DeepContextCollector: ObservableObject {
             return (activeWindowSurroundingText, activeDocumentOrURL)
         }
 
+        guard !settings.isAppRecordingExcluded(bundleIdentifier: frontApp.bundleIdentifier) else { return ([], nil) }
         if frontApp.bundleIdentifier == Bundle.main.bundleIdentifier {
             // Inside FreeTypist Playground: return the live/seeded surrounding context so Playground can test deep context!
             return (activeWindowSurroundingText, activeDocumentOrURL)
@@ -209,12 +225,8 @@ public final class DeepContextCollector: ObservableObject {
         cachedWindowContextKey = "\(frontApp.processIdentifier)-\(result.windowTitle)"
         cachedWindowTimestamp = Date()
         cachedWindowSnippets = result.snippets
-        if !result.snippets.isEmpty {
-            activeWindowSurroundingText = result.snippets
-        }
-        if let doc = result.documentOrURL {
-            activeDocumentOrURL = doc
-        }
+        activeWindowSurroundingText = result.snippets
+        activeDocumentOrURL = result.documentOrURL
         if !result.windowTitle.isEmpty {
             lastCapturedWindowTitle = result.windowTitle
         }
@@ -225,8 +237,8 @@ public final class DeepContextCollector: ObservableObject {
         for app: NSRunningApplication,
         activeFieldText: String
     ) -> (windowTitle: String, documentOrURL: String?, snippets: [String]) {
-        guard AXIsProcessTrusted() else {
-            return ("", nil, activeWindowSurroundingText)
+        guard AXIsProcessTrusted(), !AppSettings.shared.isAppRecordingExcluded(bundleIdentifier: app.bundleIdentifier) else {
+            return ("", nil, [])
         }
 
         let appAX = AXUIElementCreateApplication(app.processIdentifier)
@@ -317,6 +329,7 @@ public final class DeepContextCollector: ObservableObject {
         activeFieldText: String
     ) -> String {
         let settings = AppSettings.shared
+        guard settings.isEnabled, !settings.isAppRecordingExcluded(bundleIdentifier: currentBundleId) else { return "" }
         var sections: [String] = []
 
         // 1. User & Temporal Environment
@@ -344,7 +357,7 @@ public final class DeepContextCollector: ObservableObject {
         // 3. Cross-App Recent Activity Trail
         if settings.trackCrossAppContext {
             let recentOtherApps = crossAppTrail
-                .filter { $0.bundleId != currentBundleId }
+                .filter { $0.bundleId != currentBundleId && !settings.isAppRecordingExcluded(bundleIdentifier: $0.bundleId) }
                 .prefix(3)
             if !recentOtherApps.isEmpty {
                 let trailDesc = recentOtherApps.map { entry in
@@ -363,7 +376,8 @@ public final class DeepContextCollector: ObservableObject {
             sections.append("Clipboard Memory: \(clips)")
         }
 
-        return sections.joined(separator: "\n")
+        let summary = sections.joined(separator: "\n")
+        return settings.sanitizeSecretsLocally ? SecretSanitizer.sanitize(summary).sanitized : summary
     }
 
     public func addSimulatedWindowContext(_ snippet: String) {

@@ -1,137 +1,131 @@
+import AppKit
 import SwiftUI
 
 public struct PermissionsView: View {
-    @State private var isAccessibilityGranted: Bool = AccessibilityService.isAccessibilityGranted()
-    @State private var timer: Timer?
-
+    @ObservedObject private var permissions = PermissionManager.shared
+    @State private var showRecovery = false
     public init() {}
 
     public var body: some View {
-        Group {
-            if isAccessibilityGranted {
-                HStack(spacing: 12) {
-                    Image(systemName: "checkmark.shield.fill")
-                        .font(.system(size: 22))
-                        .foregroundColor(.green)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Accessibility Permission Granted")
-                            .font(.system(size: 13.5, weight: .semibold))
-                        Text("FreeTypist is active and ready to suggest inline completions and corrections across macOS.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-
-                    Spacer()
-
-                    Button("System Settings") {
-                        AccessibilityService.openSystemSettingsAccessibility()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: permissions.isReady ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                    .font(.system(size: 24)).foregroundColor(permissions.isReady ? .green : .orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.headline)
+                    Text(detail).font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.green.opacity(0.06))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.green.opacity(0.22), lineWidth: 1)
-                )
-            } else {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(spacing: 12) {
-                        Image(systemName: "exclamationmark.shield.fill")
-                            .font(.system(size: 28))
-                            .foregroundColor(.orange)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Accessibility Permission Required")
-                                .font(.headline)
-                            Text("FreeTypist needs Accessibility access to detect your cursor position and insert inline completions.")
-                                .font(.caption)
+                Spacer(minLength: 0)
+            }
+            if permissions.readiness == .needsAccess {
+                HStack(spacing: 10) {
+                    Button("Allow Accessibility…") { permissions.requestAccess() }.buttonStyle(.borderedProminent)
+                    Button("Open System Settings") { AccessibilityService.openSystemSettingsAccessibility() }
+                    Button("Recheck") { permissions.refresh() }
+                }
+                Text("In System Settings → Privacy & Security → Accessibility, enable FreeTypist. On newer macOS versions, this pane may be called Device Control and Data Access.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else if permissions.isReady {
+                Button("Open System Settings") { AccessibilityService.openSystemSettingsAccessibility() }.controlSize(.small)
+            }
+            if !permissions.isReady {
+                HStack(spacing: 12) {
+                    AppFileDragIcon(appURL: permissions.appURL)
+                        .frame(width: 48, height: 48)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Drag this icon into the app list in System Settings")
+                            .font(.callout.weight(.medium))
+                        Text("Then turn on FreeTypist. If the list does not accept the drop, use + to add this app.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Text(permissions.appURL.path)
+                            .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button("Show in Finder") { permissions.revealApp() }
+                }
+                DisclosureGroup("Already enabled in System Settings?", isExpanded: $showRecovery) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("1. Turn FreeTypist off and on again, then choose Recheck.")
+                        Text("2. If it still fails, remove the old FreeTypist entry with −. Drag the icon above into the list, or add this app with +, then enable it.")
+                        Text("3. Quit and reopen FreeTypist to refresh its access. Your settings and setup progress are saved; the Playground closes.")
+                        Button("Quit & Reopen FreeTypist") { permissions.relaunch() }
+                        if permissions.signingTeam == nil {
+                            Text("This development build needs access again after it changes. Signed releases keep a stable identity between updates.")
                                 .foregroundColor(.secondary)
                         }
-
-                        Spacer()
-                    }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        stepRow(number: "1", title: "Open System Settings", detail: "Go to Privacy & Security → Accessibility")
-                        stepRow(number: "2", title: "Enable FreeTypist", detail: "Turn on the toggle next to FreeTypist")
-                    }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
-
-                    HStack(spacing: 10) {
-                        Button(action: {
-                            AccessibilityService.requestAccessibilityPermission()
-                        }) {
-                            Text("Request Permission")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button(action: {
-                            AccessibilityService.openSystemSettingsAccessibility()
-                        }) {
-                            Text("Open System Settings")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                    }
+                    }.font(.callout).padding(.top, 8)
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.orange.opacity(0.06))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.orange.opacity(0.22), lineWidth: 1)
-                )
-            }
-        }
-        .onAppear {
-            checkPermission()
-            timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
-                Task { @MainActor in
-                    checkPermission()
+                if permissions.readiness == .needsKeyboardHook {
+                    Button("Quit & Reopen FreeTypist") { permissions.relaunch() }
                 }
             }
+            if let error = permissions.relaunchError { Text(error).foregroundColor(.red).font(.caption) }
         }
-        .onDisappear {
-            timer?.invalidate()
-            timer = nil
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill((permissions.isReady ? Color.green : Color.orange).opacity(0.06)))
+        .onAppear { permissions.startMonitoring() }
+        .onChange(of: permissions.hasRequestedAccess) { _, requested in
+            if requested && !permissions.isReady { showRecovery = true }
         }
     }
 
-    private func checkPermission() {
-        let granted = AccessibilityService.isAccessibilityGranted()
-        if granted != isAccessibilityGranted {
-            isAccessibilityGranted = granted
+    private var title: String {
+        switch permissions.readiness {
+        case .ready: "Accessibility is working"
+        case .needsAccess: "Allow FreeTypist to work in other apps"
+        case .needsKeyboardHook: "Accessibility is allowed; keyboard access needs a restart"
         }
     }
-
-    private func stepRow(number: String, title: String, detail: String) -> some View {
-        HStack(alignment: .center, spacing: 10) {
-            Text(number)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundColor(.white)
-                .frame(width: 20, height: 20)
-                .background(Circle().fill(Color.accentColor))
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.system(size: 12.5, weight: .semibold))
-                Text(detail)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-            }
+    private var detail: String {
+        switch permissions.readiness {
+        case .ready: "macOS allows this copy of FreeTypist to read the cursor, and its keyboard hook is active."
+        case .needsAccess: "FreeTypist needs this to place suggestions beside your cursor and insert the text you accept. Password fields are excluded."
+        case .needsKeyboardHook: "FreeTypist can read the cursor, but it cannot intercept Tab yet. Quit and reopen it, then recheck."
         }
+    }
+}
+
+/// Export the running app as a file URL, like dragging it from Finder. Only
+/// copying is offered so a drop cannot move the installed application.
+private struct AppFileDragIcon: NSViewRepresentable {
+    let appURL: URL
+
+    func makeNSView(context: Context) -> DragImageView { DragImageView(appURL: appURL) }
+    func updateNSView(_ view: DragImageView, context: Context) { view.appURL = appURL }
+
+    final class DragImageView: NSImageView, NSDraggingSource {
+        var appURL: URL {
+            didSet { image = NSWorkspace.shared.icon(forFile: appURL.path) }
+        }
+
+        init(appURL: URL) {
+            self.appURL = appURL
+            super.init(frame: NSRect(x: 0, y: 0, width: 48, height: 48))
+            image = NSWorkspace.shared.icon(forFile: appURL.path)
+            imageScaling = .scaleProportionallyUpOrDown
+            setAccessibilityElement(true)
+            setAccessibilityRole(.image)
+            setAccessibilityLabel("FreeTypist app, drag to System Settings")
+            setAccessibilityHelp("Drag this app into the Accessibility app list. Show in Finder is also available beside this icon.")
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func mouseDown(with event: NSEvent) { }
+
+        override func mouseDragged(with event: NSEvent) {
+            let item = NSDraggingItem(pasteboardWriter: appURL as NSURL)
+            item.setDraggingFrame(bounds, contents: image)
+            let session = beginDraggingSession(with: [item], event: event, source: self)
+            session.animatesToStartingPositionsOnCancelOrFail = true
+        }
+
+        override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+
+        func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
+        func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
     }
 }

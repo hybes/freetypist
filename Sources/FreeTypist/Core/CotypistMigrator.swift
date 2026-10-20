@@ -99,7 +99,7 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
         isMigrating = true
         defer {
             isMigrating = false
-            if includeDatabaseKeychainUnlock {
+            if includeDatabaseKeychainUnlock && lastMigrationReport?.foundInstallation == true {
                 hasCompletedInteractiveImport = true
             }
         }
@@ -175,12 +175,17 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
             summaryParts.append("custom style preferences")
         }
 
-        if summaryParts.isEmpty {
-            report.statusMessage = "Cotypist profile & stats are already imported and active."
+        if !isCotypistInstalled {
+            report.statusMessage = "No Cotypist installation was found."
+        } else if summaryParts.isEmpty {
+            report.statusMessage = "No new readable Cotypist data was found."
         } else {
             report.statusMessage = "Successfully imported " + summaryParts.joined(separator: ", ") + "."
         }
 
+        if includeDatabaseKeychainUnlock && FileManager.default.fileExists(atPath: cotypistDBURL.path) && !decryptedOK {
+            report.statusMessage += " Writing history could not be unlocked. It requires Cotypist's SQLCipher framework and its database key in Keychain."
+        }
         if includeDatabaseKeychainUnlock {
             self.lastMigrationReport = report
         }
@@ -229,11 +234,11 @@ public final class CotypistMigrator: ObservableObject, @unchecked Sendable {
                 DayStatsRecord(
                     dateString: dateString,
                     completionsAccepted: totalComps,
-                    completionsShown: Int(Double(totalComps) * 1.25),
-                    wordsSaved: max(totalWords, totalComps),
-                    charactersSaved: max(totalChars, totalWords * 5),
-                    avgLatencyMs: 21,
-                    cacheHits: max(1, totalComps / 3)
+                    completionsShown: totalComps,
+                    wordsSaved: totalWords,
+                    charactersSaved: totalChars,
+                    avgLatencyMs: 0,
+                    cacheHits: 0
                 )
             )
         }
