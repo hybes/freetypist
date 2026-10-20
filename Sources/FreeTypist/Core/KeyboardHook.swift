@@ -210,26 +210,23 @@ public final class KeyboardHook: @unchecked Sendable {
         }
 
         // Keycode 53 = Escape
-        if keyCode == 53 && hasActiveSuggestion {
-            let escBehavior = AppSettings.shared.escapeBehavior
-            if escBehavior == .passToApp {
-                return Unmanaged.passUnretained(event)
-            }
-            Task { @MainActor in
-                switch escBehavior {
-                case .dismissThenPassToApp:
-                    CompletionEngine.shared.dismiss()
-                case .pauseBriefly:
-                    AppSettings.shared.pausedUntilDate = Date().addingTimeInterval(15)
-                    CompletionEngine.shared.dismiss()
-                case .offUntilAppSwitch:
-                    AppSettings.shared.pausedAppBundleId = frontBundleId
-                    CompletionEngine.shared.dismiss()
-                case .passToApp:
-                    break
+        if keyCode == 53 && hasActiveSuggestion,
+           flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty,
+           AppSettings.shared.escapeBehavior != .passToApp {
+            contextRefreshTask?.cancel()
+            let handled = MainActor.assumeIsolated {
+                let engine = CompletionEngine.shared
+                // Do not learn from an old suggestion if the field or caret
+                // changed before its refresh arrived.
+                guard let target = AccessibilityService.shared.captureTextTarget(), let snapshot = target.snapshot(),
+                      snapshot.identity == lastFieldHash,
+                      engine.matchesContext(snapshot.context, bundleId: frontBundleId) else {
+                    engine.dismiss()
+                    return false
                 }
+                return engine.handleEscape()
             }
-            return nil
+            return handled ? nil : Unmanaged.passUnretained(event)
         }
 
         if flags.contains(.maskCommand) || flags.contains(.maskControl) {
@@ -270,7 +267,7 @@ public final class KeyboardHook: @unchecked Sendable {
             engine.dismiss()
             return false
         }
-        let paragraph = acceptance.checksParagraph ? SentenceSpellingCorrector.correction(in: snapshot) : nil
+        let paragraph = acceptance.checksParagraph ? engine.paragraphCorrection(in: snapshot) : nil
         guard !acceptance.checksParagraph || paragraph != nil else { engine.dismiss(); return false }
         Task { @MainActor in
             let result: TextReplacementResult
@@ -304,7 +301,9 @@ public final class KeyboardHook: @unchecked Sendable {
               !service.isPerformingSyntheticInsertion,
               service.getCurrentCaretInfo() != nil,
               let target = service.captureTextTarget(), let snapshot = target.snapshot(),
-              let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
+              let correction = SentenceSpellingCorrector.correction(in: snapshot,
+                  ignoredWords: settings.rememberedSpellings,
+                  feedback: settings.activeSpellingFeedback) else { return false }
         CompletionEngine.shared.dismiss()
         if let caret = service.getCurrentCaretInfo(), caret.hasValidCaretRect {
             GhostOverlayPanel.shared.updatePosition(caretScreenRect: caret.screenRect, fontSize: caret.estimatedFontSize)
@@ -315,6 +314,7 @@ public final class KeyboardHook: @unchecked Sendable {
             let result = await service.apply(correction, to: target)
             if result == .applied {
                 self.typingBuffer.replace(with: correction.edit.result.context.precedingText)
+                settings.recordSpellingFeedback(correction.spellingPairs, accepted: true)
                 ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes").")
             } else if result == .unsupported {
                 ReplacementFeedback.shared.show("Spelling changes could not be verified in this field.")

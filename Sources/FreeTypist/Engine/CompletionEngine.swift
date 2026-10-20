@@ -33,6 +33,20 @@ public final class CompletionEngine: ObservableObject {
     private var lastSelectedText = ""
     private var settingsObserver: AnyCancellable?
     private var modelObserver: AnyCancellable?
+    private var spellingWordsObserver: AnyCancellable?
+    private var spellingResetObserver: AnyCancellable?
+
+    private struct DismissedSuggestion {
+        let text: String
+        let selection: NSRange
+        let bundleId: String?
+        let domain: String?
+        let windowTitle: String?
+        let spellingRanges: [NSRange]
+        let singleWord: Bool
+    }
+    // Session-only rejection context. Never save drafts as spelling preferences.
+    private var dismissedSuggestions: [DismissedSuggestion] = []
 
     init(settings: AppSettings = .shared, stats: StatsManager = .shared,
          learning: LearningEngine = .shared, provider: (any ModelProvider)? = nil) {
@@ -45,6 +59,12 @@ public final class CompletionEngine: ObservableObject {
                 self?.dismiss()
                 CompletionLRUCache.shared.clear()
             }
+        spellingWordsObserver = settings.$rememberedSpellings.dropFirst().sink { [weak self] _ in
+            self?.dismissedSuggestions.removeAll()
+        }
+        spellingResetObserver = settings.$spellingFeedback.dropFirst().filter(\.isEmpty).sink { [weak self] _ in
+            self?.dismissedSuggestions.removeAll()
+        }
         modelObserver = LocalModelManager.shared.$selectedModel.dropFirst().sink { [weak self] _ in
             self?.dismiss()
         }
@@ -104,12 +124,25 @@ public final class CompletionEngine: ObservableObject {
         self.lastSelectedText = selectedText
         self.lastRequestedText = precedingText
 
+        let fullText = precedingText + selectedText + followingText
+        if force || fullText.isEmpty {
+            dismissedSuggestions.removeAll(where: isCurrentEnvironment)
+        } else if dismissedSuggestions.contains(where: {
+            isCurrentEnvironment($0) && $0.text == fullText
+                && $0.selection == NSRange(location: precedingText.utf16.count, length: selectedText.utf16.count)
+        }) {
+            return
+        }
+
         let appDisablesAutocorrect = settings.rule(for: bundleId)?.disableAutocorrect ?? false
         if revisitingText || !selectedText.isEmpty || followingText.first?.isLetter == true {
             if settings.showSuggestedTypoFixes && !appDisablesAutocorrect {
                 let snapshot = TextInputSnapshot(identity: 0, text: precedingText + selectedText + followingText,
                     selection: NSRange(location: precedingText.utf16.count, length: selectedText.utf16.count))
-                if let edit = SentenceSpellingCorrector.wordCorrection(in: snapshot) {
+                if let edit = SentenceSpellingCorrector.wordCorrection(in: snapshot,
+                    ignoredWords: settings.rememberedSpellings,
+                    feedback: settings.activeSpellingFeedback,
+                    ignoredRanges: dismissedSpellingRanges(in: fullText, singleWordOnly: true)) {
                     let word = (snapshot.text as NSString).substring(with: edit.range)
                     activeAutocorrect = AutocorrectSuggestion(misspelledWord: word, correctedWord: edit.insertion,
                         replacementLength: word.count, replacementRange: edit.range)
@@ -190,7 +223,7 @@ public final class CompletionEngine: ObservableObject {
         // Spelling is local and does not wait for the AI completion debounce.
         let atWordBoundary = precedingText.last.map { $0.isWhitespace || ".!?,;:".contains($0) } ?? false
         let paragraph = atWordBoundary && settings.showSuggestedTypoFixes && !appDisablesAutocorrect
-            ? SentenceSpellingCorrector.correction(in: TextInputSnapshot(identity: 0,
+            ? paragraphCorrection(in: TextInputSnapshot(identity: 0,
                 text: precedingText + followingText, selection: NSRange(location: precedingText.utf16.count, length: 0)))
             : nil
         if let paragraph, paragraph.count > 1 {
@@ -200,7 +233,9 @@ public final class CompletionEngine: ObservableObject {
 
         // 2. Check Inline Autocorrect
         if !appDisablesAutocorrect && (settings.hideCompletionsOnSuspectedTypo || settings.showSuggestedTypoFixes) {
-            if let typoFix = SmartWritingFeatures.detectAutocorrect(in: precedingText) {
+            if let typoFix = SmartWritingFeatures.detectAutocorrect(in: precedingText, ignoredWords: settings.rememberedSpellings,
+                feedback: settings.activeSpellingFeedback),
+               !isDismissedInlineCorrection(typoFix, precedingText: precedingText, fullText: fullText) {
                 activeTask?.cancel()
                 if settings.showSuggestedTypoFixes {
                     self.activeAutocorrect = typoFix
@@ -456,6 +491,7 @@ public final class CompletionEngine: ObservableObject {
         if let paragraph = paragraphSpellingSuggestion {
             stats.recordAccepted(text: paragraph.wordEdits.map(\.insertion).joined(separator: " "),
                                  appName: lastAppName, source: "Paragraph spelling")
+            settings.recordSpellingFeedback(paragraph.spellingPairs, accepted: true)
             dismiss()
             return (paragraph.trailingInsertion, paragraph.trailingLength, nil)
         }
@@ -473,6 +509,7 @@ public final class CompletionEngine: ObservableObject {
 
         if let typo = activeAutocorrect {
             stats.recordAccepted(text: typo.correctedWord, appName: lastAppName, source: "Autocorrect & Emoji")
+            settings.recordSpellingFeedback([(typo.misspelledWord, typo.correctedWord)], accepted: true)
             dismiss()
             return (typo.correctedWord, typo.replacementLength, typo.replacementRange)
         }
@@ -568,6 +605,85 @@ public final class CompletionEngine: ObservableObject {
 
     private var canAccept: Bool {
         settings.isEnabled && !settings.isAppExcluded(bundleIdentifier: lastBundleId)
+    }
+
+    func paragraphCorrection(in snapshot: TextInputSnapshot) -> SentenceSpellingCorrection? {
+        SentenceSpellingCorrector.correction(in: snapshot, ignoredWords: settings.rememberedSpellings,
+            feedback: settings.activeSpellingFeedback,
+            ignoredRanges: dismissedSpellingRanges(in: snapshot.text))
+    }
+
+    private func isCurrentEnvironment(_ rejection: DismissedSuggestion) -> Bool {
+        rejection.bundleId == lastBundleId && rejection.domain == lastDomain && rejection.windowTitle == lastWindowTitle
+    }
+
+    private func dismissedSpellingRanges(in text: String, singleWordOnly: Bool = false) -> [NSRange] {
+        dismissedSuggestions.filter { isCurrentEnvironment($0) && (!singleWordOnly || $0.singleWord) }
+            .flatMap { rejection in
+                rejection.spellingRanges.filter { range in
+                    // An unchanged prefix anchors the same occurrence as the user
+                    // continues typing. Editing that word makes it eligible again.
+                    guard NSMaxRange(range) <= rejection.text.utf16.count else { return false }
+                    let prefix = (rejection.text as NSString).substring(to: NSMaxRange(range))
+                    guard text.hasPrefix(prefix) else { return false }
+                    // "im" growing into "immediatly" is a new word to assess,
+                    // not the rejected contraction appearing again.
+                    return !(prefix.last?.isLetter == true && text.dropFirst(prefix.count).first?.isLetter == true)
+                }
+            }
+    }
+
+    private func isDismissedInlineCorrection(_ correction: AutocorrectSuggestion,
+                                             precedingText: String, fullText: String) -> Bool {
+        let length = String(precedingText.suffix(correction.replacementLength)).utf16.count
+        let range = NSRange(location: precedingText.utf16.count - length, length: length)
+        return dismissedSpellingRanges(in: fullText).contains { NSIntersectionRange($0, range).length > 0 }
+    }
+
+    /// Called only for an explicit dismissal, never for typing, focus changes or cancellation.
+    @discardableResult
+    func rejectCurrentSuggestion() -> Bool {
+        guard canAccept, currentSuggestion != nil || !activeSynonyms.isEmpty else { return false }
+        let text = lastRequestedText + lastSelectedText + lastFollowingText
+        let selection = NSRange(location: lastRequestedText.utf16.count, length: lastSelectedText.utf16.count)
+        var ranges: [NSRange] = []
+        var word: String?
+        var correction: String?
+        if let typo = activeAutocorrect {
+            let removedLength = String(lastRequestedText.suffix(typo.replacementLength)).utf16.count
+            ranges = [typo.replacementRange ?? NSRange(location: selection.location - removedLength,
+                                                     length: removedLength)]
+            word = typo.misspelledWord
+            correction = typo.correctedWord
+        } else if let paragraph = paragraphSpellingSuggestion {
+            ranges = paragraph.wordEdits.map(\.range)
+            if ranges.count == 1, let range = ranges.first {
+                word = (text as NSString).substring(with: range)
+                correction = paragraph.wordEdits.first?.insertion
+            }
+        }
+        let rejection = DismissedSuggestion(text: text, selection: selection, bundleId: lastBundleId,
+            domain: lastDomain, windowTitle: lastWindowTitle, spellingRanges: ranges, singleWord: word != nil)
+        // Only a single, explicit choice is evidence about a spelling. A batch
+        // dismissal can mean "not now" and must not train on all its words.
+        if let word, let correction {
+            settings.recordSpellingFeedback([(word, correction)], accepted: false)
+        }
+        dismiss()
+        dismissedSuggestions.append(rejection)
+        if dismissedSuggestions.count > 16 { dismissedSuggestions.removeFirst() }
+        return true
+    }
+
+    @discardableResult
+    func handleEscape() -> Bool {
+        guard settings.escapeBehavior != .passToApp, rejectCurrentSuggestion() else { return false }
+        switch settings.escapeBehavior {
+        case .pauseBriefly: settings.pausedUntilDate = Date().addingTimeInterval(15)
+        case .offUntilAppSwitch: settings.pausedAppBundleId = lastBundleId
+        case .dismissThenPassToApp, .passToApp: break
+        }
+        return true
     }
 
     public func dismiss() {

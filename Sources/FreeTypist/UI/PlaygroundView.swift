@@ -15,6 +15,7 @@ public final class GhostAwareNSTextView: NSTextView {
     public var onAcceptNextWord: (() -> Bool)?
     public var onEscapeDismiss: (() -> Bool)?
     public var paragraphSpellingShortcutEnabled = true
+    public var spellingSettings: AppSettings = .shared
     public var onSentenceCorrected: ((Int) -> Void)?
 
     public override func keyDown(with event: NSEvent) {
@@ -43,7 +44,7 @@ public final class GhostAwareNSTextView: NSTextView {
         }
 
         // Escape (keyCode 53)
-        if keyCode == 53 && active {
+        if keyCode == 53 && active && flags.intersection([.command, .control, .option, .shift]).isEmpty {
             if onEscapeDismiss?() == true { return }
         }
 
@@ -55,10 +56,13 @@ public final class GhostAwareNSTextView: NSTextView {
         guard paragraphSpellingShortcutEnabled, !hasMarkedText() else { return false }
         let snapshot = TextInputSnapshot(identity: UInt(bitPattern: ObjectIdentifier(self)),
                                          text: string, selection: selectedRange())
-        guard let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
+        guard let correction = SentenceSpellingCorrector.correction(in: snapshot,
+            ignoredWords: spellingSettings.rememberedSpellings,
+            feedback: spellingSettings.activeSpellingFeedback) else { return false }
         insertText(correction.edit.insertion, replacementRange: correction.edit.range)
         guard string == correction.edit.result.text else { return false }
         setSelectedRange(correction.edit.result.selection)
+        spellingSettings.recordSpellingFeedback(correction.spellingPairs, accepted: true)
         onSentenceCorrected?(correction.count)
         ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes").")
         return true
@@ -127,6 +131,7 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
     public var onAcceptNextWord: () -> Bool
     public var onEscapeDismiss: () -> Bool
     public var paragraphSpellingShortcutEnabled: Bool = true
+    public var spellingSettings: AppSettings = .shared
     public var onSentenceCorrected: ((Int) -> Void)?
 
     public func makeCoordinator() -> Coordinator {
@@ -166,6 +171,7 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         textView.onAcceptNextWord = onAcceptNextWord
         textView.onEscapeDismiss = onEscapeDismiss
         textView.paragraphSpellingShortcutEnabled = paragraphSpellingShortcutEnabled
+        textView.spellingSettings = spellingSettings
         textView.onSentenceCorrected = onSentenceCorrected
 
         scrollView.documentView = textView
@@ -189,6 +195,7 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         textView.onAcceptNextWord = onAcceptNextWord
         textView.onEscapeDismiss = onEscapeDismiss
         textView.paragraphSpellingShortcutEnabled = paragraphSpellingShortcutEnabled
+        textView.spellingSettings = spellingSettings
         textView.onSentenceCorrected = onSentenceCorrected
         textView.needsDisplay = true
     }
@@ -357,10 +364,10 @@ public struct PlaygroundView: View {
                     acceptWord()
                 },
                 onEscapeDismiss: {
-                    dismissSuggestion()
-                    return true
+                    rejectSuggestion(honourEscapeBehaviour: true)
                 },
                 paragraphSpellingShortcutEnabled: settings.isEnabled && settings.paragraphSpellingShortcutEnabled,
+                spellingSettings: settings,
                 onSentenceCorrected: { _ in
                     engine.dismiss()
                 }
@@ -496,7 +503,7 @@ public struct PlaygroundView: View {
                 .controlSize(.small)
                 .disabled(!hasAnyActiveAction)
 
-                Button(action: dismissSuggestion) {
+                Button(action: { rejectSuggestion() }) {
                     Text("Dismiss (Esc)")
                 }
                 .buttonStyle(.bordered)
@@ -646,5 +653,14 @@ public struct PlaygroundView: View {
 
     private func dismissSuggestion() {
         engine.dismiss()
+    }
+
+    @discardableResult
+    private func rejectSuggestion(honourEscapeBehaviour: Bool = false) -> Bool {
+        guard engine.matchesContext(editorContext, bundleId: "com.freetypist.playground") else {
+            engine.dismiss()
+            return false
+        }
+        return honourEscapeBehaviour ? engine.handleEscape() : engine.rejectCurrentSuggestion()
     }
 }

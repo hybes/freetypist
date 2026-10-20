@@ -333,7 +333,15 @@ public struct SmartWritingFeatures: Sendable {
     ]
 
     @MainActor
-    public static func detectAutocorrect(in precedingText: String) -> AutocorrectSuggestion? {
+    public static func detectAutocorrect(in precedingText: String, ignoredWords: Set<String> = [],
+                                        feedback: [String: SpellingFeedback] = [:]) -> AutocorrectSuggestion? {
+        guard let candidate = autocorrectCandidate(in: precedingText, ignoredWords: ignoredWords),
+              allowsCorrection(candidate.misspelledWord, correction: candidate.correctedWord, feedback: feedback) else { return nil }
+        return candidate
+    }
+
+    @MainActor
+    private static func autocorrectCandidate(in precedingText: String, ignoredWords: Set<String>) -> AutocorrectSuggestion? {
         guard !precedingText.isEmpty else { return nil }
 
         // Keep punctuation and spacing when accepting a correction after finishing a word.
@@ -349,6 +357,7 @@ public struct SmartWritingFeatures: Sendable {
 
         // Ignore slash commands, shortcodes, URLs, or non-letter words
         guard word.count >= 2, word.allSatisfy(\.isLetter) else { return nil }
+        if let key = AppSettings.spellingKey(word), ignoredWords.contains(key) { return nil }
         let lower = word.lowercased()
         let repLen = word.count + suffixSpace.count
 
@@ -495,16 +504,38 @@ public struct SmartWritingFeatures: Sendable {
     }
 
     @MainActor
-    static func completedWordCorrection(_ word: String) -> String? {
+    static func completedWordCorrection(_ word: String, ignoredWords: Set<String> = [],
+                                        feedback: [String: SpellingFeedback] = [:]) -> String? {
+        // Consult preferences before the cache so rejecting or forgetting a word
+        // takes effect immediately, including in already checked paragraphs.
+        if let key = AppSettings.spellingKey(word), ignoredWords.contains(key) { return nil }
         let now = Date()
         if let cached = completedWordCache[word], now.timeIntervalSince(cached.checkedAt) < 60 {
-            return cached.correction
+            return cached.correction.flatMap { allowsCorrection(word, correction: $0, feedback: feedback) ? $0 : nil }
         }
         let correction = uncachedCompletedWordCorrection(word)
         // Keep only a small, short-lived in-memory vocabulary. Nothing is persisted.
         if completedWordCache.count >= 512 { completedWordCache.removeAll(keepingCapacity: true) }
         completedWordCache[word] = (correction, now)
-        return correction
+        return correction.flatMap { allowsCorrection(word, correction: $0, feedback: feedback) ? $0 : nil }
+    }
+
+    private static func allowsCorrection(_ word: String, correction: String,
+                                         feedback: [String: SpellingFeedback]) -> Bool {
+        guard let key = SpellingFeedback.key(word, correction: correction),
+              let preference = feedback[key] else { return true }
+        let original = preference.word
+        let replacement = preference.correction
+        // Curated fixes and an extra repeated letter are stronger evidence than
+        // a dictionary guess such as navbar → nabber. One dismissal should not
+        // silence an otherwise clear spelling repair in a different sentence.
+        let letters = Array(original)
+        let removesRepeatedLetter = letters.indices.dropFirst().contains { index in
+            letters[index] == letters[index - 1]
+                && String(letters[..<index] + letters[(index + 1)...]) == replacement
+        }
+        let confidence = fastCommonTypos[original]?.lowercased() == replacement || removesRepeatedLetter ? 0.95 : 0.72
+        return preference.allows(confidence: confidence)
     }
 
     @MainActor

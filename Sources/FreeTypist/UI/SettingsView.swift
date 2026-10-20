@@ -13,6 +13,7 @@ public struct SettingsView: View {
     @State private var selectedTab: Int = 0
     @State private var newDictKey: String = ""
     @State private var newDictValue: String = ""
+    @State private var newSpellingWord: String = ""
     @State private var newAppBundleId: String = ""
     @State private var newAppName: String = ""
     @State private var statsRange: StatsTimeRange = .last14Days
@@ -358,6 +359,80 @@ public struct SettingsView: View {
     }
 
     // MARK: - Tab 2: Writing Style & Abbreviations
+    private var rememberedWordsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Spelling Learning")
+                .font(.headline)
+            Toggle("Learn from corrections I accept or dismiss", isOn: $settings.learnSpellingPreferences)
+                .font(.caption)
+            Text("Esc makes that correction less likely next time. Repeated dismissals count more, and their effect fades over time. Accepting a correction helps it learn too. Feedback stays on this Mac.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !settings.spellingFeedback.isEmpty {
+                HStack {
+                    Text("Learning from \(settings.spellingFeedback.count) spelling choices")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button("Reset Learning") { settings.resetSpellingLearning() }
+                        .controlSize(.small)
+                }
+            }
+
+            Divider()
+            Text("Words to Always Keep")
+                .font(.subheadline.weight(.semibold))
+            Text("Only words you add here are always kept, including during paragraph checks. Esc never adds words to this list.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if settings.rememberedSpellings.isEmpty {
+                Text("No words added.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(settings.rememberedSpellings.sorted(), id: \.self) { word in
+                            HStack {
+                                Text(word).font(.system(.body, design: .monospaced))
+                                Spacer()
+                                Button("Remove") { settings.forgetSpelling(word) }
+                                    .controlSize(.small)
+                                    .accessibilityLabel("Remove \(word) from words to always keep")
+                            }
+                        }
+                    }
+                }
+                .frame(height: min(160, CGFloat(settings.rememberedSpellings.count) * 28))
+            }
+            HStack {
+                TextField("Word to keep (e.g. navbar)", text: $newSpellingWord)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { addRememberedWord() }
+                Button("Add Word") { addRememberedWord() }
+                    .controlSize(.small)
+                    .disabled(AppSettings.spellingKey(newSpellingWord) == nil)
+            }
+            if !newSpellingWord.isEmpty && AppSettings.spellingKey(newSpellingWord) == nil {
+                Text("Enter one word of 2–48 letters.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func addRememberedWord() {
+        guard AppSettings.spellingKey(newSpellingWord) != nil else { return }
+        settings.rememberSpelling(newSpellingWord)
+        newSpellingWord = ""
+    }
+
     private var writingStyleTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -402,6 +477,8 @@ public struct SettingsView: View {
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
+
+                rememberedWordsSection
 
                 // Abbreviations & Shortcuts
                 VStack(alignment: .leading, spacing: 8) {

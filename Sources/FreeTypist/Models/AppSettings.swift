@@ -202,6 +202,9 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
     @Published public var recordWritingForPersonalization: Bool { didSet { save() } }
     @Published public var recordUnacceptedWriting: Bool { didSet { save() } }
     @Published public var personalDictionary: [String: String] { didSet { save() } }
+    @Published public var learnSpellingPreferences: Bool { didSet { save() } }
+    @Published public private(set) var spellingFeedback: [String: SpellingFeedback] { didSet { save() } }
+    @Published public private(set) var rememberedSpellings: Set<String> { didSet { save() } }
 
     // Slash Commands & Dynamic Snippets (Power-User Extra)
     @Published public var enableSlashCommands: Bool { didSet { save() } }
@@ -300,6 +303,11 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         self.personalizationStrength = PersonalizationStrength(rawValue: strengthRaw) ?? .strong
         self.recordWritingForPersonalization = defaults.object(forKey: "ft_recordWriting") as? Bool ?? true
         self.recordUnacceptedWriting = defaults.object(forKey: "ft_recordUnaccepted") as? Bool ?? true
+        self.learnSpellingPreferences = defaults.object(forKey: "ft_learnSpellingPreferences") as? Bool ?? true
+        self.spellingFeedback = defaults.data(forKey: "ft_spellingFeedback")
+            .flatMap { try? JSONDecoder().decode([String: SpellingFeedback].self, from: $0) } ?? [:]
+        self.rememberedSpellings = Set((defaults.stringArray(forKey: "ft_rememberedSpellings") ?? [])
+            .compactMap(Self.spellingKey))
         self.personalDictionary = (defaults.dictionary(forKey: "ft_personalDictionary") as? [String: String]) ?? [
             "btw": "by the way",
             "lmk": "let me know if you have any questions",
@@ -413,6 +421,11 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         defaults.set(recordWritingForPersonalization, forKey: "ft_recordWriting")
         defaults.set(recordUnacceptedWriting, forKey: "ft_recordUnaccepted")
         defaults.set(personalDictionary, forKey: "ft_personalDictionary")
+        defaults.set(learnSpellingPreferences, forKey: "ft_learnSpellingPreferences")
+        if let data = try? JSONEncoder().encode(spellingFeedback) {
+            defaults.set(data, forKey: "ft_spellingFeedback")
+        }
+        defaults.set(rememberedSpellings.sorted(), forKey: "ft_rememberedSpellings")
 
         defaults.set(enableSlashCommands, forKey: "ft_enableSlashCommands")
         defaults.set(slashCommands, forKey: "ft_slashCommands_v2")
@@ -449,6 +462,52 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         if let encoded = try? JSONEncoder().encode(appRules) {
             defaults.set(encoded, forKey: "ft_appRules_v2")
         }
+    }
+
+    /// Explicit spelling preferences are separate from recorded writing and never
+    /// change the system dictionary. Only complete words can be remembered.
+    static func spellingKey(_ word: String) -> String? {
+        let trimmed = word.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (2...48).contains(trimmed.count), trimmed.allSatisfy(\.isLetter) else { return nil }
+        return trimmed.precomposedStringWithCanonicalMapping.lowercased()
+    }
+
+    @discardableResult
+    func rememberSpelling(_ word: String) -> Bool {
+        guard let key = Self.spellingKey(word), !rememberedSpellings.contains(key) else { return false }
+        rememberedSpellings.insert(key)
+        return true
+    }
+
+    func forgetSpelling(_ word: String) {
+        guard let key = Self.spellingKey(word) else { return }
+        rememberedSpellings.remove(key)
+    }
+
+    var activeSpellingFeedback: [String: SpellingFeedback] {
+        learnSpellingPreferences ? spellingFeedback : [:]
+    }
+
+    func recordSpellingFeedback(_ corrections: [(String, String)], accepted: Bool, at date: Date = Date()) {
+        guard learnSpellingPreferences else { return }
+        var updated = spellingFeedback.filter { abs($0.value.weight(at: date)) >= 0.05 }
+        for (word, correction) in corrections {
+            guard let (original, replacement) = SpellingFeedback.words(word, correction: correction),
+                  let key = SpellingFeedback.key(original, correction: replacement) else { continue }
+            let previous = updated[key]?.weight(at: date) ?? 0
+            let weight = min(3, max(-2, previous + (accepted ? -1.5 : 1)))
+            updated[key] = SpellingFeedback(word: original, correction: replacement, weight: weight, updatedAt: date)
+        }
+        // Retain a bounded vocabulary, not a history of what was typed.
+        if updated.count > 512 {
+            updated = Dictionary(uniqueKeysWithValues: updated.sorted { $0.value.updatedAt > $1.value.updatedAt }
+                .prefix(512).map { ($0.key, $0.value) })
+        }
+        spellingFeedback = updated
+    }
+
+    func resetSpellingLearning() {
+        spellingFeedback = [:]
     }
 
     public func rule(for bundleIdentifier: String?) -> AppRule? {
@@ -507,6 +566,8 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
             "selectedTone": selectedTone.rawValue,
             "personalizationStrength": personalizationStrength.rawValue,
             "personalDictionary": personalDictionary,
+            "learnSpellingPreferences": learnSpellingPreferences,
+            "rememberedSpellings": rememberedSpellings.sorted(),
             "slashCommands": slashCommands
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]),
