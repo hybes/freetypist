@@ -60,6 +60,19 @@ public final class LocalModelManager: ObservableObject {
         let savedID = defaults.string(forKey: "ft_selectedLocalModelID")
         self.selectedModel = models.first { $0.id == savedID } ?? LocalModelInfo.recommended(forMemoryGB: memoryGB, models: models)
         scanLocalModels()
+        if savedID == nil {
+            // Older installations did not persist an untouched default. A new
+            // recommendation must not strand their downloaded model and silently
+            // drop them back to the basic predictor after an app update.
+            if downloadedModelPaths[selectedModel.id] == nil,
+               let installed = models.first(where: { $0.id == "qwen-3.5-2b" && downloadedModelPaths[$0.id] != nil })
+                    ?? models.first(where: { $0.minRAMGigabytes <= memoryGB && downloadedModelPaths[$0.id] != nil }) {
+                selectedModel = installed
+            }
+            if downloadedModelPaths[selectedModel.id] != nil {
+                defaults.set(selectedModel.id, forKey: "ft_selectedLocalModelID")
+            }
+        }
     }
 
     /// Verifies that a `.gguf` file starts with the standard 4-byte ASCII `"GGUF"` magic header (`0x47 0x47 0x55 0x46`)

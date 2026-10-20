@@ -614,6 +614,20 @@ final class FreeTypistTests: XCTestCase {
     }
 
     @MainActor
+    func testNewRecommendationKeepsAnInstalledModelWhenOldDefaultWasNotSaved() throws {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let directory = AppStorage.directory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let previous = LocalModelInfo.catalog.first { $0.id == "qwen-3.5-2b" }!
+        try Data("GGUFmodel-scan-fixture".utf8).write(to: directory.appendingPathComponent(previous.filename))
+        let manager = LocalModelManager(directory: directory, defaults: defaults, memoryGB: 32)
+        XCTAssertEqual(manager.recommendedModel.id, "qwen-3.5-4b")
+        XCTAssertEqual(manager.selectedModel, previous)
+        XCTAssertNotNil(manager.activeModelPath())
+        XCTAssertEqual(defaults.string(forKey: "ft_selectedLocalModelID"), previous.id)
+    }
+
+    @MainActor
     func testSetupResumesAndOnlyMarksARealOrExplicitlySkippedTypingCheck() {
         let defaults = UserDefaults(suiteName: UUID().uuidString)!
         let setup = SetupState(defaults: defaults)
