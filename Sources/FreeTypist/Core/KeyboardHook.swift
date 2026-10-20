@@ -39,7 +39,9 @@ public final class KeyboardHook: @unchecked Sendable {
         eventTap = nil
         runLoopSource = nil
 
-        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue) | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
+        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+            | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue)
         let observer = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
@@ -138,6 +140,11 @@ public final class KeyboardHook: @unchecked Sendable {
         if type == .keyUp {
             return Unmanaged.passUnretained(event)
         }
+        if type == .leftMouseUp {
+            // Read the selection after the destination app handles the click or drag.
+            if !isTypingInFreeTypist() { scheduleContextRefresh(caretMoved: true) }
+            return Unmanaged.passUnretained(event)
+        }
         if type == .leftMouseDown || type == .rightMouseDown {
             contextRefreshTask?.cancel()
             MainActor.assumeIsolated {
@@ -227,29 +234,26 @@ public final class KeyboardHook: @unchecked Sendable {
 
         if flags.contains(.maskCommand) || flags.contains(.maskControl) {
             typingBuffer.handleCommandKey(keyCode: keyCode)
-            Task { @MainActor [weak self] in
-                CompletionEngine.shared.dismiss()
-                if [0, 6, 7, 9, 51, 123, 124, 125, 126].contains(keyCode) {
-                    try? await Task.sleep(nanoseconds: 25_000_000)
-                    self?.requestCompletionFromContext()
-                }
+            MainActor.assumeIsolated { CompletionEngine.shared.dismiss() }
+            if [0, 6, 7, 9, 51, 123, 124, 125, 126].contains(keyCode) {
+                scheduleContextRefresh(caretMoved: (123...126).contains(keyCode) || keyCode == 0)
             }
             return Unmanaged.passUnretained(event)
         }
 
         typingBuffer.handle(event: event)
 
-        scheduleContextRefresh()
+        scheduleContextRefresh(caretMoved: (123...126).contains(keyCode))
 
         return Unmanaged.passUnretained(event)
     }
 
-    private func scheduleContextRefresh() {
+    private func scheduleContextRefresh(caretMoved: Bool = false) {
         contextRefreshTask?.cancel()
         contextRefreshTask = Task { @MainActor [weak self] in
             do { try await Task.sleep(nanoseconds: 25_000_000) } catch { return }
             guard !Task.isCancelled, !AccessibilityService.shared.isPerformingSyntheticInsertion else { return }
-            self?.requestCompletionFromContext()
+            self?.requestCompletionFromContext(caretMoved: caretMoved)
         }
     }
 
@@ -262,7 +266,7 @@ public final class KeyboardHook: @unchecked Sendable {
               let target = service.captureTextTarget(), let snapshot = target.snapshot(),
               snapshot.identity == lastFieldHash, engine.matchesContext(snapshot.context, bundleId: bundle),
               let acceptance = engine.prepareAcceptance(nextWord: nextWord),
-              let edit = TextReplacement.trailing(acceptance.text, count: acceptance.deleteCount, in: snapshot) else {
+              let edit = acceptance.replacement(in: snapshot) else {
             engine.dismiss()
             return false
         }
@@ -277,7 +281,7 @@ public final class KeyboardHook: @unchecked Sendable {
                 engine.commitAcceptance(acceptance)
                 MenuBarController.shared.rebuildMenu()
                 // The swallowed Tab produces no ordinary key event to request the next completion.
-                self.scheduleContextRefresh()
+                self.scheduleContextRefresh(caretMoved: acceptance.replacementRange != nil)
             } else {
                 engine.dismiss()
                 if result == .unsupported {
@@ -320,7 +324,7 @@ public final class KeyboardHook: @unchecked Sendable {
     }
 
     @MainActor
-    private func requestCompletionFromContext() {
+    private func requestCompletionFromContext(caretMoved: Bool = false) {
         guard !AccessibilityService.shared.isPerformingSyntheticInsertion else { return }
         let settings = AppSettings.shared
         guard settings.isEnabled,
@@ -365,7 +369,8 @@ public final class KeyboardHook: @unchecked Sendable {
             appName: caretInfo.appName,
             bundleId: caretInfo.bundleId,
             domain: caretInfo.domain,
-            windowTitle: caretInfo.windowTitle
+            windowTitle: caretInfo.windowTitle,
+            caretMoved: caretMoved
         )
     }
 

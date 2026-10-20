@@ -44,6 +44,8 @@ public struct AutocorrectSuggestion: Equatable, Sendable {
     public let misspelledWord: String
     public let correctedWord: String
     public let replacementLength: Int
+    /// Used when revisiting a word: the word may extend on both sides of the cursor.
+    public var replacementRange: NSRange? = nil
 }
 
 public struct WordAlternativeItem: Identifiable, Equatable, Sendable {
@@ -484,7 +486,29 @@ public struct SmartWritingFeatures: Sendable {
     /// More conservative than an explicitly accepted inline suggestion.
     /// Real words, names, abbreviations and code identifiers are left alone.
     @MainActor
+    private static var completedWordCache: [String: (correction: String?, checkedAt: Date)] = [:]
+
+    @MainActor
+    static func warmSpellingChecker() {
+        _ = completedWordCorrection("spelling")
+        _ = completedWordCorrection("speelling")
+    }
+
+    @MainActor
     static func completedWordCorrection(_ word: String) -> String? {
+        let now = Date()
+        if let cached = completedWordCache[word], now.timeIntervalSince(cached.checkedAt) < 60 {
+            return cached.correction
+        }
+        let correction = uncachedCompletedWordCorrection(word)
+        // Keep only a small, short-lived in-memory vocabulary. Nothing is persisted.
+        if completedWordCache.count >= 512 { completedWordCache.removeAll(keepingCapacity: true) }
+        completedWordCache[word] = (correction, now)
+        return correction
+    }
+
+    @MainActor
+    private static func uncachedCompletedWordCorrection(_ word: String) -> String? {
         guard (2...48).contains(word.count),
               word.allSatisfy({ $0.isLetter }),
               word.dropFirst().allSatisfy({ !$0.isUppercase }) else { return nil }

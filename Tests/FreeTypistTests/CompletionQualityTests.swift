@@ -62,6 +62,101 @@ final class CompletionQualityTests: XCTestCase {
     }
 
     @MainActor
+    func testParagraphSpellingIsImmediateEvenWithLongModelDelay() throws {
+        let defaults = UserDefaults(suiteName: "com.freetypist.quality.fast-spelling.\(UUID().uuidString)")!
+        let settings = AppSettings(defaults: defaults)
+        settings.debounceMs = 1_000
+        let engine = CompletionEngine(settings: settings)
+        for text in [
+            "Please check the speelling and reeplacement in this sentence.",
+            "Please check the speelling and reeplacement ",
+            "Please check the speelling and reeplacement."
+        ] {
+            let start = ContinuousClock.now
+            engine.onTextContextChanged(precedingText: text, bundleId: "com.apple.TextEdit")
+            // No task yield or timer: corrections must be ready in the same call.
+            XCTAssertEqual(engine.paragraphSpellingSuggestion?.count, 2)
+            XCTAssertFalse(engine.isGenerating)
+            print("LOCAL SPELLING offer: \(start.duration(to: .now))")
+            engine.dismiss()
+        }
+    }
+
+    @MainActor
+    func testRevisitingAWordCorrectsItsEntireRangeWithMidLinePredictionsDisabled() throws {
+        let defaults = UserDefaults(suiteName: "com.freetypist.quality.caret-spelling.\(UUID().uuidString)")!
+        let settings = AppSettings(defaults: defaults)
+        settings.enableMidLineCompletions = false
+        settings.debounceMs = 1_000
+        let engine = CompletionEngine(settings: settings)
+        let text = "👩🏽‍💻 Check speelling and reeplacement, please."
+        let wordRange = (text as NSString).range(of: "speelling")
+        for offset in 0...wordRange.length {
+            let snapshot = TextInputSnapshot(identity: 42, text: text,
+                selection: NSRange(location: wordRange.location + offset, length: 0))
+            let context = snapshot.context
+            engine.onTextContextChanged(precedingText: context.precedingText, followingText: context.followingText,
+                bundleId: "test.editor", caretMoved: true)
+            XCTAssertEqual(engine.activeAutocorrect?.misspelledWord, "speelling")
+            XCTAssertEqual(engine.activeAutocorrect?.correctedWord, "spelling")
+            XCTAssertNil(engine.paragraphSpellingSuggestion)
+            XCTAssertTrue(engine.matchesContext(context, bundleId: "test.editor"))
+            let acceptance = try XCTUnwrap(engine.prepareAcceptance(nextWord: offset % 2 == 0))
+            let edit = try XCTUnwrap(acceptance.replacement(in: snapshot))
+            XCTAssertEqual(edit.result.text, "👩🏽‍💻 Check spelling and reeplacement, please.")
+            XCTAssertEqual(edit.result.selection.location, wordRange.location + "spelling".utf16.count)
+            engine.commitAcceptance(acceptance)
+        }
+    }
+
+    @MainActor
+    func testSelectingAMisspeltWordOffersCorrectionAndRejectsMovedCaret() throws {
+        let engine = CompletionEngine()
+        let text = "Check speelling and reeplacement."
+        let selection = (text as NSString).range(of: "speelling")
+        let snapshot = TextInputSnapshot(identity: 42, text: text, selection: selection)
+        let context = snapshot.context
+        engine.onTextContextChanged(precedingText: context.precedingText, followingText: context.followingText,
+            selectedText: context.selectedText, bundleId: "test.editor", caretMoved: true)
+        XCTAssertTrue(engine.matchesContext(context, bundleId: "test.editor"))
+        let acceptance = try XCTUnwrap(engine.prepareAcceptance(nextWord: false))
+        XCTAssertEqual(acceptance.replacement(in: snapshot)?.result.text, "Check spelling and reeplacement.")
+        XCTAssertNil(acceptance.replacement(in: TextInputSnapshot(identity: 42, text: text,
+            selection: NSRange(location: text.utf16.count, length: 0))))
+        engine.dismiss()
+    }
+
+    @MainActor
+    func testClickingValidWordsNeverCorrectsTheirPrefixesOrPredictsInsideThem() {
+        let engine = CompletionEngine()
+        for (before, after) in [("I", "llustrate the idea."), ("We need a", "bout ten."),
+                                ("The", "refore we agree."), ("We", "ll done.")] {
+            engine.onTextContextChanged(precedingText: before, followingText: after,
+                                       bundleId: "test.editor", caretMoved: true)
+            XCTAssertNil(engine.currentSuggestion)
+            XCTAssertNil(engine.activeAutocorrect)
+            XCTAssertFalse(engine.isGenerating)
+        }
+    }
+
+    @MainActor
+    func testWordCorrectionReappearsAfterMovingAwayAndBackAndHonoursSettings() {
+        let defaults = UserDefaults(suiteName: "com.freetypist.quality.revisit-spelling.\(UUID().uuidString)")!
+        let settings = AppSettings(defaults: defaults)
+        let engine = CompletionEngine(settings: settings)
+        engine.onTextContextChanged(precedingText: "Check spee", followingText: "lling now.", bundleId: "test.editor")
+        XCTAssertEqual(engine.activeAutocorrect?.correctedWord, "spelling")
+        engine.onTextContextChanged(precedingText: "Check speelling no", followingText: "w.", bundleId: "test.editor")
+        XCTAssertNil(engine.activeAutocorrect)
+        engine.onTextContextChanged(precedingText: "Check spee", followingText: "lling now.", bundleId: "test.editor")
+        XCTAssertEqual(engine.activeAutocorrect?.correctedWord, "spelling")
+        settings.showSuggestedTypoFixes = false
+        engine.onTextContextChanged(precedingText: "Check spee", followingText: "lling now.",
+                                   bundleId: "test.editor", caretMoved: true)
+        XCTAssertNil(engine.currentSuggestion)
+    }
+
+    @MainActor
     func testEarlierMistakesAreOfferedTogetherAtSentenceEndAndWordBoundary() async throws {
         let defaults = UserDefaults(suiteName: "com.freetypist.quality.paragraph.\(UUID().uuidString)")!
         let settings = AppSettings(defaults: defaults)

@@ -46,6 +46,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Start Keyboard Hook
         PermissionManager.shared.startMonitoring()
+        // Initialise the local dictionary before the first typing pause.
+        Task { @MainActor in SmartWritingFeatures.warmSpellingChecker() }
 
         // Open main window so user can immediately see Playground & Settings
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {

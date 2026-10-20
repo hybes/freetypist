@@ -352,11 +352,9 @@ public struct PlaygroundView: View {
                 ghostOpacity: settings.ghostTextOpacity,
                 onTabAcceptFull: {
                     acceptFull()
-                    return true
                 },
                 onAcceptNextWord: {
                     acceptWord()
-                    return true
                 },
                 onEscapeDismiss: {
                     dismissSuggestion()
@@ -484,14 +482,14 @@ public struct PlaygroundView: View {
 
                 Spacer()
 
-                Button(action: acceptFull) {
+                Button(action: { acceptFull() }) {
                     Text("Accept (Tab)")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .disabled(!hasAnyActiveAction)
 
-                Button(action: acceptWord) {
+                Button(action: { acceptWord() }) {
                     Text("Next Word (⌥Tab)")
                 }
                 .buttonStyle(.bordered)
@@ -602,25 +600,35 @@ public struct PlaygroundView: View {
         engine.dismiss()
     }
 
-    private func acceptFull() {
+    @discardableResult
+    private func acceptFull() -> Bool {
         guard engine.matchesContext(editorContext, bundleId: "com.freetypist.playground") else {
             engine.dismiss()
-            return
+            return false
         }
-        guard let accepted = engine.acceptFull() else { return }
-        applyInsertion(accepted.textToInsert, deleteBackwardsCount: accepted.deleteBackwardsCount)
+        let snapshot = TextInputSnapshot(identity: 0, text: inputText, selection: selection)
+        guard let accepted = engine.prepareAcceptance(nextWord: false),
+              let edit = accepted.replacement(in: snapshot) else { return false }
+        inputText = edit.result.text
+        selection = edit.result.selection
+        engine.commitAcceptance(accepted)
+        onAccepted?()
+        return true
     }
 
-    private func acceptWord() {
+    @discardableResult
+    private func acceptWord() -> Bool {
         guard engine.matchesContext(editorContext, bundleId: "com.freetypist.playground") else {
             engine.dismiss()
-            return
+            return false
         }
         if (engine.currentSuggestion?.replacementLength ?? 0) > 0 {
-            acceptFull()
+            return acceptFull()
         } else if let word = engine.acceptNextWord() {
             applyInsertion(word)
+            return true
         }
+        return false
     }
 
     private func acceptAlternativeString(_ alternative: String) {

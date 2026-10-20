@@ -30,6 +30,7 @@ public final class CompletionEngine: ObservableObject {
     private let providerOverride: (any ModelProvider)?
     private var requestID = UUID()
     private var lastFollowingText = ""
+    private var lastSelectedText = ""
     private var settingsObserver: AnyCancellable?
     private var modelObserver: AnyCancellable?
 
@@ -66,6 +67,7 @@ public final class CompletionEngine: ObservableObject {
         bundleId: String? = nil,
         domain: String? = nil,
         windowTitle: String? = nil,
+        caretMoved: Bool = false,
         force: Bool = false
     ) {
         guard settings.isEnabled else {
@@ -78,27 +80,7 @@ public final class CompletionEngine: ObservableObject {
             return
         }
 
-        // Check Battery "Only on demand" rule
-        if SystemResourceMonitor.shared.isOnBatteryPower && settings.batteryOnlyOnDemand && !force {
-            dismiss()
-            return
-        }
-
-        // Check Mid-line completion setting
-        let hasSameLineFollowingText: Bool = {
-            guard !followingText.isEmpty else { return false }
-            let firstLineAfter = followingText.prefix(while: { $0 != "\n" && $0 != "\r" })
-            return !firstLineAfter.trimmingCharacters(in: .whitespaces).isEmpty
-        }()
-        if hasSameLineFollowingText && selectedText.isEmpty && !force {
-            let appDisablesMidLine = settings.rule(for: bundleId)?.disableMidLineCompletions ?? false
-            if !settings.enableMidLineCompletions || appDisablesMidLine {
-                dismiss()
-                return
-            }
-        }
-
-        if !force, selectedText.isEmpty, precedingText == lastRequestedText,
+        if !force, !caretMoved, selectedText == lastSelectedText, precedingText == lastRequestedText,
            followingText == lastFollowingText, bundleId == lastBundleId, windowTitle == lastWindowTitle,
            activeTask != nil || currentSuggestion != nil {
             return
@@ -106,6 +88,10 @@ public final class CompletionEngine: ObservableObject {
 
         let previousSuggestion = currentSuggestion
         let previousText = lastRequestedText
+        let revisitingText = caretMoved || (
+            precedingText + selectedText + followingText == lastRequestedText + lastSelectedText + lastFollowingText
+            && (precedingText != lastRequestedText || selectedText != lastSelectedText)
+        )
         let sameEnvironment = lastBundleId == bundleId && lastWindowTitle == windowTitle
             && lastFollowingText == followingText
         dismiss()
@@ -115,11 +101,27 @@ public final class CompletionEngine: ObservableObject {
         self.lastDomain = domain
         self.lastWindowTitle = windowTitle
         self.lastFollowingText = followingText
+        self.lastSelectedText = selectedText
         self.lastRequestedText = precedingText
 
-        if !selectedText.isEmpty {
-            onTextSelectionChanged(selectedText: selectedText)
-            return
+        let appDisablesAutocorrect = settings.rule(for: bundleId)?.disableAutocorrect ?? false
+        if revisitingText || !selectedText.isEmpty || followingText.first?.isLetter == true {
+            if settings.showSuggestedTypoFixes && !appDisablesAutocorrect {
+                let snapshot = TextInputSnapshot(identity: 0, text: precedingText + selectedText + followingText,
+                    selection: NSRange(location: precedingText.utf16.count, length: selectedText.utf16.count))
+                if let edit = SentenceSpellingCorrector.wordCorrection(in: snapshot) {
+                    let word = (snapshot.text as NSString).substring(with: edit.range)
+                    activeAutocorrect = AutocorrectSuggestion(misspelledWord: word, correctedWord: edit.insertion,
+                        replacementLength: word.count, replacementRange: edit.range)
+                    currentSuggestion = CompletionItem(fullText: edit.insertion, providerName: "Autocorrect",
+                                                       replacementLength: word.count)
+                    stats.recordShown(latencyMs: 0)
+                    return
+                }
+            }
+            if !selectedText.isEmpty { onTextSelectionChanged(selectedText: selectedText) }
+            // Clicking in existing text must not extend or correct a fragment of a valid word.
+            if !force || !selectedText.isEmpty || followingText.first?.isLetter == true { return }
         }
 
         // 0. Check Slash Commands & Dynamic Snippets (/date, /time, /clip1, /sig, /lgtm...)
@@ -185,8 +187,18 @@ public final class CompletionEngine: ObservableObject {
             return
         }
 
+        // Spelling is local and does not wait for the AI completion debounce.
+        let atWordBoundary = precedingText.last.map { $0.isWhitespace || ".!?,;:".contains($0) } ?? false
+        let paragraph = atWordBoundary && settings.showSuggestedTypoFixes && !appDisablesAutocorrect
+            ? SentenceSpellingCorrector.correction(in: TextInputSnapshot(identity: 0,
+                text: precedingText + followingText, selection: NSRange(location: precedingText.utf16.count, length: 0)))
+            : nil
+        if let paragraph, paragraph.count > 1 {
+            offerParagraphSpelling(paragraph)
+            return
+        }
+
         // 2. Check Inline Autocorrect
-        let appDisablesAutocorrect = settings.rule(for: bundleId)?.disableAutocorrect ?? false
         if !appDisablesAutocorrect && (settings.hideCompletionsOnSuspectedTypo || settings.showSuggestedTypoFixes) {
             if let typoFix = SmartWritingFeatures.detectAutocorrect(in: precedingText) {
                 activeTask?.cancel()
@@ -218,6 +230,22 @@ public final class CompletionEngine: ObservableObject {
             }
         }
 
+        if let paragraph {
+            offerParagraphSpelling(paragraph)
+            return
+        }
+
+        // Battery and mid-line settings control predictions, not spelling fixes.
+        if SystemResourceMonitor.shared.isOnBatteryPower && settings.batteryOnlyOnDemand && !force {
+            return
+        }
+        let hasSameLineFollowingText = !followingText.prefix(while: { !$0.isNewline })
+            .trimmingCharacters(in: .whitespaces).isEmpty
+        if hasSameLineFollowingText && !force,
+           !settings.enableMidLineCompletions || settings.rule(for: bundleId)?.disableMidLineCompletions == true {
+            return
+        }
+
         let trimmed = precedingText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !force, let last = trimmed.last, ".!?".contains(last) {
             let id = requestID
@@ -227,7 +255,6 @@ public final class CompletionEngine: ObservableObject {
                 guard let self, self.requestID == id else { return }
                 learning.recordPassiveTyping(text: precedingText, appName: appName, bundleId: bundleId,
                                              domain: domain, windowTitle: windowTitle)
-                _ = offerParagraphSpelling(precedingText: precedingText, followingText: followingText, bundleId: bundleId)
                 activeTask = nil
             }
             return
@@ -277,13 +304,6 @@ public final class CompletionEngine: ObservableObject {
             }
 
             guard !Task.isCancelled, self.requestID == id else { return }
-
-            // Catch earlier mistakes at a word boundary before extending the draft.
-            if precedingText.last?.isWhitespace == true,
-               offerParagraphSpelling(precedingText: precedingText, followingText: followingText, bundleId: bundleId) {
-                activeTask = nil
-                return
-            }
 
             let ragSamples = learning.relevantWritingSamples(
                 for: precedingText,
@@ -369,11 +389,22 @@ public final class CompletionEngine: ObservableObject {
         let text: String
         let deleteCount: Int
         let checksParagraph: Bool
+        let replacementRange: NSRange?
         fileprivate let nextWord: Bool
+        fileprivate let originalContext: TextEditingContext
+
+        func replacement(in snapshot: TextInputSnapshot) -> TextReplacement? {
+            guard snapshot.isValid, snapshot.text == originalContext.text,
+                  snapshot.selection == originalContext.selection else { return nil }
+            if let replacementRange {
+                return TextReplacement(original: snapshot, range: replacementRange, insertion: text)
+            }
+            return TextReplacement.trailing(text, count: deleteCount, in: snapshot)
+        }
     }
 
     func matchesContext(_ context: TextEditingContext, bundleId: String?) -> Bool {
-        canAccept && context.selectedText.isEmpty && lastBundleId == bundleId
+        canAccept && lastSelectedText == context.selectedText && lastBundleId == bundleId
             && lastRequestedText == context.precedingText && lastFollowingText == context.followingText
     }
 
@@ -399,20 +430,18 @@ public final class CompletionEngine: ObservableObject {
         // Invalidate any inference response already on its way back.
         requestID = UUID()
         return PreparedAcceptance(requestID: requestID, text: value.0, deleteCount: value.1,
-                                  checksParagraph: paragraphSpellingSuggestion != nil, nextWord: wordOnly)
+                                  checksParagraph: paragraphSpellingSuggestion != nil,
+                                  replacementRange: activeAutocorrect?.replacementRange, nextWord: wordOnly,
+                                  originalContext: TextEditingContext(text: lastRequestedText + lastSelectedText + lastFollowingText,
+                                      selection: NSRange(location: lastRequestedText.utf16.count, length: lastSelectedText.utf16.count)))
     }
 
-    private func offerParagraphSpelling(precedingText: String, followingText: String, bundleId: String?) -> Bool {
-        guard settings.showSuggestedTypoFixes, settings.rule(for: bundleId)?.disableAutocorrect != true else { return false }
-        let snapshot = TextInputSnapshot(identity: 0, text: precedingText + followingText,
-            selection: NSRange(location: precedingText.utf16.count, length: 0))
-        guard let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
+    private func offerParagraphSpelling(_ correction: SentenceSpellingCorrection) {
         paragraphSpellingSuggestion = correction
         currentSuggestion = CompletionItem(fullText: "Fix \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes") · Tab",
             providerName: "Paragraph spelling", replacementLength: correction.trailingLength)
         isGenerating = false
         stats.recordShown(latencyMs: 0)
-        return true
     }
 
     /// Statistics and learning are updated only after the target confirms the edit.
@@ -422,30 +451,30 @@ public final class CompletionEngine: ObservableObject {
         else { _ = acceptFull() }
     }
 
-    public func acceptFull() -> (textToInsert: String, deleteBackwardsCount: Int)? {
+    public func acceptFull() -> (textToInsert: String, deleteBackwardsCount: Int, replacementRange: NSRange?)? {
         guard canAccept else { dismiss(); return nil }
         if let paragraph = paragraphSpellingSuggestion {
             stats.recordAccepted(text: paragraph.wordEdits.map(\.insertion).joined(separator: " "),
                                  appName: lastAppName, source: "Paragraph spelling")
             dismiss()
-            return (paragraph.trailingInsertion, paragraph.trailingLength)
+            return (paragraph.trailingInsertion, paragraph.trailingLength, nil)
         }
         if let slash = activeSlashCommand {
             stats.recordAccepted(text: slash.expansion, appName: lastAppName, source: "Slash Snippets")
             dismiss()
-            return (slash.expansion, slash.replacementLength)
+            return (slash.expansion, slash.replacementLength, nil)
         }
 
         if let emoji = activeEmojiCandidates.first {
             stats.recordAccepted(text: emoji.emoji, appName: lastAppName, source: "Autocorrect & Emoji")
             dismiss()
-            return (emoji.emoji, emoji.replacementLength)
+            return (emoji.emoji, emoji.replacementLength, nil)
         }
 
         if let typo = activeAutocorrect {
             stats.recordAccepted(text: typo.correctedWord, appName: lastAppName, source: "Autocorrect & Emoji")
             dismiss()
-            return (typo.correctedWord, typo.replacementLength)
+            return (typo.correctedWord, typo.replacementLength, typo.replacementRange)
         }
 
         guard let suggestion = currentSuggestion else { return nil }
@@ -466,7 +495,7 @@ public final class CompletionEngine: ObservableObject {
             NSSound(named: "Tink")?.play()
         }
         dismiss()
-        return (textToInsert, deleteCount)
+        return (textToInsert, deleteCount, nil)
     }
 
     public func acceptNextWord() -> String? {

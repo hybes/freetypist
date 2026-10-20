@@ -8,6 +8,72 @@ final class TextReplacementTests: XCTestCase {
     }
 
     @MainActor
+    func testRevisitedWordsUseVerifiedReplacementAndKeepTheSurroundingText() async throws {
+        for direct in [true, false] {
+            let original = snapshot("An earlier speelling.\n👩🏽‍💻 Fix speelling, keep reeplacement.",
+                                    caret: "An earlier speelling.\n👩🏽‍💻 Fix spee".utf16.count)
+            let edit = try XCTUnwrap(SentenceSpellingCorrector.wordCorrection(in: original))
+            let target = TestTarget(original)
+            target.directWrite = direct ? .supported : .unsupported
+            let result = await TextReplacementWriter.apply(edit, to: target)
+            XCTAssertEqual(result, .applied)
+            XCTAssertEqual(target.value.text, "An earlier speelling.\n👩🏽‍💻 Fix spelling, keep reeplacement.")
+            XCTAssertEqual(target.value.selection.location, "An earlier speelling.\n👩🏽‍💻 Fix spelling".utf16.count)
+            XCTAssertEqual(target.typedChunks, direct ? [] : ["spelling"])
+        }
+    }
+
+    @MainActor
+    func testWordAtCaretSkipsCodeAddressesPartialSelectionsAndWhitespace() {
+        for text in ["https://example.com/speelling", "speelling@example.com", "`speelling`",
+                     "my_speelling_variable", "/tmp/speelling.txt", ":speelling:", "ABC123speelling"] {
+            let word = (text as NSString).range(of: "speelling")
+            XCTAssertNil(SentenceSpellingCorrector.wordCorrection(in: snapshot(text, caret: word.location + 3)), text)
+        }
+        let text = "Check  speelling and reeplacement."
+        XCTAssertNil(SentenceSpellingCorrector.wordCorrection(in: snapshot(text, caret: 6)))
+        XCTAssertNil(SentenceSpellingCorrector.wordCorrection(in: TextInputSnapshot(identity: 42, text: text,
+            selection: NSRange(location: 7, length: 4))))
+        XCTAssertNil(SentenceSpellingCorrector.wordCorrection(in: TextInputSnapshot(identity: 42, text: text,
+            selection: NSRange(location: 7, length: 24))))
+    }
+
+    @MainActor
+    func testNativeEditorTabCorrectsClickedWordAndUndoRestoresIt() throws {
+        let editor = GhostAwareNSTextView()
+        let undoProvider = TestUndoProvider()
+        editor.delegate = undoProvider
+        editor.allowsUndo = true
+        editor.string = "Check speelling and reeplacement."
+        editor.setSelectedRange(NSRange(location: "Check spee".utf16.count, length: 0))
+        let engine = CompletionEngine()
+        let context = TextEditingContext(text: editor.string, selection: editor.selectedRange())
+        engine.onTextContextChanged(precedingText: context.precedingText, followingText: context.followingText,
+                                   bundleId: "test.editor", caretMoved: true)
+        editor.hasInterceptableAction = engine.currentSuggestion != nil
+        editor.onTabAcceptFull = {
+            let snapshot = TextInputSnapshot(identity: 42, text: editor.string, selection: editor.selectedRange())
+            guard engine.matchesContext(snapshot.context, bundleId: "test.editor"),
+                  let acceptance = engine.prepareAcceptance(nextWord: false),
+                  let edit = acceptance.replacement(in: snapshot) else { return false }
+            editor.insertText(edit.insertion, replacementRange: edit.range)
+            editor.setSelectedRange(edit.result.selection)
+            engine.commitAcceptance(acceptance)
+            return true
+        }
+        let tab = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, characters: "\t", charactersIgnoringModifiers: "\t",
+            isARepeat: false, keyCode: 48))
+        undoProvider.undo.beginUndoGrouping()
+        editor.keyDown(with: tab)
+        undoProvider.undo.endUndoGrouping()
+        XCTAssertEqual(editor.string, "Check spelling and reeplacement.")
+        XCTAssertEqual(editor.selectedRange().location, "Check spelling".utf16.count)
+        editor.undoManager?.undo()
+        XCTAssertEqual(editor.string, "Check speelling and reeplacement.")
+    }
+
+    @MainActor
     func testSentenceCorrectsTheUsersDoubledLettersWithoutRewriting() throws {
         let text = "ok sweet, please check the aactual reeplacement stuff, and speelling corrections over a full sentencee!"
         let correction = try XCTUnwrap(SentenceSpellingCorrector.correction(in: snapshot(text)))

@@ -10,6 +10,7 @@ public final class GhostOverlayPanel: NSPanel {
     private var cancellables = Set<AnyCancellable>()
     private var lastCaretRect: CGRect = .zero
     private var hasValidCaretPosition: Bool = false
+    private var lastPositionUpdate: ContinuousClock.Instant?
     public var detectedFontSize: CGFloat = 13.5
 
     public override var canBecomeKey: Bool { false }
@@ -57,6 +58,7 @@ public final class GhostOverlayPanel: NSPanel {
 
     public func invalidateCaretPosition() {
         hasValidCaretPosition = false
+        lastPositionUpdate = nil
         lastCaretRect = .zero
         hideOverlay()
     }
@@ -71,6 +73,7 @@ public final class GhostOverlayPanel: NSPanel {
 
         lastCaretRect = caretScreenRect
         hasValidCaretPosition = true
+        lastPositionUpdate = .now
         detectedFontSize = fontSize
         fitToContent()
 
@@ -83,7 +86,7 @@ public final class GhostOverlayPanel: NSPanel {
 
         let targetOrigin = NSPoint(
             x: caretScreenRect.origin.x + caretScreenRect.width + xNudge,
-            y: ReplacementFeedback.shared.message == nil
+            y: ReplacementFeedback.shared.message == nil && CompletionEngine.shared.activeAutocorrect?.replacementRange == nil
                 ? caretScreenRect.origin.y + yNudge
                 : caretScreenRect.origin.y - frame.height - 6
         )
@@ -117,13 +120,18 @@ public final class GhostOverlayPanel: NSPanel {
             return
         }
 
-        // Refresh cursor position from Accessibility
-        if let caretInfo = AccessibilityService.shared.getCurrentCaretInfo(), caretInfo.hasValidCaretRect {
-            updatePosition(caretScreenRect: caretInfo.screenRect, fontSize: caretInfo.estimatedFontSize)
+        // Immediate spelling suggestions already have a freshly read caret.
+        // Avoid a second complete AX round trip before drawing them.
+        let positionIsFresh = lastPositionUpdate.map { $0.duration(to: .now) < .milliseconds(100) } ?? false
+        if !positionIsFresh {
+            if let caretInfo = AccessibilityService.shared.getCurrentCaretInfo(), caretInfo.hasValidCaretRect {
+                updatePosition(caretScreenRect: caretInfo.screenRect, fontSize: caretInfo.estimatedFontSize)
+            } else {
+                hideOverlay()
+                return
+            }
         } else {
-            // Never display a floating modal at (0,0) bottom-left corner when cursor bounds are unavailable!
-            hideOverlay()
-            return
+            updatePosition(caretScreenRect: lastCaretRect, fontSize: detectedFontSize)
         }
 
         guard hasValidCaretPosition else {

@@ -24,6 +24,30 @@ enum SentenceSpellingCorrector {
     private static let protectedText = try! NSRegularExpression(
         pattern: #"`[^`]*(?:`|$)|(?:https?://|www\.)\S+|[^\s]+@[^\s]+|\S*[/_:=#\\]\S*|\b\S+\.\p{L}{2,}\b|\b\S*\d\S*\b"#)
 
+    /// Check the complete word under the cursor, or an exactly selected word.
+    /// Do not interpret the prefix before a click as an unfinished misspelling.
+    static func wordCorrection(in snapshot: TextInputSnapshot) -> TextReplacement? {
+        guard snapshot.isValid else { return nil }
+        let text = snapshot.text as NSString
+        let paragraphRange = text.paragraphRange(for: snapshot.selection)
+        guard paragraphRange.length <= 2_000 else { return nil }
+        let paragraph = text.substring(with: paragraphRange)
+        let range = NSRange(location: 0, length: paragraph.utf16.count)
+        let selection = NSRange(location: snapshot.selection.location - paragraphRange.location,
+                                length: snapshot.selection.length)
+        guard let match = words.matches(in: paragraph, range: range).first(where: {
+            if selection.length > 0 { return $0.range == selection }
+            return selection.location >= $0.range.location && selection.location <= NSMaxRange($0.range)
+        }), !protectedText.matches(in: paragraph, range: range).contains(where: {
+            NSIntersectionRange($0.range, match.range).length > 0
+        }) else { return nil }
+        let word = (paragraph as NSString).substring(with: match.range)
+        guard let fixed = SmartWritingFeatures.completedWordCorrection(word), fixed != word else { return nil }
+        return TextReplacement(original: snapshot,
+            range: NSRange(location: paragraphRange.location + match.range.location, length: match.range.length),
+            insertion: fixed)
+    }
+
     static func correction(in snapshot: TextInputSnapshot) -> SentenceSpellingCorrection? {
         guard snapshot.isValid, snapshot.selection.length == 0 else { return nil }
         let context = snapshot.context
