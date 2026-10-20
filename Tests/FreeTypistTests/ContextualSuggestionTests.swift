@@ -4,12 +4,12 @@ import XCTest
 
 final class ContextualSuggestionTests: XCTestCase {
     @MainActor
-    func testCompletedWordsStartPredictionsWithoutTheFullMidWordDelay() {
-        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, atWordBoundary: true, force: false), 80)
-        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, atWordBoundary: false, force: false), 200)
-        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 40, atWordBoundary: true, force: false), 40)
-        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: -1, atWordBoundary: true, force: false), 0)
-        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, atWordBoundary: false, force: true), 0)
+    func testPredictionDelayDoesNotDependOnTypingASpace() {
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, force: false), 200)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 80, force: false), 80)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 40, force: false), 40)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: -1, force: false), 0)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, force: true), 0)
     }
 
     private func settings() -> AppSettings {
@@ -32,7 +32,8 @@ final class ContextualSuggestionTests: XCTestCase {
 
     @MainActor
     func testValidWordsAndCodeVocabularyAreNotRewritten() {
-        for word in ["I", "lets", "wont", "cant", "navbar", "frontend", "useState", "API", "zustand"] {
+        for word in ["I", "lets", "wont", "cant", "navbar", "frontend", "useState", "API", "zustand",
+                     "prioritize", "finalize", "prioritise", "finalise", "color", "colour"] {
             let text = "The code uses \(word) "
             XCTAssertNil(SmartWritingFeatures.detectAutocorrect(in: text), word)
             XCTAssertNil(SentenceSpellingCorrector.correction(in: snapshot(text)), word)
@@ -43,6 +44,8 @@ final class ContextualSuggestionTests: XCTestCase {
             XCTAssertNil(SmartWritingFeatures.detectAutocorrect(in: text), text)
         }
         XCTAssertEqual(SmartWritingFeatures.detectAutocorrect(in: "im ")?.correctedWord, "I'm ")
+        XCTAssertNil(SmartWritingFeatures.detectAutocorrect(in: "We should prioritize "))
+        XCTAssertNil(SmartWritingFeatures.detectAutocorrect(in: "Now we can finalize "))
     }
 
     @MainActor
@@ -77,16 +80,67 @@ final class ContextualSuggestionTests: XCTestCase {
         XCTAssertEqual(PromptBuilder.cleanCompletionText(" be responsive", precedingText: context.precedingText),
                        "be responsive")
         XCTAssertEqual(PromptBuilder.completionMessages(context: PromptContext(precedingText: "The nav")).last?["content"],
-                       "The nav")
-        let nextSentence = PromptContext(precedingText: "The code works. ")
-        XCTAssertEqual(PromptBuilder.completionMessages(context: nextSentence).last?["role"], "user")
+                       "The")
+        let nextSentence = PromptContext(precedingText: "The code works.")
+        XCTAssertEqual(PromptBuilder.completionMessages(context: nextSentence).last?["content"], "The code works.")
         XCTAssertTrue(PromptBuilder.buildSystemPrompt(context: nextSentence).contains("next sentence"))
+    }
+
+    func testRegeneratingPartialWordsPreservesExactlyWhatTheWriterTyped() throws {
+        for (before, generated, expected) in [
+            ("We need to improve the perform", " performance of the app.", "We need to improve the performance of the app."),
+            ("Can you send me the docum", " document?", "Can you send me the document?"),
+            ("The navbar needs to", " to be responsive.", "The navbar needs to be responsive."),
+            ("The navbar needs to ", " be responsive.", "The navbar needs to be responsive."),
+            ("I", "I can help.", "I can help."),
+            ("I'", "I'm ready.", "I'm ready."),
+            ("Le caf", " café est ouvert.", "Le café est ouvert."),
+            ("Done.", " We can deploy.", "Done. We can deploy.")
+        ] {
+            let context = PromptContext(precedingText: before)
+            var stream = CompletionStream()
+            let event: [String: Any] = ["choices": [["delta": ["content": generated], "finish_reason": "stop"]]]
+            try stream.consume("data: " + String(decoding: JSONSerialization.data(withJSONObject: event), as: UTF8.self))
+            let suffix = stream.completion(context: context)
+            XCTAssertEqual(before + suffix, expected)
+            let input = snapshot(before)
+            let edit = input.context.replacingSelection(with: suffix, deleteBackwardsCount: 0)
+            XCTAssertEqual(edit.text, expected)
+        }
+    }
+
+    func testRegeneratedPrefixIsNeverDisplayedOrAcceptedAsNewText() throws {
+        let context = PromptContext(precedingText: "Check the docum")
+        var stream = CompletionStream()
+        try stream.consume(#"data: {"choices":[{"delta":{"content":" doc"}}]}"#)
+        XCTAssertEqual(stream.completion(context: context), "")
+        try stream.consume(#"data: {"choices":[{"delta":{"content":"ument for "}}]}"#)
+        XCTAssertEqual(stream.completion(context: context), "ent for ")
+
+        var wrong = CompletionStream()
+        try wrong.consume(#"data: {"choices":[{"delta":{"content":" documentation "},"finish_reason":"stop"}]}"#)
+        XCTAssertEqual(wrong.completion(context: PromptContext(precedingText: "Check the docux")), "")
+
+        let single = PromptBuilder.completionPrompt(context: PromptContext(precedingText: "I"))
+        XCTAssertEqual(single.regeneratedPrefix, "I")
+        XCTAssertNotNil(single.grammar)
+        XCTAssertFalse(single.grammar!.contains("['’]"), "A complete pronoun must not grow an apostrophe")
+    }
+
+    func testNativeModelSuffixKeepsItsBoundaryInsteadOfGuessingFromADictionary() {
+        // "perform" is a valid word, so a dictionary-based join previously
+        // inserted an extra space before its valid continuation.
+        XCTAssertEqual(PromptBuilder.cleanCompletionText("ance", precedingText: "perform",
+                                                         preservesWordBoundary: true), "ance")
+        XCTAssertEqual(PromptBuilder.cleanCompletionText(" update", precedingText: "the",
+                                                         preservesWordBoundary: true), " update")
     }
 
     @MainActor
     func testEarlierMistakesDoNotBlockNextWordsButReturnAtSentenceEnd() async throws {
         let engine = CompletionEngine(settings: settings(), provider: PredictableProvider())
-        for text in ["Check speelling and then ", "Check speelling and reeplacement before we ", "The navbar needs ", "I "] {
+        for text in ["Check speelling and then ", "Check speelling and reeplacement before we ", "The navbar needs ", "I ",
+                     "The navbar needs to", "We need to improve the perform", "Can you send the docum"] {
             engine.onTextContextChanged(precedingText: text, bundleId: "com.freetypist.playground")
             try await Task.sleep(for: .milliseconds(20))
             XCTAssertEqual(engine.currentSuggestion?.fullText, "continue writing", text)
@@ -100,9 +154,9 @@ final class ContextualSuggestionTests: XCTestCase {
     }
 
     @MainActor
-    func testSpaceAfterSentenceStartsNextPredictionButPunctuationAndReturnDoNot() async throws {
+    func testSentencePredictionsNeedNoSpaceAndReturnStillEndsTheParagraph() async throws {
         let engine = CompletionEngine(settings: settings(), provider: PredictableProvider())
-        for (text, shouldPredict) in [("The code works.", false), ("The code works. ", true),
+        for (text, shouldPredict) in [("The code works.", true), ("The code works. ", true),
                                       ("The code works.\n", false)] {
             engine.onTextContextChanged(precedingText: text, bundleId: "com.freetypist.playground")
             try await Task.sleep(for: .milliseconds(20))

@@ -201,8 +201,8 @@ final class FreeTypistTests: XCTestCase {
         )
 
         let prompt = PromptBuilder.buildSystemPrompt(context: context)
-        XCTAssertTrue(prompt.contains("Slack"))
-        XCTAssertTrue(prompt.contains("#product-launch"))
+        XCTAssertFalse(prompt.contains("Slack"), "App metadata must not become the subject of a continuation")
+        XCTAssertFalse(prompt.contains("#product-launch"))
         XCTAssertTrue(prompt.contains("Concise developer"))
         XCTAssertTrue(prompt.contains("Casual"))
     }
@@ -601,15 +601,16 @@ final class FreeTypistTests: XCTestCase {
     @MainActor
     func testLocalModelDefaultsFollowMemoryAndPreserveAnExplicitChoice() {
         let defaults = UserDefaults(suiteName: UUID().uuidString)!
-        for (ram, expectedID) in [(8, "qwen-3.5-0.8b"), (16, "qwen-3.5-2b"), (32, "qwen-3.5-2b"), (64, "qwen-3.5-2b")] {
+        for (ram, expectedID) in [(8, "qwen-3.5-0.8b"), (16, "qwen-3.5-2b"), (24, "qwen-3.5-4b"),
+                                  (32, "qwen-3.5-4b"), (64, "qwen-3.5-4b")] {
             let manager = LocalModelManager(directory: AppStorage.directory.appendingPathComponent(UUID().uuidString), defaults: defaults, memoryGB: ram)
             XCTAssertEqual(manager.selectedModel.id, expectedID)
             XCTAssertEqual(manager.recommendedModel.id, expectedID)
         }
         let manager = LocalModelManager(directory: AppStorage.directory.appendingPathComponent(UUID().uuidString), defaults: defaults, memoryGB: 32)
-        manager.selectedModel = LocalModelInfo.catalog.first { $0.id == "qwen-3.5-4b" }!
+        manager.selectedModel = LocalModelInfo.catalog.first { $0.id == "qwen-3.5-2b" }!
         let reloaded = LocalModelManager(directory: manager.freeTypistModelsDirectory, defaults: defaults, memoryGB: 32)
-        XCTAssertEqual(reloaded.selectedModel.id, "qwen-3.5-4b")
+        XCTAssertEqual(reloaded.selectedModel.id, "qwen-3.5-2b")
     }
 
     @MainActor

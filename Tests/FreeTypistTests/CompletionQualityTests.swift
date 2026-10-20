@@ -199,7 +199,7 @@ final class CompletionQualityTests: XCTestCase {
     }
 
     @MainActor
-    func testSentenceEndStillRecordsWritingWithoutRequestingAnotherSentence() async throws {
+    func testNewlineStillRecordsWritingWithoutRequestingAnotherSentence() async throws {
         let settings = AppSettings.shared
         settings.isEnabled = true
         settings.recordWritingForPersonalization = true
@@ -207,7 +207,7 @@ final class CompletionQualityTests: XCTestCase {
         settings.debounceMs = 0
         let learning = LearningEngine(storageURL: AppStorage.directory.appendingPathComponent(UUID().uuidString))
         let engine = CompletionEngine(settings: settings, learning: learning)
-        engine.onTextContextChanged(precedingText: "We can finish the project tomorrow.",
+        engine.onTextContextChanged(precedingText: "We can finish the project tomorrow.\n",
                                     appName: "TextEdit", bundleId: "com.apple.TextEdit")
         try await Task.sleep(for: .milliseconds(20))
         XCTAssertEqual(learning.historyRecords.count, 1)
@@ -249,7 +249,7 @@ final class CompletionQualityTests: XCTestCase {
         settings.trackCrossAppContext = false
         settings.useClipboardContext = false
         settings.includeSystemAndUserMetadata = false
-        settings.debounceMs = 140
+        settings.debounceMs = 80
         settings.completionLength = .long
         settings.batteryOnlyOnDemand = false
         settings.isEnabled = true
@@ -318,6 +318,32 @@ final class CompletionQualityTests: XCTestCase {
             XCTAssertFalse(completion.lowercased().contains("nabber"))
             if seed == "I " { XCTAssertFalse(completion.hasPrefix("I'm")) }
             print("REAL STREAM first \(observations.first?.1 ?? -1) ms / final \(latency) ms: \(seed)\(completion)")
+        }
+        // These are actual grammar, tokenizer and model requests, not a fake
+        // provider returning the expected suffix.
+        for (seed, expectedStart) in [
+            ("We need to improve the perform", "ance"),
+            ("Can you send me the docum", "ent"),
+            ("The navigation menu should be respons", "ive"),
+            ("The navbar needs to", " "),
+            ("Please let me know if you", " "),
+            ("The build passed.", " ")
+        ] {
+            let context = PromptContext(precedingText: seed, appName: "TextEdit", maxWords: 7)
+            let progress = StreamObservations()
+            let (text, latency) = try await EmbeddedLocalProvider(allowFallback: false)
+                .complete(context: context, settings: settings) { partial, ms in await progress.record(partial, ms) }
+            XCTAssertTrue(text.hasPrefix(expectedStart), "\(seed) + \(text)")
+            XCTAssertFalse(text.trimmingCharacters(in: .whitespaces).isEmpty, seed)
+            let joined = seed + text
+            for leaked in ["as an ai", "your next command", "continue the draft", "provide the story"] {
+                XCTAssertFalse(joined.lowercased().contains(leaked), joined)
+            }
+            let observed = await progress.values
+            for (partial, _) in observed {
+                XCTAssertTrue(partial.hasPrefix(expectedStart), "Unsafe streamed word boundary: \(seed) + \(partial)")
+            }
+            print("REAL NO-SPACE first \(observed.first?.1 ?? -1) ms / final \(latency) ms: \(joined)")
         }
     }
 }

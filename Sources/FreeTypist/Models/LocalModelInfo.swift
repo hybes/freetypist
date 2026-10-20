@@ -34,7 +34,7 @@ public struct LocalModelInfo: Identifiable, Hashable, Sendable {
     /// Keep inline generation responsive without using most of an 8 GB Mac's memory.
     public static func recommended(forMemoryGB memoryGB: Int, models: [LocalModelInfo] = catalog) -> LocalModelInfo {
         precondition(!models.isEmpty)
-        let preferredID = memoryGB >= 16 ? "qwen-3.5-2b" : "qwen-3.5-0.8b"
+        let preferredID = memoryGB >= 24 ? "qwen-3.5-4b" : memoryGB >= 16 ? "qwen-3.5-2b" : "qwen-3.5-0.8b"
         return models.first { $0.id == preferredID }
             ?? models.first { $0.minRAMGigabytes <= memoryGB }
             ?? models[0]

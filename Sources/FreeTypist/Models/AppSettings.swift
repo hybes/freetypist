@@ -267,7 +267,7 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         self.showSuggestedTypoFixes = defaults.object(forKey: "ft_showTypoFixes") as? Bool ?? true
         self.paragraphSpellingShortcutEnabled = defaults.object(forKey: "ft_paragraphSpellingShortcutEnabled") as? Bool ?? true
 
-        self.debounceMs = defaults.object(forKey: "ft_debounceMs") as? Int ?? 140
+        self.debounceMs = defaults.object(forKey: "ft_debounceMs") as? Int ?? 80
         self.minTriggerCharacters = defaults.object(forKey: "ft_minTriggerCharacters") as? Int ?? 2
         self.playSoundOnAccept = defaults.object(forKey: "ft_playSoundOnAccept") as? Bool ?? false
         self.showShortcutBadges = defaults.object(forKey: "ft_showInlineBadges_v2") as? Bool ?? false

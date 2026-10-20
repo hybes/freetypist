@@ -459,10 +459,14 @@ public struct SmartWritingFeatures: Sendable {
         let lower = word.lowercased()
         let checker = NSSpellChecker.shared
         func isWord(_ candidate: String) -> Bool {
-            checker.checkSpelling(of: candidate, startingAt: 0, language: "en_GB",
-                                  wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
+            ["en_GB", "en_US"].contains { language in
+                checker.checkSpelling(of: candidate, startingAt: 0, language: language,
+                    wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
+            }
         }
         // These valid words and informal abbreviations must not be rewritten automatically.
+        // Regional spelling variants are valid too; accepting "finalize" must
+        // not immediately produce another suggestion to replace it with "finalise".
         let ambiguous = ["ill", "id", "form", "fro", "lets", "wont", "were", "well", "its",
                          "cant", "thats", "therefor", "pls", "plz", "thx", "ty"]
         guard !ambiguous.contains(lower), !developerTerms.contains(lower), !isWord(word) else { return nil }

@@ -203,6 +203,10 @@ public final class LocalInferenceService: ObservableObject {
                    let http = response as? HTTPURLResponse, http.statusCode == 200,
                    !Task.isCancelled, self.generation == id,
                    self.serverProcess?.isRunning == true {
+                    self.serverStatus = "Preparing the first suggestion…"
+                    await self.warmPrediction()
+                    guard !Task.isCancelled, self.generation == id,
+                          self.serverProcess?.isRunning == true else { return }
                     self.isServerRunning = true
                     self.isStarting = false
                     self.serverStatus = "Active (Metal GPU • Low-Memory KV)"
@@ -213,6 +217,30 @@ public final class LocalInferenceService: ObservableObject {
             guard !Task.isCancelled, self.generation == id else { return }
             self.stopServer(reason: "Model startup timed out. See engine.log for details.")
         }
+    }
+
+    /// Compile the first inference kernels and cache the stable instructions
+    /// during startup, using synthetic text rather than the user's first draft.
+    private func warmPrediction() async {
+        let settings = AppSettings.shared
+        let tone = settings.effectiveTone(for: nil)
+        let context = PromptContext(precedingText: "The project is ready for ",
+                                    personaDescription: settings.effectiveCustomInstructions(for: nil),
+                                    toneInstruction: tone == .custom
+                                        ? settings.customToneInstructions : tone.promptInstruction,
+                                    maxWords: settings.completionLength.maxWords)
+        let prompt = PromptBuilder.completionPrompt(context: context)
+        var request = URLRequest(url: URL(string: baseURL + "/chat/completions")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 5
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "messages": prompt.messages, "max_tokens": 1, "temperature": 0,
+            "cache_prompt": true, "id_slot": 0, "stream": false,
+            "reasoning_format": "none", "chat_template_kwargs": ["enable_thinking": false]
+        ])
+        _ = try? await URLSession.shared.data(for: request)
     }
 
     private func setupIdleWatcher() {

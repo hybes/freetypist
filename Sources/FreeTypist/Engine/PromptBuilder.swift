@@ -47,6 +47,17 @@ public struct PromptContext: Sendable {
     }
 }
 
+struct CompletionPrompt {
+    let messages: [[String: String]]
+    let regeneratedPrefix: String
+    let grammar: String?
+
+    var prefill: String? {
+        guard messages.last?["role"] == "assistant" else { return nil }
+        return messages.last?["content"]
+    }
+}
+
 public struct PromptBuilder {
     public static func readSafeClipboardSnippet(enabled: Bool) -> String? {
         guard enabled else { return nil }
@@ -69,27 +80,15 @@ public struct PromptBuilder {
         return clipped
     }
 
-    public static func buildSystemPrompt(context: PromptContext) -> String {
+    public static func buildSystemPrompt(context: PromptContext, includesDraft: Bool = false) -> String {
         var instructions: [String] = []
         let task = startsNewSentence(context)
-            ? "Write the next sentence of the writer's draft in its existing language and style."
-            : "Complete the unfinished sentence in its existing language and style."
-
-        instructions.append("""
-        You are FreeTypist, an on-device inline autocomplete engine for macOS.
-        \(task) Output only the missing words, at most \(context.maxWords). Finish a partial word first if needed. Do not reply to the writer. Do not repeat the input, explain, add quotes, or output reasoning.
-        """)
-
-        if !context.appName.isEmpty {
-            var envDesc = "Active application: '\(context.appName)'"
-            if let dom = context.domain, !dom.isEmpty {
-                envDesc += " (domain: \(dom))"
-            }
-            if let win = context.windowTitle, !win.isEmpty {
-                envDesc += " — Window: '\(win.prefix(80))'"
-            }
-            instructions.append(envDesc)
-        }
+            ? "Continue the draft with its next sentence."
+            : "Complete the unfinished draft with a brief, relevant continuation."
+        let output = includesDraft
+            ? "Return the draft with a few words added; no explanation."
+            : "Return only the words to append; no explanation."
+        instructions.append("\(task) Keep the writer's point of view, language and style. \(output)")
 
         if !context.toneInstruction.isEmpty {
             instructions.append("Tone & Style: \(context.toneInstruction.prefix(300))")
@@ -99,16 +98,14 @@ public struct PromptBuilder {
             instructions.append("Custom AI Instructions: \(context.personaDescription.prefix(600))")
         }
 
-        instructions.append("Continue the draft directly from its final character. Use background only when relevant; never copy a writing example or a previous sentence. Stop at the end of the sentence.")
         return instructions.joined(separator: "\n\n")
     }
 
     private static func startsNewSentence(_ context: PromptContext) -> Bool {
-        context.precedingText.last?.isWhitespace == true
-            && context.precedingText.trimmingCharacters(in: .whitespacesAndNewlines).last.map({ ".!?".contains($0) }) == true
+        context.precedingText.trimmingCharacters(in: .whitespacesAndNewlines).last.map({ ".!?".contains($0) }) == true
     }
 
-    public static func buildUserPrompt(context: PromptContext, includeDraft: Bool = true) -> String {
+    public static func buildUserPrompt(context: PromptContext, continuationOnly: Bool = true) -> String {
         let shouldSanitize = AppSettings.shared.sanitizeSecretsLocally
         let beforeSlice = String(context.precedingText.suffix(700))
         let sanitizedBefore = shouldSanitize ? SecretSanitizer.sanitize(beforeSlice).sanitized : beforeSlice
@@ -117,7 +114,7 @@ public struct PromptBuilder {
         // stable also lets the local server reuse its prompt cache while typing.
         var parts: [String] = []
         if context.bundleIdentifier != "com.freetypist.playground" {
-            let background = [context.deepContextSummary, context.clipboardSnippet ?? ""]
+            let background = [context.deepContextSummary, context.clipboardSnippet ?? "", context.windowTitle ?? ""]
                 .filter { isRelevantBackground($0, to: context.precedingText) }.joined(separator: "\n")
             if !background.isEmpty {
                 parts.append("<background>\n\(background.prefix(600))\n</background>")
@@ -127,38 +124,63 @@ public struct PromptBuilder {
             let samples = context.learnedSamples.prefix(2).map { String($0.suffix(120)) }.joined(separator: "\n")
             parts.append("<writing_style_examples>\n\(samples)\n</writing_style_examples>")
         }
-        if includeDraft { parts.append("Sentence: \(sanitizedBefore)") }
+        parts.append("Draft: \(sanitizedBefore)")
         if !context.followingText.isEmpty {
             let after = String(context.followingText.prefix(160))
             parts.append("<after>\(shouldSanitize ? SecretSanitizer.sanitize(after).sanitized : after)</after>")
         }
-        parts.append(includeDraft ? "Missing continuation:" : "Continue the draft already started below.")
+        if continuationOnly { parts.append("Missing continuation:") }
         return parts.joined(separator: "\n")
     }
 
-    /// llama.cpp b11669 continues a final assistant message rather than opening
-    /// a new reply. This anchors small instruct models to the actual draft.
-    static func completionMessages(context: PromptContext) -> [[String: String]] {
-        if startsNewSentence(context) {
-            // Prefilling a complete assistant sentence encourages immediate EOS.
-            // Supply the finished draft as context when starting its next sentence.
-            return [
-                ["role": "system", "content": buildSystemPrompt(context: context)],
-                ["role": "user", "content": buildUserPrompt(context: context)]
-            ]
-        }
+    /// Regenerate the final word under an exact prefix constraint. Starting
+    /// generation halfway through a model token otherwise produces misspellings
+    /// such as "perform" + "ace", even with a larger model. Only the new suffix
+    /// reaches the editor; the writer's existing text is never replaced.
+    static func completionPrompt(context: PromptContext) -> CompletionPrompt {
         let prefix = String(context.precedingText.suffix(700))
         // Space-prefixed word tokens must remain available to the model. A
         // literal trailing space in the prefill splits that token boundary and
         // biases the next token towards numbers/symbols. Output normalisation
         // still uses the exact cursor text, so no user whitespace is removed.
         let trimmed = String(prefix.reversed().drop(while: \.isWhitespace).reversed())
-        let draft = AppSettings.shared.sanitizeSecretsLocally ? SecretSanitizer.sanitize(trimmed).sanitized : trimmed
-        return [
-            ["role": "system", "content": buildSystemPrompt(context: context)],
-            ["role": "user", "content": buildUserPrompt(context: context, includeDraft: false)],
+        var draft = AppSettings.shared.sanitizeSecretsLocally ? SecretSanitizer.sanitize(trimmed).sanitized : trimmed
+        var regenerated = ""
+        var grammar: String?
+        if context.precedingText.last?.isWhitespace != true,
+           let wordRange = draft.range(of: #"[\p{L}\p{M}]+(?:['’][\p{L}\p{M}]*)?$"#, options: .regularExpression) {
+            let word = String(draft[wordRange])
+            let before = String(draft[..<wordRange.lowerBound].reversed().drop(while: \.isWhitespace).reversed())
+            regenerated = String(draft.dropFirst(before.count))
+            draft = before
+            // Short function words and pronouns must stay whole: "on" must not
+            // become "once", nor "I" become "I'm" just because space was omitted.
+            let wholeWords: Set<String> = ["i", "you", "he", "she", "it", "we", "they", "that", "there", "who",
+                "to", "on", "in", "and", "or", "the", "a", "an", "if", "of", "for", "is", "as", "at", "be", "but", "so"]
+            let literal = String(data: try! JSONEncoder().encode(regenerated), encoding: .utf8)!
+            let tail = wholeWords.contains(word.lowercased())
+                ? #"([ \t.!?,;:] [^\n\r]*)?"#
+                : #"[^\n\r]*"#
+            grammar = "root ::= \(literal) \(tail)"
+        } else if context.precedingText.last?.isWhitespace == true {
+            // An append-only suggestion cannot move an existing space to put
+            // punctuation before it. Ask for a word instead of "works , and".
+            grammar = #"root ::= " "? [^\n\r \t,.;:!?'’] [^\n\r]*"#
+        }
+        let messages = [
+            ["role": "system", "content": buildSystemPrompt(context: context, includesDraft: true)],
+            ["role": "user", "content": "Draft: Could you please"],
+            ["role": "assistant", "content": "Could you please review the changes?"],
+            ["role": "user", "content": "Draft: The mobile menu should"],
+            ["role": "assistant", "content": "The mobile menu should collapse into a hamburger button."],
+            ["role": "user", "content": buildUserPrompt(context: context, continuationOnly: false)],
             ["role": "assistant", "content": draft]
         ]
+        return CompletionPrompt(messages: messages, regeneratedPrefix: regenerated, grammar: grammar)
+    }
+
+    static func completionMessages(context: PromptContext) -> [[String: String]] {
+        completionPrompt(context: context).messages
     }
 
     static func isRelevantBackground(_ background: String, to prefix: String) -> Bool {
@@ -172,7 +194,7 @@ public struct PromptBuilder {
             || (prefix.lowercased().hasSuffix("the link") && background.contains("https://"))
     }
 
-    public static func cleanCompletionText(_ raw: String, precedingText: String, maxWords: Int = 12, truncated: Bool = false) -> String {
+    static func stripModelControlText(_ raw: String) -> String {
         var text = raw
 
         // 1. Remove closed or unclosed thinking tags (<think>...</think>, <|thought|>...<turn|>, <|thought|>...<|thought|>)
@@ -194,6 +216,12 @@ public struct PromptBuilder {
         for token in ["<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<turn|>", "<|end|>"] {
             text = text.replacingOccurrences(of: token, with: "")
         }
+        return text.trimmingCharacters(in: .newlines)
+    }
+
+    public static func cleanCompletionText(_ raw: String, precedingText: String, maxWords: Int = 12,
+                                          truncated: Bool = false, preservesWordBoundary: Bool = false) -> String {
+        var text = stripModelControlText(raw)
 
         text = text.trimmingCharacters(in: .newlines)
 
@@ -298,7 +326,7 @@ public struct PromptBuilder {
         // 8. Normalize leading space
         if precedingText.last?.isWhitespace == true {
             text = String(text.drop(while: { $0 == " " || $0 == "\t" }))
-        } else if !wasCodeBlock && !text.isEmpty && text.first?.isLetter == true && !precedingText.isEmpty {
+        } else if !preservesWordBoundary && !wasCodeBlock && !text.isEmpty && text.first?.isLetter == true && !precedingText.isEmpty {
             // Add leading space if starting a new word after a completed word
             let lastPrecedingWord = String(precedingText.split(whereSeparator: \.isWhitespace).last ?? "")
             let completesTypedApostrophe = precedingText.last.map { "'’".contains($0) } == true

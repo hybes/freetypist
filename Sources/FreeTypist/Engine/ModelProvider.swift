@@ -35,12 +35,16 @@ struct CompletionStream {
         }
     }
 
-    func completion(context: PromptContext) -> String {
-        var content = rawText
-        if let prefill = PromptBuilder.completionMessages(context: context).last, prefill["role"] == "assistant",
-           let draft = prefill["content"], !draft.isEmpty {
+    func completion(context: PromptContext, prompt: CompletionPrompt? = nil) -> String {
+        let prompt = prompt ?? PromptBuilder.completionPrompt(context: context)
+        var content = PromptBuilder.stripModelControlText(rawText)
+        if let draft = prompt.prefill, !draft.isEmpty {
             if !finished, draft.hasPrefix(content) { return "" }
             if content.hasPrefix(draft) { content = String(content.dropFirst(draft.count)) }
+        }
+        if !prompt.regeneratedPrefix.isEmpty {
+            guard content.hasPrefix(prompt.regeneratedPrefix) else { return "" }
+            content = String(content.dropFirst(prompt.regeneratedPrefix.count))
         }
         if !finished {
             // A token is not a word: "100" can still become "1000", and a
@@ -50,7 +54,7 @@ struct CompletionStream {
             content = String(content[...boundary])
         }
         return PromptBuilder.cleanCompletionText(content, precedingText: context.precedingText,
-            maxWords: context.maxWords, truncated: truncated)
+            maxWords: context.maxWords, truncated: truncated, preservesWordBoundary: true)
             .trimmingCharacters(in: .newlines)
     }
 }
@@ -170,9 +174,10 @@ public struct EmbeddedLocalProvider: ModelProvider {
             effectiveMaxTokens = settings.completionLength.maxTokens
         }
 
-        let body: [String: Any] = [
-            "messages": PromptBuilder.completionMessages(context: context),
-            "max_tokens": min(effectiveMaxTokens, max(8, context.maxWords * 2 + 4)),
+        let prompt = PromptBuilder.completionPrompt(context: context)
+        var body: [String: Any] = [
+            "messages": prompt.messages,
+            "max_tokens": min(effectiveMaxTokens, max(8, context.maxWords * 2 + 4)) + (prompt.regeneratedPrefix.isEmpty ? 0 : 8),
             "temperature": settings.temperature,
             "top_p": settings.topP,
             "top_k": settings.topK,
@@ -184,6 +189,7 @@ public struct EmbeddedLocalProvider: ModelProvider {
             "stop": ["\n\n", "<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<turn|>"],
             "stream": true
         ]
+        if let grammar = prompt.grammar { body["grammar"] = grammar }
 
         var lastShown = ""
         func elapsedMilliseconds() -> Int {
@@ -204,7 +210,7 @@ public struct EmbeddedLocalProvider: ModelProvider {
             for try await line in bytes.lines {
                 try Task.checkCancellation()
                 try stream.consume(line)
-                let partial = stream.completion(context: context)
+                let partial = stream.completion(context: context, prompt: prompt)
                 if !partial.trimmingCharacters(in: .whitespaces).isEmpty, partial != lastShown {
                     lastShown = partial
                     await onProgress(partial, elapsedMilliseconds())
@@ -212,7 +218,7 @@ public struct EmbeddedLocalProvider: ModelProvider {
                 if stream.finished { break }
             }
             try Task.checkCancellation()
-            let cleaned = stream.completion(context: context)
+            let cleaned = stream.completion(context: context, prompt: prompt)
             if allowFallback, !cleaned.isEmpty { CompletionLRUCache.shared.set(cleaned, forKey: cacheKey) }
             // An empty or rejected model result means there is no useful suggestion.
             // Do not replace it with an unrelated memorised phrase.

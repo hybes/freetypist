@@ -113,14 +113,12 @@ struct FreeTypistAppMain {
         }
 
         if args.contains("--test-local-engine") {
-            LocalModelManager.shared.scanLocalModels()
-            let paths = LocalModelManager.shared.downloadedModelPaths
-            print("Found \(paths.count) local models:")
-            for (id, path) in paths {
-                print(" - \(id): \(path)")
-            }
-            if let activePath = LocalModelManager.shared.activeModelPath() {
+            let explicitPath = ProcessInfo.processInfo.environment["FREETYPIST_QA_MODEL"]
+            if explicitPath == nil { LocalModelManager.shared.scanLocalModels() }
+            if let activePath = explicitPath ?? LocalModelManager.shared.activeModelPath() {
                 print("Starting server for \(activePath)...")
+                // Diagnostics must not stop or compete for the installed app's port.
+                LocalInferenceService.shared.serverPort = 58866
                 LocalInferenceService.shared.startServer(for: activePath)
                 for _ in 0..<750 {
                     if LocalInferenceService.shared.isServerRunning || !LocalInferenceService.shared.isStarting { break }
@@ -136,10 +134,29 @@ struct FreeTypistAppMain {
                 let settings = AppSettings(defaults: defaults)
                 settings.personalizationStrength = .off
                 do {
-                    for prefix in ["Thank you for ", "I think we should ", "The next step is to "] {
+                    for (prefix, expectedPrefix) in [
+                        ("Thank you for ", ""),
+                        ("The navbar needs to", " "),
+                        ("We need to improve the perform", "ance"),
+                        ("Can you send me the docum", "ent"),
+                        ("The API returns a 401 error because", " "),
+                        ("Could you review the pull request before", " "),
+                        ("The database query takes ten seconds. We should add an", " "),
+                        ("We cannot deploy until the tests", ""),
+                        ("The button should be red, not blue. Please change its colour to", " "),
+                        ("The build passed.", " ")
+                    ] {
+                        let timing = DiagnosticPredictionTiming()
                         let result = try await EmbeddedLocalProvider(allowFallback: false).complete(
-                            context: PromptContext(precedingText: prefix, maxWords: 4), settings: settings)
-                        print("Engine completion: '\(prefix)' + '\(result.text)' (\(result.latencyMs)ms)")
+                            context: PromptContext(precedingText: prefix, maxWords: 7), settings: settings) { _, ms in
+                                await timing.record(ms)
+                            }
+                        guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                              result.text.hasPrefix(expectedPrefix) else {
+                            throw NSError(domain: "FreeTypist.Diagnostic", code: 1,
+                                userInfo: [NSLocalizedDescriptionKey: "Invalid continuation for '\(prefix)': '\(result.text)'"])
+                        }
+                        print("Engine completion: '\(prefix)' + '\(result.text)' (first \(await timing.first ?? -1)ms; final \(result.latencyMs)ms)")
                     }
                 } catch {
                     print("Engine completion failed: \(error.localizedDescription)")
@@ -172,5 +189,12 @@ struct FreeTypistAppMain {
         let delegate = AppDelegate()
         app.delegate = delegate
         withExtendedLifetime(delegate) { app.run() }
+    }
+}
+
+private actor DiagnosticPredictionTiming {
+    private(set) var first: Int?
+    func record(_ milliseconds: Int) {
+        if first == nil { first = milliseconds }
     }
 }

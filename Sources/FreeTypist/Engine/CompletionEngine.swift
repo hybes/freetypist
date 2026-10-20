@@ -290,8 +290,7 @@ public final class CompletionEngine: ObservableObject {
             return
         }
 
-        if !force, sentenceEnded,
-           precedingText.last?.isWhitespace != true || precedingText.last?.isNewline == true {
+        if !force, precedingText.last?.isNewline == true {
             let id = requestID
             let delay = max(0, settings.debounceMs)
             activeTask = Task { [weak self] in
@@ -335,7 +334,7 @@ public final class CompletionEngine: ObservableObject {
         lastRequestedText = precedingText
 
         let debounceDelay = Self.predictionDelayMs(configured: settings.debounceMs,
-                                                  atWordBoundary: atWordBoundary, force: force)
+                                                  force: force)
         let provider = providerOverride ?? ModelProviderFactory.provider(for: settings.activeProvider)
         let tone = settings.effectiveTone(for: bundleId)
         let customInstructions = settings.effectiveCustomInstructions(for: bundleId)
@@ -411,11 +410,11 @@ public final class CompletionEngine: ObservableObject {
         }
     }
 
-    static func predictionDelayMs(configured: Int, atWordBoundary: Bool, force: Bool) -> Int {
+    static func predictionDelayMs(configured: Int, force: Bool) -> Int {
         if force { return 0 }
-        // A completed word is a useful prediction point. Start promptly after
-        // spaces, while retaining the longer pause during a partially typed word.
-        return atWordBoundary ? min(max(0, configured), 80) : max(0, configured)
+        // The same pause applies with or without a space. Keep the user's
+        // configured typing delay rather than making whitespace a hidden trigger.
+        return max(0, configured)
     }
 
     private func offerPrediction(_ text: String, latency: Int, request: UUID) {
