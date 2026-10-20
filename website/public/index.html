@@ -16,17 +16,18 @@
     <section class="intro" aria-labelledby="title">
       <div>
         <p class="eyebrow">A free typing assistant for Mac</p>
-        <h1 id="title">A little<br>less typing.</h1>
-        <p class="lead">FreeTypist suggests the next few words as you write. Press Tab to accept them, correct a misspelling or turn <code>:rocket:</code> into 🚀. Everything runs on your Mac.</p>
+        <h1 id="title"><span>A little</span><span>less typing.</span></h1>
+        <p class="lead">FreeTypist suggests the next few words as you write. Press Tab to accept them, correct a misspelling or turn <span class="keep-together"><code>:rocket:</code> into 🚀.</span> Everything runs on your Mac.</p>
         <a class="button" id="download" href="/download">Download for Mac <span aria-hidden="true">↓</span></a>
-        <p class="download-detail" id="release-status" aria-live="polite">Apple silicon · Checking the latest release…</p>
+        <div class="download-detail" id="release-status" aria-live="polite">Apple silicon · Checking the latest release…</div>
         <noscript><p>Apple silicon. The download link serves the latest available release.</p></noscript>
         <p class="small">Free to use. No account or subscription.</p>
       </div>
       <div class="example" aria-label="Illustration of FreeTypist suggestions">
-        <div class="example-heading"><span>While you’re writing</span><span class="example-label">Example</span></div>
-        <p class="example-line" aria-live="polite"><span id="example-typed">Thank you for </span><span class="caret" aria-hidden="true"></span><span class="ghost" id="example-ghost">your help with this.</span></p>
-        <div class="example-controls"><span id="example-hint">Accept a suggestion with Tab</span><button id="example-accept" type="button" aria-label="Accept the example suggestion">Tab <span aria-hidden="true">⇥</span></button></div>
+        <div class="example-heading"><span>While you’re writing</span><div class="example-toolbar"><span class="example-label">Example</span><button id="example-play" type="button" hidden>Pause</button></div></div>
+        <p class="example-line" aria-hidden="true"><span id="example-typed">Thanks for </span><span class="caret"></span><span class="ghost" id="example-ghost">your help.</span></p>
+        <p class="sr-only" id="example-description">FreeTypist suggests “your help.” after “Thanks for ”. Tab accepts the suggestion.</p>
+        <div class="example-controls"><span id="example-hint">Press Tab to accept</span><button id="example-accept" type="button" aria-label="Accept the example suggestion">Tab <span aria-hidden="true">⇥</span></button></div>
         <div class="example-tabs" aria-label="Choose an example"><button type="button" data-example="completion" aria-pressed="true">Complete</button><button type="button" data-example="spelling" aria-pressed="false">Correct</button><button type="button" data-example="emoji" aria-pressed="false">Emoji</button></div>
       </div>
     </section>
