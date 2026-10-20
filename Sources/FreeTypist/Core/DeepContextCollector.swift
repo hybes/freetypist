@@ -68,6 +68,7 @@ public final class DeepContextCollector: ObservableObject {
     private var appSwitchObserver: NSObjectProtocol?
     private var settingsObserver: AnyCancellable?
     private var cachedWindowContextKey: String = ""
+    private var windowCaptureTask: Task<Void, Never>?
     private var cachedWindowSnippets: [String] = []
     private var cachedWindowTimestamp: Date = .distantPast
 
@@ -156,15 +157,34 @@ public final class DeepContextCollector: ObservableObject {
         guard bundleId != Bundle.main.bundleIdentifier else { return }
 
         lastCapturedAppName = appName
-        let snapshot = captureFocusedWindowHierarchy(for: app, activeFieldText: "")
-        if !snapshot.snippets.isEmpty || !snapshot.windowTitle.isEmpty {
-            recordCrossAppSnapshot(
-                appName: appName,
-                bundleId: bundleId,
-                windowTitle: snapshot.windowTitle,
-                domainOrURL: snapshot.documentOrURL,
-                snippet: snapshot.snippets.prefix(2).joined(separator: " | ")
-            )
+        scheduleWindowCapture(pid: app.processIdentifier, appName: appName, bundleId: bundleId)
+    }
+
+    private func scheduleWindowCapture(pid: pid_t, appName: String, bundleId: String) {
+        guard windowCaptureTask == nil else { return }
+        let worker = Task.detached(priority: .utility) {
+            Self.captureFocusedWindowHierarchy(pid: pid)
+        }
+        windowCaptureTask = Task { [weak self] in
+            let snapshot = await worker.value
+            guard let self else { return }
+            self.windowCaptureTask = nil
+            let settings = AppSettings.shared
+            guard settings.isEnabled, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                  !settings.isAppRecordingExcluded(bundleIdentifier: bundleId) else { return }
+            self.cachedWindowContextKey = String(pid)
+            self.cachedWindowTimestamp = Date()
+            if settings.readSurroundingWindowText {
+                self.cachedWindowSnippets = snapshot.snippets
+                self.activeWindowSurroundingText = snapshot.snippets
+                self.activeDocumentOrURL = snapshot.documentOrURL
+                self.lastCapturedWindowTitle = snapshot.windowTitle
+            }
+            if settings.trackCrossAppContext {
+                self.recordCrossAppSnapshot(appName: appName, bundleId: bundleId,
+                    windowTitle: snapshot.windowTitle, domainOrURL: snapshot.documentOrURL,
+                    snippet: snapshot.snippets.prefix(2).joined(separator: " | "))
+            }
         }
     }
 
@@ -211,37 +231,24 @@ public final class DeepContextCollector: ObservableObject {
         }
 
         guard !settings.isAppRecordingExcluded(bundleIdentifier: frontApp.bundleIdentifier) else { return ([], nil) }
-        if frontApp.bundleIdentifier == Bundle.main.bundleIdentifier {
-            // Inside FreeTypist Playground: return the live/seeded surrounding context so Playground can test deep context!
-            return (activeWindowSurroundingText, activeDocumentOrURL)
+        guard frontApp.bundleIdentifier != Bundle.main.bundleIdentifier else { return ([], nil) }
+        let cacheKey = String(frontApp.processIdentifier)
+        if cacheKey != cachedWindowContextKey || Date().timeIntervalSince(cachedWindowTimestamp) >= 2.5 {
+            scheduleWindowCapture(pid: frontApp.processIdentifier, appName: frontApp.localizedName ?? "App",
+                                  bundleId: frontApp.bundleIdentifier ?? "unknown")
         }
-
-        let cacheKey = "\(frontApp.processIdentifier)-\(lastCapturedWindowTitle)"
-        if cacheKey == cachedWindowContextKey && Date().timeIntervalSince(cachedWindowTimestamp) < 2.5 {
-            return (cachedWindowSnippets, activeDocumentOrURL)
-        }
-
-        let result = captureFocusedWindowHierarchy(for: frontApp, activeFieldText: activeFieldText)
-        cachedWindowContextKey = "\(frontApp.processIdentifier)-\(result.windowTitle)"
-        cachedWindowTimestamp = Date()
-        cachedWindowSnippets = result.snippets
-        activeWindowSurroundingText = result.snippets
-        activeDocumentOrURL = result.documentOrURL
-        if !result.windowTitle.isEmpty {
-            lastCapturedWindowTitle = result.windowTitle
-        }
-        return (result.snippets, result.documentOrURL)
+        // Never wait for a window scan on the keyboard/main thread, or reuse another app's window.
+        guard cacheKey == cachedWindowContextKey else { return ([], nil) }
+        return (cachedWindowSnippets, activeDocumentOrURL)
     }
 
-    private func captureFocusedWindowHierarchy(
-        for app: NSRunningApplication,
-        activeFieldText: String
+    nonisolated private static func captureFocusedWindowHierarchy(
+        pid: pid_t
     ) -> (windowTitle: String, documentOrURL: String?, snippets: [String]) {
-        guard AXIsProcessTrusted(), !AppSettings.shared.isAppRecordingExcluded(bundleIdentifier: app.bundleIdentifier) else {
-            return ("", nil, [])
-        }
-
-        let appAX = AXUIElementCreateApplication(app.processIdentifier)
+        guard AXIsProcessTrusted() else { return ("", nil, []) }
+        let deadline = Date().addingTimeInterval(0.1)
+        let appAX = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appAX, 0.025)
         var focusedWinObj: AnyObject?
         guard AXUIElementCopyAttributeValue(appAX, kAXFocusedWindowAttribute as CFString, &focusedWinObj) == .success,
               let win = focusedWinObj else {
@@ -262,11 +269,11 @@ public final class DeepContextCollector: ObservableObject {
         var visited = 0
         let maxNodes = 65
         var collected: [String] = []
-        let trimmedActive = activeFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        while !queue.isEmpty && visited < maxNodes && collected.count < 10 {
+        while !queue.isEmpty && visited < maxNodes && collected.count < 10 && Date() < deadline {
             let current = queue.removeFirst()
             visited += 1
+            AXUIElementSetMessagingTimeout(current, 0.025)
 
             var roleObj: AnyObject?
             AXUIElementCopyAttributeValue(current, kAXRoleAttribute as CFString, &roleObj)
@@ -274,7 +281,7 @@ public final class DeepContextCollector: ObservableObject {
 
             var subroleObj: AnyObject?
             AXUIElementCopyAttributeValue(current, kAXSubroleAttribute as CFString, &subroleObj)
-            if (subroleObj as? String) == "AXSecureTextField" {
+            if (subroleObj as? String) == "AXSecureTextField" || ["AXTextArea", "AXTextField", "AXComboBox"].contains(role) {
                 continue
             }
 
@@ -290,12 +297,11 @@ public final class DeepContextCollector: ObservableObject {
             }
 
             // Extract text from StaticText, Heading, TextArea, Cell, Link, or WebArea description
-            if ["AXStaticText", "AXHeading", "AXTextArea", "AXTextField", "AXLink", "AXCell"].contains(role) {
+            if ["AXStaticText", "AXHeading", "AXLink", "AXCell"].contains(role) {
                 var valObj: AnyObject?
                 if AXUIElementCopyAttributeValue(current, kAXValueAttribute as CFString, &valObj) == .success,
                    let str = (valObj as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                    str.count >= 8,
-                   str != trimmedActive,
                    !collected.contains(str) {
                     collected.append(String(str.prefix(240)))
                 } else {
@@ -303,7 +309,6 @@ public final class DeepContextCollector: ObservableObject {
                     if AXUIElementCopyAttributeValue(current, kAXDescriptionAttribute as CFString, &descObj) == .success,
                        let desc = (descObj as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                        desc.count >= 10,
-                       desc != trimmedActive,
                        !collected.contains(desc) {
                         collected.append(String(desc.prefix(240)))
                     }
@@ -329,7 +334,8 @@ public final class DeepContextCollector: ObservableObject {
         activeFieldText: String
     ) -> String {
         let settings = AppSettings.shared
-        guard settings.isEnabled, !settings.isAppRecordingExcluded(bundleIdentifier: currentBundleId) else { return "" }
+        guard settings.isEnabled, currentBundleId != "com.freetypist.playground",
+              !settings.isAppRecordingExcluded(bundleIdentifier: currentBundleId) else { return "" }
         var sections: [String] = []
 
         // 1. User & Temporal Environment

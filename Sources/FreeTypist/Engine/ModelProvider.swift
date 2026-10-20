@@ -86,17 +86,6 @@ public struct EmbeddedLocalProvider: ModelProvider {
         let cacheKey = String(decoding: try JSONEncoder().encode(keyParts), as: UTF8.self)
         if allowFallback, let cached = CompletionLRUCache.shared.get(forKey: cacheKey) { return (cached, 1) }
 
-        // Check if Constant Learning Booster has a strong personal phrase match
-        if allowFallback, settings.personalizationStrength == .strong,
-           let boosterMatch = LearningEngine.shared.predictFromLearnedHistory(
-               precedingText: context.precedingText,
-               strength: .strong
-           ),
-           !boosterMatch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let cleaned = PromptBuilder.cleanCompletionText(boosterMatch, precedingText: context.precedingText, maxWords: context.maxWords)
-            return (cleaned, 2)
-        }
-
         let serverReady = await MainActor.run {
             LocalInferenceService.shared.markActivity()
             return LocalInferenceService.shared.isServerRunning
@@ -119,9 +108,6 @@ public struct EmbeddedLocalProvider: ModelProvider {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 3.5
 
-        let systemPrompt = PromptBuilder.buildSystemPrompt(context: context)
-        let userPrompt = PromptBuilder.buildUserPrompt(context: context)
-
         let effectiveMaxTokens: Int
         if onBattery && settings.batteryShorterCompletions {
             effectiveMaxTokens = min(14, settings.completionLength.maxTokens)
@@ -130,11 +116,8 @@ public struct EmbeddedLocalProvider: ModelProvider {
         }
 
         let body: [String: Any] = [
-            "messages": [
-                ["role": "system", "content": systemPrompt],
-                ["role": "user", "content": userPrompt]
-            ],
-            "max_tokens": effectiveMaxTokens,
+            "messages": PromptBuilder.completionMessages(context: context),
+            "max_tokens": min(effectiveMaxTokens, max(8, context.maxWords * 2 + 4)),
             "temperature": settings.temperature,
             "top_p": settings.topP,
             "top_k": settings.topK,
@@ -162,11 +145,17 @@ public struct EmbeddedLocalProvider: ModelProvider {
                let choices = json["choices"] as? [[String: Any]],
                let firstChoice = choices.first,
                let message = firstChoice["message"] as? [String: Any] {
-                let rawContent = (message["content"] as? String) ?? ""
+                var rawContent = (message["content"] as? String) ?? ""
+                // Some llama.cpp templates include the assistant prefill in the response.
+                if let draft = PromptBuilder.completionMessages(context: context).last?["content"],
+                   !draft.isEmpty, rawContent.hasPrefix(draft) {
+                    rawContent = String(rawContent.dropFirst(draft.count))
+                }
                 let cleaned = PromptBuilder.cleanCompletionText(
                     rawContent,
                     precedingText: context.precedingText,
-                    maxWords: context.maxWords
+                    maxWords: context.maxWords,
+                    truncated: firstChoice["finish_reason"] as? String == "length"
                 )
 
                 if !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -175,8 +164,9 @@ public struct EmbeddedLocalProvider: ModelProvider {
                 }
             }
 
-            // Never return an empty string; fall back to the fast local predictor
-            return try await fallback(context: context, settings: settings)
+            // An empty or rejected model result means there is no useful suggestion.
+            // Do not replace it with an unrelated memorised phrase.
+            return ("", latencyMs)
         } catch {
             try Task.checkCancellation()
             if !allowFallback { throw error }

@@ -157,6 +157,32 @@ final class TextReplacementTests: XCTestCase {
     }
 
     @MainActor
+    func testSentenceCorrectsSeparateWordsInControlsWithoutAnAXTextSetter() async throws {
+        let original = snapshot("👩🏽‍💻 outsiide the playgroundnd, it doesnt offer suitable correcetions.")
+        let correction = try XCTUnwrap(SentenceSpellingCorrector.correction(in: original))
+        let target = TestTarget(original)
+        target.directWrite = .unsupported
+        let result = await TextReplacementWriter.apply(correction, to: target)
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(target.value.text, "👩🏽‍💻 outside the playground, it doesn't offer suitable corrections.")
+        XCTAssertEqual(target.value.selection.location, target.value.text.utf16.count)
+        XCTAssertEqual(target.typedChunks, ["corrections", "doesn't", "playground", "outside"])
+    }
+
+    @MainActor
+    func testSentenceBatchStopsWhenFocusChangesWithoutDeletingTheRest() async throws {
+        let original = snapshot("aactual text with a final sentencee.")
+        let correction = try XCTUnwrap(SentenceSpellingCorrector.correction(in: original))
+        let target = TestTarget(original)
+        target.directWrite = .unsupported
+        target.loseFocusAfterChunk = true
+        let result = await TextReplacementWriter.apply(correction, to: target)
+        XCTAssertEqual(result, .interrupted)
+        XCTAssertEqual(target.value.text, "aactual text with a final sentence.")
+        XCTAssertEqual(target.typedChunks, ["sentence"])
+    }
+
+    @MainActor
     func testWriterDeclinesStaleTextFocusAndMovedCursor() async throws {
         let original = snapshot("Ship :rocket:")
         let edit = try XCTUnwrap(TextReplacement.trailing("🚀", count: 8, in: original))
@@ -227,6 +253,7 @@ private final class TestUndoProvider: NSObject, NSTextViewDelegate {
 
 @MainActor
 private final class TestTarget: TextReplacementTarget {
+    var supportsDirectReplacement: Bool? { directWrite != .unsupported }
     enum DirectWrite { case supported, unsupported, ignored }
     var value: TextInputSnapshot
     var directWrite = DirectWrite.supported

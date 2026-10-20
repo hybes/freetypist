@@ -18,6 +18,7 @@ public final class KeyboardHook: @unchecked Sendable {
     private var sentenceCorrectionInProgress = false
     private var suppressReturnRepeats = false
     private var correctedSentence: TextInputSnapshot?
+    private var contextRefreshTask: Task<Void, Never>?
 
     private init() {}
 
@@ -76,6 +77,7 @@ public final class KeyboardHook: @unchecked Sendable {
             queue: .main
         ) { [weak self] _ in
             self?.typingBuffer.reset()
+            self?.contextRefreshTask?.cancel()
             self?.correctedSentence = nil
             MainActor.assumeIsolated {
                 AccessibilityService.shared.cancelPendingInsertion()
@@ -104,14 +106,12 @@ public final class KeyboardHook: @unchecked Sendable {
                 }
                 self.typingBuffer.handle(event: cgEvent)
             }
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 25_000_000)
-                self?.requestCompletionFromContext()
-            }
+            self.scheduleContextRefresh()
         }
     }
 
     public func stop() {
+        contextRefreshTask?.cancel()
         if let obs = workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
             workspaceObserver = nil
@@ -143,6 +143,7 @@ public final class KeyboardHook: @unchecked Sendable {
             return Unmanaged.passUnretained(event)
         }
         if type == .leftMouseDown || type == .rightMouseDown {
+            contextRefreshTask?.cancel()
             MainActor.assumeIsolated {
                 AccessibilityService.shared.cancelPendingInsertion()
                 ReplacementFeedback.shared.clear()
@@ -166,6 +167,7 @@ public final class KeyboardHook: @unchecked Sendable {
         }
 
         if isTypingInFreeTypist() {
+            contextRefreshTask?.cancel()
             trace("Own application; using Playground controls")
             return Unmanaged.passUnretained(event)
         }
@@ -235,13 +237,18 @@ public final class KeyboardHook: @unchecked Sendable {
 
         typingBuffer.handle(event: event)
 
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 20_000_000)
-            guard !AccessibilityService.shared.isPerformingSyntheticInsertion else { return }
-            self?.requestCompletionFromContext()
-        }
+        scheduleContextRefresh()
 
         return Unmanaged.passUnretained(event)
+    }
+
+    private func scheduleContextRefresh() {
+        contextRefreshTask?.cancel()
+        contextRefreshTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: 25_000_000) } catch { return }
+            guard !Task.isCancelled, !AccessibilityService.shared.isPerformingSyntheticInsertion else { return }
+            self?.requestCompletionFromContext()
+        }
     }
 
     @MainActor
@@ -263,6 +270,8 @@ public final class KeyboardHook: @unchecked Sendable {
                 self.typingBuffer.replace(with: edit.result.context.precedingText)
                 engine.commitAcceptance(acceptance)
                 MenuBarController.shared.rebuildMenu()
+                // The swallowed Tab produces no ordinary key event to request the next completion.
+                self.scheduleContextRefresh()
             } else {
                 engine.dismiss()
                 if result == .unsupported {
@@ -292,7 +301,7 @@ public final class KeyboardHook: @unchecked Sendable {
         sentenceCorrectionInProgress = true
         Task { @MainActor in
             defer { self.sentenceCorrectionInProgress = false }
-            let result = await service.apply(correction.edit, to: target)
+            let result = await service.apply(correction, to: target)
             if result == .applied {
                 self.correctedSentence = correction.edit.result
                 self.typingBuffer.replace(with: correction.edit.result.context.precedingText)

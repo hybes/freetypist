@@ -134,6 +134,7 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
     ) {
         let settings = AppSettings.shared
         guard settings.recordWritingForPersonalization else { return }
+        guard bundleId != "com.freetypist.playground" else { return }
         if settings.isAppRecordingExcluded(bundleIdentifier: bundleId) { return }
 
         let combined = precedingText + acceptedText
@@ -189,6 +190,7 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
     ) {
         let settings = AppSettings.shared
         guard settings.recordWritingForPersonalization && settings.recordUnacceptedWriting else { return }
+        guard bundleId != "com.freetypist.playground" else { return }
         if settings.isAppRecordingExcluded(bundleIdentifier: bundleId) { return }
 
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -202,7 +204,8 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         lock.lock()
         if let latest = historyRecords.first,
            latest.appBundleIdentifier == (bundleId ?? "com.freetypist.app"),
-           sanitized == latest.textUpToCursor {
+           sanitized == String((latest.textUpToCursor + (latest.acceptedCompletion ?? ""))
+                .trimmingCharacters(in: .whitespacesAndNewlines).suffix(400)) {
             lock.unlock()
             return
         }
@@ -372,9 +375,9 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        // 1. Check 4-gram, 3-gram, 2-gram matches
-        if words.count >= 2 {
-            for n in stride(from: min(4, words.count), through: 2, by: -1) {
+        // Two common words are not enough evidence to reuse an old sentence.
+        if words.count >= 3 {
+            for n in stride(from: min(4, words.count), through: 3, by: -1) {
                 let key = words.suffix(n).joined(separator: " ").lowercased()
                 if let candidates = ngramMap[key],
                    let best = candidates.max(by: { $0.value < $1.value }),
@@ -427,8 +430,11 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         )
 
         let scored: [(record: WritingHistoryRecord, score: Int)] = snapshot.compactMap { rec in
+            guard rec.appBundleIdentifier != "com.freetypist.playground" else { return nil }
             let full = (rec.textUpToCursor + (rec.acceptedCompletion ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard full.count >= 20 else { return nil }
+            guard full.count >= 20,
+                  !full.hasPrefix(precedingText.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  !precedingText.contains(full) else { return nil }
             var score = 0
             if let bid = appBundleId, rec.appBundleIdentifier == bid {
                 score += 5
@@ -445,7 +451,11 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
                     .filter { $0.count >= 4 }
                     .map(String.init)
             )
-            score += queryWords.intersection(recWords).count * 2
+            let sharedWords = queryWords.intersection(recWords)
+                .subtracting(["thank", "thanks", "please", "should", "could", "would", "there", "their",
+                              "about", "this", "that", "with", "have", "been", "will", "your", "just"])
+            guard sharedWords.count >= 2 else { return nil }
+            score += sharedWords.count * 2
             return (rec, score)
         }
 
@@ -571,7 +581,7 @@ public final class LearningEngine: ObservableObject, @unchecked Sendable {
         let snapshot = historyRecords
         lock.unlock()
 
-        for rec in snapshot.reversed() {
+        for rec in snapshot.reversed() where rec.appBundleIdentifier != "com.freetypist.playground" {
             let full = rec.textUpToCursor + (rec.acceptedCompletion ?? "")
             learnFromText(full, appName: rec.appName, weight: rec.wasAcceptedCompletion ? 2 : 1)
             if let accepted = rec.acceptedCompletion, !accepted.isEmpty {

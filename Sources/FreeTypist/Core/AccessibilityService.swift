@@ -70,12 +70,14 @@ public final class AccessibilityService: @unchecked Sendable {
         }
 
         let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, 0.04)
         var focusedElement: AnyObject?
         var result = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
 
         // Fallback: query the frontmost application'sAXFocusedUIElementAttribute directly
         if (result != .success || focusedElement == nil), let pid = frontApp?.processIdentifier {
             let appAX = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appAX, 0.04)
             result = AXUIElementCopyAttributeValue(appAX, kAXFocusedUIElementAttribute as CFString, &focusedElement)
         }
 
@@ -83,6 +85,10 @@ public final class AccessibilityService: @unchecked Sendable {
             return nil
         }
         let axElement = element as! AXUIElement
+        AXUIElementSetMessagingTimeout(axElement, 0.04)
+        var elementPID: pid_t = 0
+        guard AXUIElementGetPid(axElement, &elementPID) == .success,
+              elementPID == frontApp?.processIdentifier else { return nil }
 
         // Skip password / secure text fields automatically
         var roleObj: AnyObject?
@@ -97,6 +103,7 @@ public final class AccessibilityService: @unchecked Sendable {
         var windowTitle: String?
         if let pid = frontApp?.processIdentifier {
             let appAX = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appAX, 0.04)
             var focusedWin: AnyObject?
             if AXUIElementCopyAttributeValue(appAX, kAXFocusedWindowAttribute as CFString, &focusedWin) == .success,
                let win = focusedWin {
@@ -353,6 +360,14 @@ public final class AccessibilityService: @unchecked Sendable {
     }
 
     @MainActor
+    func apply(_ correction: SentenceSpellingCorrection, to target: AccessibilityTextTarget) async -> TextReplacementResult {
+        guard !isPerformingSyntheticInsertion else { return .interrupted }
+        isPerformingSyntheticInsertion = true
+        defer { isPerformingSyntheticInsertion = false }
+        return await TextReplacementWriter.apply(correction, to: target)
+    }
+
+    @MainActor
     fileprivate static func focusedTextElement() -> (pid_t, AXUIElement)? {
         guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
         let app = AXUIElementCreateApplication(front.processIdentifier)
@@ -377,6 +392,12 @@ final class AccessibilityTextTarget: TextReplacementTarget {
     private let pid: pid_t
     private let element: AXUIElement
     private let isValid: () -> Bool
+    var supportsDirectReplacement: Bool? {
+        guard isValid() else { return nil }
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success else { return nil }
+        return settable.boolValue
+    }
 
     init(pid: pid_t, element: AXUIElement, isValid: @escaping () -> Bool) {
         self.pid = pid

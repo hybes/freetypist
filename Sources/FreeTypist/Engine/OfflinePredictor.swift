@@ -13,7 +13,12 @@ public struct OfflinePredictor: Sendable {
         let combined = lowerStem + firstContWord
         if lexiconSet.contains(combined) { return true }
         let checker = NSSpellChecker.shared
-        let range = checker.checkSpelling(of: combined, startingAt: 0)
+        // Do not merge two complete words because a proper-name dictionary happens
+        // to accept their concatenation (for example "as" + "I" -> "asI").
+        if checker.checkSpelling(of: lowerStem, startingAt: 0, language: "en_GB",
+            wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound { return false }
+        let range = checker.checkSpelling(of: combined, startingAt: 0, language: "en_GB",
+            wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
         return range.location == NSNotFound
     }
 
@@ -71,28 +76,6 @@ public struct OfflinePredictor: Sendable {
                 let url = String(combinedContext[urlRange])
                 if !preceding.contains(url) {
                     return spaced(": \(url)", after: preceding)
-                }
-            }
-        }
-
-        // B. N-gram phrase continuation mined directly from active window & clipboard text
-        let userWords = trimmed.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).map(String.init)
-        if userWords.count >= 2, preceding.last?.isWhitespace == true {
-            let lastTwo = userWords.suffix(2).joined(separator: " ").lowercased()
-            let ctxWords = combinedContext
-                .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
-                .map(String.init)
-                .filter { !$0.hasPrefix("[") && !$0.hasSuffix("]") }
-            if ctxWords.count >= 4 {
-                for i in 0..<(ctxWords.count - 3) {
-                    let pair = "\(ctxWords[i]) \(ctxWords[i + 1])".lowercased()
-                    if pair == lastTwo {
-                        let contEnd = min(ctxWords.count, i + 5)
-                        let continuation = ctxWords[(i + 2)..<contEnd].joined(separator: " ")
-                        if continuation.count >= 4 && !preceding.lowercased().contains(continuation.lowercased()) {
-                            return spaced(continuation, after: preceding)
-                        }
-                    }
                 }
             }
         }

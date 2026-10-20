@@ -121,15 +121,6 @@ public final class CompletionEngine: ObservableObject {
             return
         }
 
-        // Record passive sentence completion for Constant Learning
-        learning.recordPassiveTyping(
-            text: precedingText,
-            appName: appName,
-            bundleId: bundleId,
-            domain: domain,
-            windowTitle: windowTitle
-        )
-
         // 0. Check Slash Commands & Dynamic Snippets (/date, /time, /clip1, /sig, /lgtm...)
         if settings.enableSlashCommands {
             let clips = DeepContextCollector.shared.clipboardHistory.map(\.text)
@@ -227,6 +218,18 @@ public final class CompletionEngine: ObservableObject {
         }
 
         let trimmed = precedingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !force, let last = trimmed.last, ".!?".contains(last) {
+            let id = requestID
+            let delay = max(0, settings.debounceMs)
+            activeTask = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(delay)) } catch { return }
+                guard let self, self.requestID == id else { return }
+                learning.recordPassiveTyping(text: precedingText, appName: appName, bundleId: bundleId,
+                                             domain: domain, windowTitle: windowTitle)
+                activeTask = nil
+            }
+            return
+        }
         if trimmed.count < settings.minTriggerCharacters && !force {
             dismiss()
             return
@@ -263,49 +266,6 @@ public final class CompletionEngine: ObservableObject {
         let tone = settings.effectiveTone(for: bundleId)
         let customInstructions = settings.effectiveCustomInstructions(for: bundleId)
 
-        let ragSamples = learning.relevantWritingSamples(
-            for: precedingText,
-            appBundleId: bundleId,
-            domain: domain,
-            strength: settings.personalizationStrength
-        )
-        let clipSnippet = PromptBuilder.readSafeClipboardSnippet(enabled: settings.useClipboardContext)
-        let deepSummary = DeepContextCollector.shared.buildSynthesizedContextSummary(
-            currentAppName: appName,
-            currentBundleId: bundleId,
-            activeFieldText: precedingText
-        )
-
-        let context = PromptContext(
-            precedingText: precedingText,
-            followingText: followingText,
-            appName: appName,
-            bundleIdentifier: bundleId,
-            domain: domain,
-            windowTitle: settings.useWindowEnvironmentContext ? windowTitle : nil,
-            clipboardSnippet: clipSnippet,
-            deepContextSummary: deepSummary,
-            personaDescription: customInstructions,
-            toneInstruction: tone == .custom ? settings.customToneInstructions : tone.promptInstruction,
-            dictionary: settings.personalDictionary,
-            learnedSamples: ragSamples,
-            maxWords: settings.completionLength.maxWords
-        )
-
-        if providerOverride == nil, settings.activeProvider == .localEmbedded {
-            let started = DispatchTime.now().uptimeNanoseconds
-            let instant = PromptBuilder.cleanCompletionText(
-                OfflinePredictor().complete(context: context, tone: tone),
-                precedingText: precedingText, maxWords: context.maxWords
-            )
-            if !instant.isEmpty {
-                let latency = Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
-                lastLatencyMs = latency
-                currentSuggestion = CompletionItem(fullText: instant, providerName: AIProviderType.mock.rawValue, latencyMs: latency)
-                stats.recordShown(latencyMs: latency)
-            }
-        }
-
         let id = requestID
         activeTask = Task { [weak self] in
             guard let self = self else { return }
@@ -315,6 +275,39 @@ public final class CompletionEngine: ObservableObject {
             }
 
             guard !Task.isCancelled, self.requestID == id else { return }
+
+            let ragSamples = learning.relevantWritingSamples(
+                for: precedingText,
+                appBundleId: bundleId,
+                domain: domain,
+                strength: settings.personalizationStrength
+            )
+            let isPlayground = bundleId == "com.freetypist.playground"
+            let clipSnippet = PromptBuilder.readSafeClipboardSnippet(enabled: !isPlayground && settings.useClipboardContext)
+            let deepSummary = isPlayground ? "" : DeepContextCollector.shared.buildSynthesizedContextSummary(
+                currentAppName: appName,
+                currentBundleId: bundleId,
+                activeFieldText: precedingText
+            )
+
+            let context = PromptContext(
+                precedingText: precedingText,
+                followingText: followingText,
+                appName: appName,
+                bundleIdentifier: bundleId,
+                domain: domain,
+                windowTitle: settings.useWindowEnvironmentContext ? windowTitle : nil,
+                clipboardSnippet: clipSnippet,
+                deepContextSummary: deepSummary,
+                personaDescription: customInstructions,
+                toneInstruction: tone == .custom ? settings.customToneInstructions : tone.promptInstruction,
+                dictionary: settings.personalDictionary,
+                learnedSamples: ragSamples,
+                maxWords: settings.completionLength.maxWords
+            )
+
+            learning.recordPassiveTyping(text: precedingText, appName: appName, bundleId: bundleId,
+                                         domain: domain, windowTitle: windowTitle)
 
             self.isGenerating = true
             self.lastError = nil

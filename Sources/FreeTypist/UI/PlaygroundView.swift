@@ -609,11 +609,19 @@ public struct PlaygroundView: View {
     }
 
     private func acceptFull() {
+        guard engine.matchesContext(editorContext, bundleId: "com.freetypist.playground") else {
+            engine.dismiss()
+            return
+        }
         guard let accepted = engine.acceptFull() else { return }
         applyInsertion(accepted.textToInsert, deleteBackwardsCount: accepted.deleteBackwardsCount)
     }
 
     private func acceptWord() {
+        guard engine.matchesContext(editorContext, bundleId: "com.freetypist.playground") else {
+            engine.dismiss()
+            return
+        }
         if (engine.currentSuggestion?.replacementLength ?? 0) > 0 {
             acceptFull()
         } else if let word = engine.acceptNextWord() {

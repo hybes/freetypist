@@ -3,6 +3,7 @@ import AppKit
 struct SentenceSpellingCorrection {
     let edit: TextReplacement
     let count: Int
+    let wordEdits: [TextReplacement]
 }
 
 /// Checks the current paragraph only, preserving wording, punctuation and whitespace.
@@ -44,6 +45,18 @@ enum SentenceSpellingCorrector {
         guard let edit = TextReplacement(original: snapshot,
             range: NSRange(location: offset + span.location, length: span.length),
             insertion: replacement, caret: newCaret) else { return nil }
-        return SentenceSpellingCorrection(edit: edit, count: changes.count)
+        // Controls such as Electron may expose selection but no AX text setter.
+        // Replace individual words from right to left so each Unicode insertion
+        // is atomic and earlier ranges remain valid.
+        var wordEdits: [TextReplacement] = []
+        var current = snapshot
+        for (range, fixed) in changes.reversed() {
+            guard let wordEdit = TextReplacement(original: current,
+                range: NSRange(location: offset + range.location, length: range.length),
+                insertion: fixed, caret: current.selection.location + fixed.utf16.count - range.length) else { return nil }
+            wordEdits.append(wordEdit)
+            current = wordEdit.result
+        }
+        return SentenceSpellingCorrection(edit: edit, count: changes.count, wordEdits: wordEdits)
     }
 }

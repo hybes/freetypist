@@ -88,10 +88,6 @@ public struct PromptBuilder {
             instructions.append(envDesc)
         }
 
-        if !context.deepContextSummary.isEmpty {
-            instructions.append("DEEP ON-DEVICE MULTI-WINDOW & CLIPBOARD CONTEXT:\n\(context.deepContextSummary.prefix(1500))")
-        }
-
         if !context.toneInstruction.isEmpty {
             instructions.append("Tone & Style: \(context.toneInstruction.prefix(300))")
         }
@@ -100,39 +96,62 @@ public struct PromptBuilder {
             instructions.append("Custom AI Instructions: \(context.personaDescription.prefix(600))")
         }
 
-        if !context.dictionary.isEmpty {
-            let dictPairs = context.dictionary.sorted { $0.key < $1.key }.map { "\($0.key) -> \($0.value)" }.joined(separator: ", ").prefix(600)
-            instructions.append("Preferred vocabulary and expansions: \(dictPairs)")
-        }
-
-        if !context.learnedSamples.isEmpty {
-            let formatted = context.learnedSamples.prefix(3).map { "- \"\($0.suffix(180))\"" }.joined(separator: "\n")
-            instructions.append("Recent examples of the user's personal writing style:\n\(formatted)")
-        }
-
-        if let clip = context.clipboardSnippet, !clip.isEmpty {
-            instructions.append("Current clipboard context (for reference if relevant):\n\"\(clip)\"")
-        }
-
-        instructions.append("Complete the given sentence. Respond with ONLY the missing words, never the original sentence or an explanation.")
+        instructions.append("Continue the draft directly from its final character. Use background only when relevant; never copy a writing example or a previous sentence. Stop at the end of the sentence.")
         return instructions.joined(separator: "\n\n")
     }
 
-    public static func buildUserPrompt(context: PromptContext) -> String {
+    public static func buildUserPrompt(context: PromptContext, includeDraft: Bool = true) -> String {
         let shouldSanitize = AppSettings.shared.sanitizeSecretsLocally
         let beforeSlice = String(context.precedingText.suffix(700))
         let sanitizedBefore = shouldSanitize ? SecretSanitizer.sanitize(beforeSlice).sanitized : beforeSlice
 
-        if context.followingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "Sentence: \(sanitizedBefore)"
-        } else {
-            let afterSlice = String(context.followingText.prefix(240))
-            let sanitizedAfter = shouldSanitize ? SecretSanitizer.sanitize(afterSlice).sanitized : afterSlice
-            return "<TEXT_BEFORE_CURSOR>\n\(sanitizedBefore)\n</TEXT_BEFORE_CURSOR>\n<TEXT_AFTER_CURSOR>\n\(sanitizedAfter)\n</TEXT_AFTER_CURSOR>\n\nImmediate middle continuation (\(context.maxWords) words max):"
+        // Background belongs in the data message. Keeping the system instruction
+        // stable also lets the local server reuse its prompt cache while typing.
+        var parts: [String] = []
+        if context.bundleIdentifier != "com.freetypist.playground" {
+            let background = [context.deepContextSummary, context.clipboardSnippet ?? ""]
+                .filter { isRelevantBackground($0, to: context.precedingText) }.joined(separator: "\n")
+            if !background.isEmpty {
+                parts.append("<background>\n\(background.prefix(600))\n</background>")
+            }
         }
+        if !context.learnedSamples.isEmpty {
+            let samples = context.learnedSamples.prefix(2).map { String($0.suffix(120)) }.joined(separator: "\n")
+            parts.append("<writing_style_examples>\n\(samples)\n</writing_style_examples>")
+        }
+        if includeDraft { parts.append("Sentence: \(sanitizedBefore)") }
+        if !context.followingText.isEmpty {
+            let after = String(context.followingText.prefix(160))
+            parts.append("<after>\(shouldSanitize ? SecretSanitizer.sanitize(after).sanitized : after)</after>")
+        }
+        parts.append(includeDraft ? "Missing continuation:" : "Continue the draft already started below.")
+        return parts.joined(separator: "\n")
     }
 
-    public static func cleanCompletionText(_ raw: String, precedingText: String, maxWords: Int = 12) -> String {
+    /// llama.cpp b11669 continues a final assistant message rather than opening
+    /// a new reply. This anchors small instruct models to the actual draft.
+    static func completionMessages(context: PromptContext) -> [[String: String]] {
+        let prefix = String(context.precedingText.suffix(700))
+        let draft = AppSettings.shared.sanitizeSecretsLocally ? SecretSanitizer.sanitize(prefix).sanitized : prefix
+        return [
+            ["role": "system", "content": buildSystemPrompt(context: context)],
+            ["role": "user", "content": buildUserPrompt(context: context, includeDraft: false)],
+            ["role": "assistant", "content": draft]
+        ]
+    }
+
+    static func isRelevantBackground(_ background: String, to prefix: String) -> Bool {
+        let common: Set<String> = ["thank", "thanks", "please", "should", "could", "would", "there", "their",
+                                   "about", "this", "that", "with", "have", "been", "will", "your", "just"]
+        func words(_ value: String) -> Set<String> {
+            Set(value.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .filter { $0.count >= 4 }.map(String.init)).subtracting(common)
+        }
+        return words(prefix).intersection(words(background)).count >= 2
+            || (prefix.lowercased().hasSuffix("the link") && background.contains("https://"))
+    }
+
+    public static func cleanCompletionText(_ raw: String, precedingText: String, maxWords: Int = 12, truncated: Bool = false) -> String {
         var text = raw
 
         // 1. Remove closed or unclosed thinking tags (<think>...</think>, <|thought|>...<turn|>, <|thought|>...<|thought|>)
@@ -207,21 +226,50 @@ public struct PromptBuilder {
         if let firstLine = text.components(separatedBy: .newlines).first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
             text = firstLine
         }
+        if let sentenceEnd = text.range(of: #"[.!?](?=\s|$)"#, options: .regularExpression) {
+            text = String(text[...sentenceEnd.lowerBound])
+        }
 
         // 7. Enforce word count cap from Cotypist completionLength setting
-        let chunks = text.split(whereSeparator: \.isWhitespace)
+        var chunks = text.split(whereSeparator: \.isWhitespace)
+        if truncated, chunks.count <= maxWords, text.last?.isLetter == true {
+            // A token budget can cut through a word. Keep only completed words.
+            guard chunks.count > 1, let last = chunks.last else { return "" }
+            text = String(text[..<last.startIndex]).trimmingCharacters(in: .newlines)
+            chunks = text.split(whereSeparator: \.isWhitespace)
+        }
         if chunks.count > maxWords && maxWords > 0 {
             let leadingSpace = text.first?.isWhitespace == true ? " " : ""
             text = leadingSpace + chunks.prefix(maxWords).joined(separator: " ")
         }
 
+        // Reject loops instead of presenting an old sentence as a new completion.
+        func words(_ value: String) -> [String] {
+            value.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        }
+        let beforeWords = words(precedingText)
+        let proposedWords = words(text)
+        if proposedWords.count >= 3 {
+            let opening = Array(proposedWords.prefix(3))
+            if beforeWords.count >= 3,
+               (0...(beforeWords.count - 3)).contains(where: { Array(beforeWords[$0..<($0 + 3)]) == opening }) {
+                return ""
+            }
+            var seen = Set<String>()
+            for index in 0...(proposedWords.count - 3) {
+                let phrase = proposedWords[index..<(index + 3)].joined(separator: " ")
+                guard seen.insert(phrase).inserted else { return "" }
+            }
+        }
+
         // 8. Normalize leading space
         if precedingText.last?.isWhitespace == true {
             text = String(text.drop(while: { $0 == " " || $0 == "\t" }))
-        } else if !wasCodeBlock && !text.isEmpty && precedingText.last?.isLetter == true && text.first?.isLetter == true {
+        } else if !wasCodeBlock && !text.isEmpty && text.first?.isLetter == true && !precedingText.isEmpty {
             // Add leading space if starting a new word after a completed word
             let lastPrecedingWord = String(precedingText.split(whereSeparator: \.isWhitespace).last ?? "")
-            if lastPrecedingWord.count >= 2 && !OfflinePredictor.isLikelyPartialWordContinuation(stem: lastPrecedingWord, continuation: text) {
+            if precedingText.last?.isLetter != true ||
+                !OfflinePredictor.isLikelyPartialWordContinuation(stem: lastPrecedingWord, continuation: text) {
                 text = " " + text
             }
         }

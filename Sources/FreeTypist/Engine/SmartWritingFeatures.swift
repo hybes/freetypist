@@ -334,9 +334,11 @@ public struct SmartWritingFeatures: Sendable {
     public static func detectAutocorrect(in precedingText: String) -> AutocorrectSuggestion? {
         guard !precedingText.isEmpty else { return nil }
 
-        let hasTrailingSingleSpace = precedingText.hasSuffix(" ") && !precedingText.hasSuffix("  ")
-        let trimmed = hasTrailingSingleSpace ? String(precedingText.dropLast()) : precedingText
-        let suffixSpace = hasTrailingSingleSpace ? " " : ""
+        // Keep punctuation and spacing when accepting a correction after finishing a word.
+        let suffixSpace = String(precedingText.reversed().prefix { " .,!?;:)]}".contains($0) }.reversed())
+        guard suffixSpace.count <= 4, !suffixSpace.hasSuffix("  ") else { return nil }
+        let trimmed = String(precedingText.dropLast(suffixSpace.count))
+        let hasTrailingSingleSpace = !suffixSpace.isEmpty
 
         guard trimmed.last?.isWhitespace != true else { return nil }
         let tokens = trimmed.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
@@ -346,7 +348,7 @@ public struct SmartWritingFeatures: Sendable {
         // Ignore slash commands, shortcodes, URLs, or non-letter words
         guard word.count >= 2, word.allSatisfy(\.isLetter) else { return nil }
         let lower = word.lowercased()
-        let repLen = word.count + (hasTrailingSingleSpace ? 1 : 0)
+        let repLen = word.count + suffixSpace.count
 
         // 0. Check accidental repeated consecutive word (e.g. "the the ", "to to ", "is is ")
         if tokens.count >= 2 {
@@ -382,9 +384,22 @@ public struct SmartWritingFeatures: Sendable {
 
         guard word.count >= 4 else { return nil }
         let checker = NSSpellChecker.shared
-        let spellRange = checker.checkSpelling(of: word, startingAt: 0)
+        let spellRange = checker.checkSpelling(of: word, startingAt: 0, language: "en_GB",
+                                              wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
         guard spellRange.location != NSNotFound else {
             return nil // Word is spelled correctly
+        }
+
+        // Prefer repairing a repeated keystroke to a guess that changes the word.
+        if let fixed = repeatedKeystrokeCorrection(word) {
+            return AutocorrectSuggestion(misspelledWord: word, correctedWord: fixed + suffixSpace,
+                                         replacementLength: word.count + suffixSpace.count)
+        }
+        let fullRange = NSRange(location: 0, length: word.utf16.count)
+        if !hasTrailingSingleSpace,
+           !(checker.completions(forPartialWordRange: fullRange, in: word,
+                                 language: "en_GB", inSpellDocumentWithTag: 0) ?? []).isEmpty {
+            return nil
         }
 
         // 2. Stutter / Doubled-Prefix Detector (e.g., "expeexperience" -> "experience", "recreceive" -> "receive")
@@ -425,11 +440,10 @@ public struct SmartWritingFeatures: Sendable {
         }
 
         // 4. macOS NSSpellChecker direct correction
-        let fullRange = NSRange(location: 0, length: word.utf16.count)
         if let correction = checker.correction(
             forWordRange: fullRange,
             in: word,
-            language: "en",
+            language: "en_GB",
             inSpellDocumentWithTag: 0
         ), correction.lowercased() != lower {
             return AutocorrectSuggestion(
@@ -440,7 +454,7 @@ public struct SmartWritingFeatures: Sendable {
         }
 
         // 5. macOS NSSpellChecker guesses ranked by edit distance (catches transpositions & 1-2 char typos)
-        if let guesses = checker.guesses(forWordRange: fullRange, in: word, language: "en", inSpellDocumentWithTag: 0),
+        if let guesses = checker.guesses(forWordRange: fullRange, in: word, language: "en_GB", inSpellDocumentWithTag: 0),
            !guesses.isEmpty {
             // Only trigger mid-word if no valid word starts with `word`
             let possibleCompletions = checker.completions(forPartialWordRange: fullRange, in: word, language: "en", inSpellDocumentWithTag: 0) ?? []
@@ -485,18 +499,7 @@ public struct SmartWritingFeatures: Sendable {
         }
         guard word.count >= 4, !isWord(word) else { return nil }
 
-        // Repeated keystrokes: aactual, reeplacement, speelling, sentencee.
-        let letters = Array(lower)
-        var candidates = Set<String>()
-        for index in 1..<letters.count where letters[index] == letters[index - 1] {
-            var shortened = letters
-            shortened.remove(at: index)
-            let candidate = String(shortened)
-            if isWord(candidate) { candidates.insert(candidate) }
-        }
-        if candidates.count == 1, let fixed = candidates.first {
-            return preserveCase(original: word, replacement: fixed)
-        }
+        if let fixed = repeatedKeystrokeCorrection(word) { return fixed }
         // Do not guess at unfamiliar capitalised names.
         guard word.first?.isUppercase != true,
               let fixed = checker.correction(forWordRange: NSRange(location: 0, length: word.utf16.count),
@@ -504,6 +507,36 @@ public struct SmartWritingFeatures: Sendable {
               fixed.allSatisfy(\.isLetter), fixed.lowercased() != lower,
               fixed.first == word.first, editDistance(lower, fixed.lowercased()) <= 2 else { return nil }
         return fixed
+    }
+
+    @MainActor
+    private static func repeatedKeystrokeCorrection(_ word: String) -> String? {
+        let lower = word.lowercased()
+        func isWord(_ candidate: String) -> Bool {
+            NSSpellChecker.shared.checkSpelling(of: candidate, startingAt: 0, language: "en_GB",
+                wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
+        }
+        // Repeated letters and repeated endings: outsiide, sentencee, playgroundnd.
+        let letters = Array(lower)
+        var candidates = Set<String>()
+        guard letters.count >= 4 else { return nil }
+        for index in 1..<letters.count where letters[index] == letters[index - 1] {
+            var shortened = letters
+            shortened.remove(at: index)
+            let candidate = String(shortened)
+            if isWord(candidate) { candidates.insert(candidate) }
+        }
+        if letters.count >= 6 {
+            for length in 2...min(3, letters.count / 2) {
+                let ending = String(lower.suffix(length))
+                let shortened = String(lower.dropLast(length))
+                if shortened.hasSuffix(ending), isWord(shortened) { candidates.insert(shortened) }
+            }
+        }
+        if candidates.count == 1, let fixed = candidates.first {
+            return preserveCase(original: word, replacement: fixed)
+        }
+        return nil
     }
 
     private static func editDistance(_ a: String, _ b: String) -> Int {

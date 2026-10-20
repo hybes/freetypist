@@ -38,11 +38,16 @@ struct TextReplacement {
 
 @MainActor
 protocol TextReplacementTarget: AnyObject {
+    var supportsDirectReplacement: Bool? { get }
     /// Returns nil when focus, authorisation or the operation's validity changes.
     func snapshot() -> TextInputSnapshot?
     func select(_ range: NSRange) -> Bool
     func replaceSelectedText(_ text: String) -> Bool
     func typeText(_ text: String) -> Bool
+}
+
+extension TextReplacementTarget {
+    var supportsDirectReplacement: Bool? { nil }
 }
 
 enum TextReplacementResult {
@@ -52,6 +57,20 @@ enum TextReplacementResult {
 /// Uses a verified selection, never a blind sequence of Backspace keys.
 @MainActor
 enum TextReplacementWriter {
+    static func apply(_ correction: SentenceSpellingCorrection, to target: any TextReplacementTarget) async -> TextReplacementResult {
+        guard target.supportsDirectReplacement == false else {
+            return await apply(correction.edit, to: target)
+        }
+        // Validate every chunk before editing anything. Never fall back after an
+        // acknowledged but unverified AX write.
+        guard correction.wordEdits.allSatisfy({ $0.insertion.utf16.count <= 20 }) else { return .unsupported }
+        for edit in correction.wordEdits {
+            let result = await apply(edit, to: target)
+            guard result == .applied else { return result }
+        }
+        return target.snapshot() == correction.edit.result ? .applied : .interrupted
+    }
+
     static func apply(_ edit: TextReplacement, to target: any TextReplacementTarget) async -> TextReplacementResult {
         guard target.snapshot() == edit.original else { return .stale }
         let selected = TextInputSnapshot(identity: edit.original.identity, text: edit.original.text, selection: edit.range)
