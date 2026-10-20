@@ -89,7 +89,7 @@ Audit of the supplied Cotypist 2026.5 screenshots against FreeTypist's code on 2
 | Keyboard shortcuts | Fixed Tab/full, Option–Tab or backtick/word and Escape behaviour. Word spacing/punctuation and Escape policies exist internally. Shortcut recording, configurable bindings and system-wide force-completion/global-toggle shortcuts are missing. |
 | Battery | Shorter output and on-demand gating exist internally, but lack settings controls. Automatic smaller-model switching is not implemented. Manual engine sleep and idle sleep are implemented. |
 | Per-app settings | Exclusions, tone and custom instructions have controls. Per-app autocorrect, Tab, recording and mid-line restrictions are respected internally/imported but have no controls. Cotypist's per-option inherit/on/off selectors and compatibility mode are missing. |
-| Alternatives and synonyms | Basic local alternatives and dictionary synonyms; interactive choices in Playground. The system overlay can display synonym labels, but full system-wide numbered selection and model-based contextual synonyms are missing. |
+| Alternatives and synonyms | Basic local alternatives and dictionary synonyms; interactive choices in Playground. Synonym labels exist in the overlay view, but selecting text does not open a usable system-wide picker. System-wide numbered selection and model-based contextual synonyms are missing. |
 | Sync | No iCloud writing-history sync or end-to-end encrypted multi-Mac sync. |
 | Statistics | Local accepted-word/activity history, app breakdowns and date-range charts. No subscriptions, daily word cap or usage-reporting service. |
 
