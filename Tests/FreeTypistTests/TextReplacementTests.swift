@@ -69,7 +69,7 @@ final class TextReplacementTests: XCTestCase {
         let undoProvider = TestUndoProvider()
         editor.delegate = undoProvider
         editor.allowsUndo = true
-        editor.correctSpellingOnEnter = true
+        editor.paragraphSpellingShortcutEnabled = true
         editor.string = "👩🏽‍💻 Check aactual speelling, please!"
         editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
         var corrections = 0
@@ -89,6 +89,7 @@ final class TextReplacementTests: XCTestCase {
     @MainActor
     func testNativeEditorSettingOffLeavesTextAlone() {
         let editor = GhostAwareNSTextView()
+        editor.paragraphSpellingShortcutEnabled = false
         editor.string = "Check speelling"
         editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
         XCTAssertFalse(editor.performSentenceSpellingCheck())
@@ -222,6 +223,79 @@ final class TextReplacementTests: XCTestCase {
     }
 
     @MainActor
+    func testKnownUnsupportedSetterIsNeverCalledEvenIfItWouldAcknowledge() async throws {
+        let original = snapshot("Check speelling, please!", caret: "Check speelling".utf16.count)
+        let target = TestTarget(original)
+        target.directWrite = .ignored
+        target.directSupport = false
+        let edit = try XCTUnwrap(TextReplacement.trailing("spelling", count: 9, in: original))
+        let result = await TextReplacementWriter.apply(edit, to: target)
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(target.directWrites, 0)
+        XCTAssertEqual(target.value.text, "Check spelling, please!")
+        XCTAssertEqual(target.typedChunks, ["spelling"])
+    }
+
+    @MainActor
+    func testKeyboardInsertionWaitsForSeparateValueAndSelectionUpdates() async throws {
+        // Equal-length text keeps an old selection valid while AX catches up.
+        let original = snapshot("Fix teh now", caret: 7)
+        let target = TestTarget(original)
+        target.directSupport = false
+        target.delayedKeyboardSelection = true
+        let edit = try XCTUnwrap(TextReplacement.trailing("the", count: 3, in: original))
+        let result = await TextReplacementWriter.apply(edit, to: target)
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(target.value, edit.result)
+        XCTAssertEqual(target.typedChunks, ["the"])
+    }
+
+    @MainActor
+    func testShortenedWordCanTemporarilyExposeItsOldLongerSelection() async throws {
+        let original = snapshot("speelling")
+        let target = TestTarget(original)
+        target.directSupport = false
+        target.delayedKeyboardSelection = true
+        let edit = try XCTUnwrap(TextReplacement.trailing("spelling", count: 9, in: original))
+        let result = await TextReplacementWriter.apply(edit, to: target)
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(target.value, edit.result)
+        XCTAssertEqual(target.typedChunks, ["spelling"])
+    }
+
+    @MainActor
+    func testReturnAndKeypadEnterMatchNativeEditorBehaviourWithoutCorrecting() throws {
+        for code: UInt16 in [36, 76] {
+            _ = NSApplication.shared
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 200),
+                                  styleMask: [], backing: .buffered, defer: false)
+            let editor = GhostAwareNSTextView()
+            window.contentView = editor
+            window.makeFirstResponder(editor)
+            editor.paragraphSpellingShortcutEnabled = true
+            editor.string = "Check speelling."
+            editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+            let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
+                isARepeat: false, keyCode: code))
+            editor.keyDown(with: event)
+            XCTAssertEqual(editor.string, "Check speelling.\n")
+        }
+    }
+
+    @MainActor
+    func testParagraphShortcutCorrectsMultipleEarlierWordsWithoutSubmitting() throws {
+        let editor = GhostAwareNSTextView()
+        editor.string = "The aactual reeplacement has speelling mistakes in this sentencee."
+        editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+            modifierFlags: [.control, .option], timestamp: 0, windowNumber: 0, context: nil,
+            characters: "s", charactersIgnoringModifiers: "s", isARepeat: false, keyCode: 1))
+        editor.keyDown(with: event)
+        XCTAssertEqual(editor.string, "The actual replacement has spelling mistakes in this sentence.")
+    }
+
+    @MainActor
     func testChangingFocusDuringFallbackStopsFurtherTyping() async throws {
         let original = snapshot("Replace these words")
         let edit = try XCTUnwrap(TextReplacement.trailing(String(repeating: "new words ", count: 10),
@@ -253,7 +327,8 @@ private final class TestUndoProvider: NSObject, NSTextViewDelegate {
 
 @MainActor
 private final class TestTarget: TextReplacementTarget {
-    var supportsDirectReplacement: Bool? { directWrite != .unsupported }
+    var supportsDirectReplacement: Bool? { directSupport ?? (directWrite != .unsupported) }
+    var directSupport: Bool?
     enum DirectWrite { case supported, unsupported, ignored }
     var value: TextInputSnapshot
     var directWrite = DirectWrite.supported
@@ -262,6 +337,8 @@ private final class TestTarget: TextReplacementTarget {
     var focused = true
     var delayed = false
     var selectionWrites = 0
+    var directWrites = 0
+    var delayedKeyboardSelection = false
     var typedChunks: [String] = []
     init(_ value: TextInputSnapshot) { self.value = value }
     func snapshot() -> TextInputSnapshot? { focused ? value : nil }
@@ -278,6 +355,7 @@ private final class TestTarget: TextReplacementTarget {
         value = TextInputSnapshot(identity: value.identity, text: value.text, selection: range)
     }
     func replaceSelectedText(_ text: String) -> Bool {
+        directWrites += 1
         if directWrite == .unsupported { return false }
         if directWrite == .supported {
             if delayed {
@@ -288,7 +366,13 @@ private final class TestTarget: TextReplacementTarget {
     }
     func typeText(_ text: String) -> Bool {
         typedChunks.append(text)
+        let previousSelection = value.selection
         write(text)
+        if delayedKeyboardSelection {
+            let finalSelection = value.selection
+            setSelection(previousSelection)
+            Task { try? await Task.sleep(for: .milliseconds(150)); self.setSelection(finalSelection) }
+        }
         if loseFocusAfterChunk { focused = false }
         return true
     }

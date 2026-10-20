@@ -16,8 +16,6 @@ public final class KeyboardHook: @unchecked Sendable {
     private let typingBuffer = TypingBuffer()
     private var lastFieldHash: UInt?
     private var sentenceCorrectionInProgress = false
-    private var suppressReturnRepeats = false
-    private var correctedSentence: TextInputSnapshot?
     private var contextRefreshTask: Task<Void, Never>?
 
     private init() {}
@@ -78,7 +76,6 @@ public final class KeyboardHook: @unchecked Sendable {
         ) { [weak self] _ in
             self?.typingBuffer.reset()
             self?.contextRefreshTask?.cancel()
-            self?.correctedSentence = nil
             MainActor.assumeIsolated {
                 AccessibilityService.shared.cancelPendingInsertion()
                 ReplacementFeedback.shared.clear()
@@ -139,7 +136,6 @@ public final class KeyboardHook: @unchecked Sendable {
         }
 
         if type == .keyUp {
-            if [36, 76].contains(event.getIntegerValueField(.keyboardEventKeycode)) { suppressReturnRepeats = false }
             return Unmanaged.passUnretained(event)
         }
         if type == .leftMouseDown || type == .rightMouseDown {
@@ -148,7 +144,6 @@ public final class KeyboardHook: @unchecked Sendable {
                 AccessibilityService.shared.cancelPendingInsertion()
                 ReplacementFeedback.shared.clear()
             }
-            correctedSentence = nil
             typingBuffer.reset()
             lastFieldHash = nil
             Task { @MainActor in
@@ -174,18 +169,25 @@ public final class KeyboardHook: @unchecked Sendable {
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
-        let plainReturn = [36, 76].contains(keyCode)
-            && flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty
-        if plainReturn && (sentenceCorrectionInProgress ||
-            (suppressReturnRepeats && event.getIntegerValueField(.keyboardEventAutorepeat) != 0)) { return nil }
+        let paragraphShortcut = WritingShortcut.checksParagraph(keyCode: UInt16(keyCode),
+            modifiers: NSEvent.ModifierFlags(rawValue: UInt(flags.rawValue)))
+            && AppSettings.shared.paragraphSpellingShortcutEnabled
+        if paragraphShortcut && event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return nil }
         MainActor.assumeIsolated {
             AccessibilityService.shared.cancelPendingInsertion()
             ReplacementFeedback.shared.clear()
         }
-        if plainReturn && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-            let handled = MainActor.assumeIsolated { handleSentenceReturn() }
-            if handled { suppressReturnRepeats = true; return nil }
-        } else { correctedSentence = nil }
+        // Sending a message or inserting a newline must never depend on a spelling check.
+        if [36, 76].contains(keyCode) {
+            contextRefreshTask?.cancel()
+            typingBuffer.reset()
+            MainActor.assumeIsolated { CompletionEngine.shared.dismiss() }
+            return Unmanaged.passUnretained(event)
+        }
+        if paragraphShortcut {
+            let handled = MainActor.assumeIsolated { checkParagraphSpelling() }
+            if handled { return nil }
+        }
         let hasActiveSuggestion = hasSuggestion() && AppSettings.shared.isEnabled
         let frontBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let tabDisabledInApp = AppSettings.shared.rule(for: frontBundleId)?.disableTabKey ?? false
@@ -264,8 +266,12 @@ public final class KeyboardHook: @unchecked Sendable {
             engine.dismiss()
             return false
         }
+        let paragraph = acceptance.checksParagraph ? SentenceSpellingCorrector.correction(in: snapshot) : nil
+        guard !acceptance.checksParagraph || paragraph != nil else { engine.dismiss(); return false }
         Task { @MainActor in
-            let result = await service.apply(edit, to: target)
+            let result: TextReplacementResult
+            if let paragraph { result = await service.apply(paragraph, to: target) }
+            else { result = await service.apply(edit, to: target) }
             if result == .applied {
                 self.typingBuffer.replace(with: edit.result.context.precedingText)
                 engine.commitAcceptance(acceptance)
@@ -283,16 +289,17 @@ public final class KeyboardHook: @unchecked Sendable {
     }
 
     @MainActor
-    private func handleSentenceReturn() -> Bool {
+    @discardableResult
+    func checkParagraphSpelling() -> Bool {
         let settings = AppSettings.shared
         let service = AccessibilityService.shared
         let bundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        guard settings.correctSentenceOnEnter, settings.isEnabled,
+        guard settings.isEnabled, !sentenceCorrectionInProgress,
               !settings.isAppExcluded(bundleIdentifier: bundle),
               settings.rule(for: bundle)?.disableAutocorrect != true,
               !service.isPerformingSyntheticInsertion,
+              service.getCurrentCaretInfo() != nil,
               let target = service.captureTextTarget(), let snapshot = target.snapshot(),
-              snapshot != correctedSentence,
               let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
         CompletionEngine.shared.dismiss()
         if let caret = service.getCurrentCaretInfo(), caret.hasValidCaretRect {
@@ -303,13 +310,10 @@ public final class KeyboardHook: @unchecked Sendable {
             defer { self.sentenceCorrectionInProgress = false }
             let result = await service.apply(correction, to: target)
             if result == .applied {
-                self.correctedSentence = correction.edit.result
                 self.typingBuffer.replace(with: correction.edit.result.context.precedingText)
-                ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes"). Press Enter again to continue.")
+                ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes").")
             } else if result == .unsupported {
-                // Allow the next Enter to behave normally even in an unsupported field.
-                self.correctedSentence = target.snapshot()
-                ReplacementFeedback.shared.show("This field could not confirm the spelling changes. Check the text; Enter again continues.")
+                ReplacementFeedback.shared.show("Spelling changes could not be verified in this field.")
             }
         }
         return true

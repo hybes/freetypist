@@ -650,14 +650,14 @@ final class FreeTypistTests: XCTestCase {
         XCTAssertTrue(settings.enableEmojiSuggestions)
         XCTAssertFalse(settings.useClipboardContext)
         XCTAssertFalse(settings.trackCrossAppContext)
-        XCTAssertFalse(settings.correctSentenceOnEnter)
+        XCTAssertTrue(settings.paragraphSpellingShortcutEnabled)
         settings.enableEmojiSuggestions = false
         settings.useClipboardContext = true
-        settings.correctSentenceOnEnter = true
+        settings.paragraphSpellingShortcutEnabled = false
         let reloaded = AppSettings(defaults: defaults)
         XCTAssertFalse(reloaded.enableEmojiSuggestions)
         XCTAssertTrue(reloaded.useClipboardContext)
-        XCTAssertTrue(reloaded.correctSentenceOnEnter)
+        XCTAssertFalse(reloaded.paragraphSpellingShortcutEnabled)
     }
 
     @MainActor

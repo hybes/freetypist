@@ -98,6 +98,9 @@ public final class AccessibilityService: @unchecked Sendable {
         if let subrole = subroleObj as? String, subrole == "AXSecureTextField" {
             return nil
         }
+        guard Self.allowsWriting(in: axElement, role: roleObj as? String ?? "", subrole: subroleObj as? String) else {
+            return nil
+        }
 
         // Read window title if available
         var windowTitle: String?
@@ -344,11 +347,12 @@ public final class AccessibilityService: @unchecked Sendable {
     @MainActor
     func captureTextTarget() -> AccessibilityTextTarget? {
         guard let (pid, element) = Self.focusedTextElement() else { return nil }
+        guard Self.allowsWriting(in: element) else { return nil }
         let generation = insertionGeneration
         let target = AccessibilityTextTarget(pid: pid, element: element) { [weak self] in
             self?.insertionGeneration == generation
         }
-        return target.snapshot() == nil ? nil : target
+        return target.snapshot()?.isValid == true ? target : nil
     }
 
     @MainActor
@@ -385,6 +389,19 @@ public final class AccessibilityService: @unchecked Sendable {
         AXUIElementSetMessagingTimeout(element, 0.15)
         return (pid, element)
     }
+
+    fileprivate static func allowsWriting(in element: AXUIElement, role: String? = nil, subrole: String? = nil) -> Bool {
+        func string(_ attribute: String) -> String? {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+            return value as? String
+        }
+        return WritingInputPolicy.allowsSuggestions(
+            role: role ?? string(kAXRoleAttribute) ?? "",
+            subrole: subrole ?? string(kAXSubroleAttribute),
+            labels: [kAXPlaceholderValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute]
+                .compactMap { string($0) })
+    }
 }
 
 @MainActor
@@ -394,6 +411,12 @@ final class AccessibilityTextTarget: TextReplacementTarget {
     private let isValid: () -> Bool
     var supportsDirectReplacement: Bool? {
         guard isValid() else { return nil }
+        // Chromium advertises AXSelectedText but its web renderer does not
+        // implement kReplaceSelectedText. Do not issue a no-op and then wait.
+        // https://github.com/chromium/chromium/blob/main/content/renderer/accessibility/render_accessibility_impl.cc
+        var chromiumNode: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "ChromeAXNodeId" as CFString, &chromiumNode) == .success,
+           chromiumNode != nil { return false }
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success else { return nil }
         return settable.boolValue
@@ -424,23 +447,26 @@ final class AccessibilityTextTarget: TextReplacementTarget {
         guard AXValueGetValue(selection as! AXValue, .cfRange, &range) else { return nil }
         let snapshot = TextInputSnapshot(identity: CFHash(element), text: text,
                                          selection: NSRange(location: range.location, length: range.length))
-        return snapshot.isValid ? snapshot : nil
+        // Text and selection can arrive in separate AX updates. Preserve that
+        // intermediate snapshot for the writer to recognise and wait for.
+        // Starting an edit still requires a fully valid snapshot.
+        return snapshot
     }
 
     func select(_ range: NSRange) -> Bool {
-        guard snapshot() != nil else { return false }
+        guard let current = snapshot(), TextEditingContext.isValidRange(range, in: current.text) else { return false }
         var cfRange = CFRange(location: range.location, length: range.length)
         guard let value = AXValueCreate(.cfRange, &cfRange) else { return false }
         return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value) == .success
     }
 
     func replaceSelectedText(_ text: String) -> Bool {
-        guard snapshot() != nil else { return false }
+        guard snapshot()?.isValid == true else { return false }
         return AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
     }
 
     func typeText(_ text: String) -> Bool {
-        guard snapshot() != nil, text.utf16.count <= 20 else { return false }
+        guard snapshot()?.isValid == true, text.utf16.count <= 20 else { return false }
         let source = CGEventSource(stateID: .privateState)
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { return false }

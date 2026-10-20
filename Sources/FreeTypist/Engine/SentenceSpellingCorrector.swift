@@ -4,10 +4,20 @@ struct SentenceSpellingCorrection {
     let edit: TextReplacement
     let count: Int
     let wordEdits: [TextReplacement]
+
+    /// Preserve the tail when applying a correction through the Playground's native undo path.
+    var trailingInsertion: String {
+        (edit.result.text as NSString).substring(with: NSRange(
+            location: edit.range.location, length: edit.result.selection.location - edit.range.location))
+    }
+    var trailingLength: Int {
+        (edit.original.text as NSString).substring(with: NSRange(
+            location: edit.range.location, length: edit.original.selection.location - edit.range.location)).count
+    }
 }
 
 /// Checks the current paragraph only, preserving wording, punctuation and whitespace.
-/// No model or network request is involved in an Enter-key spelling check.
+/// No model or network request is involved in a paragraph spelling check.
 @MainActor
 enum SentenceSpellingCorrector {
     private static let words = try! NSRegularExpression(pattern: #"\p{L}[\p{L}\p{M}]*(?:['’][\p{L}\p{M}]+)*"#)
@@ -17,7 +27,7 @@ enum SentenceSpellingCorrector {
     static func correction(in snapshot: TextInputSnapshot) -> SentenceSpellingCorrection? {
         guard snapshot.isValid, snapshot.selection.length == 0 else { return nil }
         let context = snapshot.context
-        // Enter in the middle of a line retains its native editing behaviour.
+        // Leave text after the cursor untouched.
         guard context.followingText.isEmpty || context.followingText.first?.isNewline == true else { return nil }
         let prefix = context.precedingText
         let start = prefix.lastIndex(where: \.isNewline).map { prefix.index(after: $0) } ?? prefix.startIndex

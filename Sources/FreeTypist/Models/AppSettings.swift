@@ -168,7 +168,7 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
     @Published public var enableMidLineCompletions: Bool { didSet { save() } }
     @Published public var hideCompletionsOnSuspectedTypo: Bool { didSet { save() } }
     @Published public var showSuggestedTypoFixes: Bool { didSet { save() } }
-    @Published public var correctSentenceOnEnter: Bool { didSet { save() } }
+    @Published public var paragraphSpellingShortcutEnabled: Bool { didSet { save() } }
     @Published public var debounceMs: Int { didSet { save() } }
     @Published public var minTriggerCharacters: Int { didSet { save() } }
     @Published public var playSoundOnAccept: Bool { didSet { save() } }
@@ -262,7 +262,7 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         self.enableMidLineCompletions = defaults.object(forKey: "ft_enableMidLineCompletions") as? Bool ?? true
         self.hideCompletionsOnSuspectedTypo = defaults.object(forKey: "ft_hideOnTypo") as? Bool ?? true
         self.showSuggestedTypoFixes = defaults.object(forKey: "ft_showTypoFixes") as? Bool ?? true
-        self.correctSentenceOnEnter = defaults.object(forKey: "ft_correctSentenceOnEnter") as? Bool ?? false
+        self.paragraphSpellingShortcutEnabled = defaults.object(forKey: "ft_paragraphSpellingShortcutEnabled") as? Bool ?? true
 
         self.debounceMs = defaults.object(forKey: "ft_debounceMs") as? Int ?? 140
         self.minTriggerCharacters = defaults.object(forKey: "ft_minTriggerCharacters") as? Int ?? 2
@@ -379,7 +379,8 @@ public final class AppSettings: ObservableObject, @unchecked Sendable {
         defaults.set(enableMidLineCompletions, forKey: "ft_enableMidLineCompletions")
         defaults.set(hideCompletionsOnSuspectedTypo, forKey: "ft_hideOnTypo")
         defaults.set(showSuggestedTypoFixes, forKey: "ft_showTypoFixes")
-        defaults.set(correctSentenceOnEnter, forKey: "ft_correctSentenceOnEnter")
+        defaults.set(paragraphSpellingShortcutEnabled, forKey: "ft_paragraphSpellingShortcutEnabled")
+        defaults.removeObject(forKey: "ft_correctSentenceOnEnter")
 
         defaults.set(debounceMs, forKey: "ft_debounceMs")
         defaults.set(minTriggerCharacters, forKey: "ft_minTriggerCharacters")

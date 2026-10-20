@@ -19,6 +19,12 @@ public struct GhostTextView: View {
                     .font(.system(size: effectiveFontSize))
                     .padding(5)
                     .background(Color(nsColor: .textBackgroundColor))
+            } else if let paragraph = engine.paragraphSpellingSuggestion {
+                Text("Fix \(paragraph.count) spelling \(paragraph.count == 1 ? "mistake" : "mistakes") · Tab")
+                    .font(.system(size: effectiveFontSize))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color(nsColor: .textBackgroundColor))
             } else if let typo = engine.activeAutocorrect {
                 // Inline Autocorrect Strikethrough Red + Correction Green
                 HStack(alignment: .firstTextBaseline, spacing: 5) {

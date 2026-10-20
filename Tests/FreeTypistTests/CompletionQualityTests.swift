@@ -62,6 +62,48 @@ final class CompletionQualityTests: XCTestCase {
     }
 
     @MainActor
+    func testEarlierMistakesAreOfferedTogetherAtSentenceEndAndWordBoundary() async throws {
+        let defaults = UserDefaults(suiteName: "com.freetypist.quality.paragraph.\(UUID().uuidString)")!
+        let settings = AppSettings(defaults: defaults)
+        settings.debounceMs = 0
+        let engine = CompletionEngine(settings: settings)
+        for ending in [".", " "] {
+            let text = "👩🏽‍💻 Check aactual reeplacement and speelling in this sentencee please\(ending)"
+            engine.onTextContextChanged(precedingText: text, appName: "TextEdit", bundleId: "com.apple.TextEdit")
+            try await Task.sleep(for: .milliseconds(30))
+            let correction = try XCTUnwrap(engine.paragraphSpellingSuggestion)
+            XCTAssertEqual(correction.count, 4)
+            let accepted = try XCTUnwrap(engine.prepareAcceptance(nextWord: false))
+            XCTAssertTrue(accepted.checksParagraph)
+            let context = TextEditingContext(text: text, selection: NSRange(location: text.utf16.count, length: 0))
+            let updated = context.replacingSelection(with: accepted.text, deleteBackwardsCount: accepted.deleteCount)
+            XCTAssertEqual(updated.text, "👩🏽‍💻 Check actual replacement and spelling in this sentence please\(ending)")
+            XCTAssertEqual(updated.selection.location, updated.text.utf16.count)
+            engine.commitAcceptance(accepted)
+            XCTAssertNil(engine.paragraphSpellingSuggestion)
+        }
+    }
+
+    @MainActor
+    func testParagraphOfferHonoursAutocorrectSettingAndCancelsWithChangedDraft() async throws {
+        let defaults = UserDefaults(suiteName: "com.freetypist.quality.paragraph-cancel.\(UUID().uuidString)")!
+        let settings = AppSettings(defaults: defaults)
+        settings.debounceMs = 20
+        settings.showSuggestedTypoFixes = false
+        let engine = CompletionEngine(settings: settings)
+        engine.onTextContextChanged(precedingText: "Check speelling please.", bundleId: "test.editor")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(engine.paragraphSpellingSuggestion)
+        settings.showSuggestedTypoFixes = true
+        engine.onTextContextChanged(precedingText: "Check speelling please.", bundleId: "test.editor")
+        engine.onTextContextChanged(precedingText: "A new correct sentence.", bundleId: "test.editor")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(engine.paragraphSpellingSuggestion)
+        XCTAssertNil(engine.currentSuggestion)
+        engine.dismiss()
+    }
+
+    @MainActor
     func testSentenceEndStillRecordsWritingWithoutRequestingAnotherSentence() async throws {
         let settings = AppSettings.shared
         settings.isEnabled = true

@@ -83,7 +83,9 @@ public final class GhostOverlayPanel: NSPanel {
 
         let targetOrigin = NSPoint(
             x: caretScreenRect.origin.x + caretScreenRect.width + xNudge,
-            y: caretScreenRect.origin.y + yNudge
+            y: ReplacementFeedback.shared.message == nil
+                ? caretScreenRect.origin.y + yNudge
+                : caretScreenRect.origin.y - frame.height - 6
         )
 
         let screen = NSScreen.screens.first { $0.frame.insetBy(dx: -40, dy: -40).contains(targetOrigin) }

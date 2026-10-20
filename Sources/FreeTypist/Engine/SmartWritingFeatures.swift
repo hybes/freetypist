@@ -439,6 +439,10 @@ public struct SmartWritingFeatures: Sendable {
             }
         }
 
+        // A lack of dictionary completions does not make an unfinished name or
+        // host query a spelling mistake. Wait for a word boundary before guessing.
+        guard hasTrailingSingleSpace || (tokens.count >= 2 && word.count >= 6 && word.first?.isUppercase != true) else { return nil }
+
         // 4. macOS NSSpellChecker direct correction
         if let correction = checker.correction(
             forWordRange: fullRange,

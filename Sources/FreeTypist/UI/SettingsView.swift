@@ -162,8 +162,8 @@ public struct SettingsView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Toggle("Check sentence spelling when I press Enter", isOn: $settings.correctSentenceOnEnter)
-                        Text("At the end of a paragraph, Enter fixes clear spelling mistakes. Review the changes, then press Enter again to send or start a new line. Shift–Enter keeps its usual behaviour.")
+                        Toggle("Check paragraph spelling with Control–Option–S", isOn: $settings.paragraphSpellingShortcutEnabled)
+                        Text("At the end of a paragraph, press ⌃⌥S to fix spelling mistakes throughout it. Enter always sends or starts a new line as usual.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

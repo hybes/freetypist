@@ -8,6 +8,7 @@ public final class CompletionEngine: ObservableObject {
 
     @Published public var currentSuggestion: CompletionItem?
     @Published public var activeAutocorrect: AutocorrectSuggestion?
+    @Published var paragraphSpellingSuggestion: SentenceSpellingCorrection?
     @Published public var activeEmojiCandidates: [EmojiCandidate] = []
     @Published public var activeWordAlternatives: [WordAlternativeItem] = []
     @Published public var activeSynonyms: [WordAlternativeItem] = []
@@ -226,6 +227,7 @@ public final class CompletionEngine: ObservableObject {
                 guard let self, self.requestID == id else { return }
                 learning.recordPassiveTyping(text: precedingText, appName: appName, bundleId: bundleId,
                                              domain: domain, windowTitle: windowTitle)
+                _ = offerParagraphSpelling(precedingText: precedingText, followingText: followingText, bundleId: bundleId)
                 activeTask = nil
             }
             return
@@ -275,6 +277,13 @@ public final class CompletionEngine: ObservableObject {
             }
 
             guard !Task.isCancelled, self.requestID == id else { return }
+
+            // Catch earlier mistakes at a word boundary before extending the draft.
+            if precedingText.last?.isWhitespace == true,
+               offerParagraphSpelling(precedingText: precedingText, followingText: followingText, bundleId: bundleId) {
+                activeTask = nil
+                return
+            }
 
             let ragSamples = learning.relevantWritingSamples(
                 for: precedingText,
@@ -359,6 +368,7 @@ public final class CompletionEngine: ObservableObject {
         fileprivate let requestID: UUID
         let text: String
         let deleteCount: Int
+        let checksParagraph: Bool
         fileprivate let nextWord: Bool
     }
 
@@ -371,7 +381,8 @@ public final class CompletionEngine: ObservableObject {
         guard canAccept else { return nil }
         let value: (String, Int)
         var wordOnly = false
-        if let slash = activeSlashCommand { value = (slash.expansion, slash.replacementLength) }
+        if let paragraph = paragraphSpellingSuggestion { value = (paragraph.trailingInsertion, paragraph.trailingLength) }
+        else if let slash = activeSlashCommand { value = (slash.expansion, slash.replacementLength) }
         else if let emoji = activeEmojiCandidates.first { value = (emoji.emoji, emoji.replacementLength) }
         else if let typo = activeAutocorrect { value = (typo.correctedWord, typo.replacementLength) }
         else if let current = currentSuggestion {
@@ -387,7 +398,21 @@ public final class CompletionEngine: ObservableObject {
         isGenerating = false
         // Invalidate any inference response already on its way back.
         requestID = UUID()
-        return PreparedAcceptance(requestID: requestID, text: value.0, deleteCount: value.1, nextWord: wordOnly)
+        return PreparedAcceptance(requestID: requestID, text: value.0, deleteCount: value.1,
+                                  checksParagraph: paragraphSpellingSuggestion != nil, nextWord: wordOnly)
+    }
+
+    private func offerParagraphSpelling(precedingText: String, followingText: String, bundleId: String?) -> Bool {
+        guard settings.showSuggestedTypoFixes, settings.rule(for: bundleId)?.disableAutocorrect != true else { return false }
+        let snapshot = TextInputSnapshot(identity: 0, text: precedingText + followingText,
+            selection: NSRange(location: precedingText.utf16.count, length: 0))
+        guard let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
+        paragraphSpellingSuggestion = correction
+        currentSuggestion = CompletionItem(fullText: "Fix \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes") · Tab",
+            providerName: "Paragraph spelling", replacementLength: correction.trailingLength)
+        isGenerating = false
+        stats.recordShown(latencyMs: 0)
+        return true
     }
 
     /// Statistics and learning are updated only after the target confirms the edit.
@@ -399,6 +424,12 @@ public final class CompletionEngine: ObservableObject {
 
     public func acceptFull() -> (textToInsert: String, deleteBackwardsCount: Int)? {
         guard canAccept else { dismiss(); return nil }
+        if let paragraph = paragraphSpellingSuggestion {
+            stats.recordAccepted(text: paragraph.wordEdits.map(\.insertion).joined(separator: " "),
+                                 appName: lastAppName, source: "Paragraph spelling")
+            dismiss()
+            return (paragraph.trailingInsertion, paragraph.trailingLength)
+        }
         if let slash = activeSlashCommand {
             stats.recordAccepted(text: slash.expansion, appName: lastAppName, source: "Slash Snippets")
             dismiss()
@@ -517,6 +548,7 @@ public final class CompletionEngine: ObservableObject {
         activeTask = nil
         currentSuggestion = nil
         activeAutocorrect = nil
+        paragraphSpellingSuggestion = nil
         activeEmojiCandidates = []
         activeWordAlternatives = []
         activeSynonyms = []

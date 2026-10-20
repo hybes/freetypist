@@ -173,6 +173,11 @@ public final class MenuBarController: NSObject, NSMenuItemValidation {
 
         menu.addItem(NSMenuItem.separator())
 
+        let spellingItem = NSMenuItem(title: "Check Paragraph Spelling", action: #selector(checkParagraphSpelling), keyEquivalent: "s")
+        spellingItem.keyEquivalentModifierMask = [.control, .option]
+        spellingItem.target = self
+        menu.addItem(spellingItem)
+
         // Playground
         let playgroundItem = NSMenuItem(title: "Open Playground...", action: #selector(openPlayground), keyEquivalent: "p")
         playgroundItem.target = self
@@ -205,6 +210,14 @@ public final class MenuBarController: NSObject, NSMenuItemValidation {
 
     @objc private func checkForUpdates() {
         AppUpdater.shared.checkForUpdates()
+    }
+
+    @objc private func checkParagraphSpelling() {
+        // Let the menu close and return AX focus to the app's text field first.
+        Task { @MainActor in
+            await Task.yield()
+            _ = KeyboardHook.shared.checkParagraphSpelling()
+        }
     }
 
     public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {

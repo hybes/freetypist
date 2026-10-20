@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// An exact, UTF-16 snapshot. A replacement must never be applied to a newer draft.
 struct TextInputSnapshot: Equatable {
@@ -57,6 +58,8 @@ enum TextReplacementResult {
 /// Uses a verified selection, never a blind sequence of Backspace keys.
 @MainActor
 enum TextReplacementWriter {
+    private static let log = Logger(subsystem: "com.freetypist.app", category: "TextReplacement")
+
     static func apply(_ correction: SentenceSpellingCorrection, to target: any TextReplacementTarget) async -> TextReplacementResult {
         guard target.supportsDirectReplacement == false else {
             return await apply(correction.edit, to: target)
@@ -75,28 +78,34 @@ enum TextReplacementWriter {
         guard target.snapshot() == edit.original else { return .stale }
         let selected = TextInputSnapshot(identity: edit.original.identity, text: edit.original.text, selection: edit.range)
         guard target.select(edit.range) else {
+            log.notice("Replacement stopped: field rejected selection.")
             restoreSelection(edit, target: target)
             return .unsupported
         }
         var selectionConfirmed = false
-        for _ in 0..<12 {
+        for _ in 0..<30 {
             guard let now = target.snapshot() else { return .interrupted }
             if now == selected { selectionConfirmed = true; break }
             guard now == edit.original else { return .interrupted }
             try? await Task.sleep(for: .milliseconds(10))
         }
-        guard selectionConfirmed else { restoreSelection(edit, target: target); return .unsupported }
+        guard selectionConfirmed else {
+            log.notice("Replacement stopped: field did not confirm selection.")
+            restoreSelection(edit, target: target)
+            return .unsupported
+        }
 
-        let requested = target.replaceSelectedText(edit.insertion)
+        let requested = target.supportsDirectReplacement != false && target.replaceSelectedText(edit.insertion)
         // Some apps acknowledge AX writes before exposing the updated value.
         if requested {
-            for _ in 0..<8 {
+            for _ in 0..<30 {
                 guard let now = target.snapshot() else { return .interrupted }
                 if now.text == edit.result.text { return await finish(edit, target: target) }
                 guard now == selected else { return .interrupted }
                 try? await Task.sleep(for: .milliseconds(15))
             }
             // An acknowledged but unverified write is ambiguous: never duplicate it.
+            log.notice("Replacement stopped: field acknowledged a text write without updating its value.")
             restoreSelection(edit, target: target)
             return .unsupported
         }
@@ -118,19 +127,25 @@ enum TextReplacementWriter {
         for chunk in chunks {
             guard target.snapshot() == expected else { return .interrupted }
             guard target.typeText(chunk) else {
+                log.notice("Replacement stopped: text input could not be posted.")
                 restoreSelection(edit, target: target)
                 return .unsupported
             }
             let changed = expected.context.replacingSelection(with: chunk)
             let next = TextInputSnapshot(identity: expected.identity, text: changed.text, selection: changed.selection)
             var confirmed = false
-            for _ in 0..<12 {
+            for _ in 0..<40 {
                 guard let now = target.snapshot() else { return .interrupted }
                 if now == next { confirmed = true; break }
-                guard now == expected else { return .interrupted }
+                // Chromium can publish text and selection in separate AX updates.
+                // No additional input is sent until both agree.
+                guard now.identity == expected.identity,
+                      (now.text == expected.text || now.text == next.text),
+                      (now.selection == expected.selection || now.selection == next.selection) else { return .interrupted }
                 try? await Task.sleep(for: .milliseconds(10))
             }
             guard confirmed else {
+                log.notice("Replacement stopped: typed text was not confirmed by the field.")
                 restoreSelection(edit, target: target)
                 return .unsupported
             }
@@ -142,10 +157,11 @@ enum TextReplacementWriter {
     private static func finish(_ edit: TextReplacement, target: any TextReplacementTarget) async -> TextReplacementResult {
         guard let now = target.snapshot(), now.text == edit.result.text else { return .interrupted }
         let insertedCaret = NSRange(location: edit.range.location + edit.insertion.utf16.count, length: 0)
-        guard [insertedCaret, edit.range, edit.result.selection].contains(now.selection) else { return .interrupted }
+        let insertedRange = NSRange(location: edit.range.location, length: edit.insertion.utf16.count)
+        guard [insertedCaret, insertedRange, edit.range, edit.result.selection].contains(now.selection) else { return .interrupted }
         if now == edit.result { return .applied }
         guard target.select(edit.result.selection) else { return .unsupported }
-        for _ in 0..<12 {
+        for _ in 0..<30 {
             guard let next = target.snapshot() else { return .interrupted }
             if next == edit.result { return .applied }
             guard next == now else { return .interrupted }

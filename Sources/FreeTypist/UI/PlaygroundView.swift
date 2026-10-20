@@ -14,21 +14,17 @@ public final class GhostAwareNSTextView: NSTextView {
     public var onTabAcceptFull: (() -> Bool)?
     public var onAcceptNextWord: (() -> Bool)?
     public var onEscapeDismiss: (() -> Bool)?
-    public var correctSpellingOnEnter = false
+    public var paragraphSpellingShortcutEnabled = true
     public var onSentenceCorrected: ((Int) -> Void)?
-    private var suppressReturnRepeats = false
 
     public override func keyDown(with event: NSEvent) {
         ReplacementFeedback.shared.clear()
         let keyCode = event.keyCode
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let active = !ghostSuggestion.isEmpty || hasInterceptableAction
-        if (keyCode == 36 || keyCode == 76), event.isARepeat, suppressReturnRepeats { return }
-        if (keyCode == 36 || keyCode == 76),
-           flags.intersection([.command, .control, .option, .shift]).isEmpty,
-           !event.isARepeat, correctSpellingOnEnter, !hasMarkedText(),
+        if WritingShortcut.checksParagraph(keyCode: keyCode, modifiers: flags),
+           !event.isARepeat, paragraphSpellingShortcutEnabled, !hasMarkedText(),
            performSentenceSpellingCheck() {
-            suppressReturnRepeats = true
             return
         }
 
@@ -54,14 +50,9 @@ public final class GhostAwareNSTextView: NSTextView {
         super.keyDown(with: event)
     }
 
-    public override func keyUp(with event: NSEvent) {
-        if event.keyCode == 36 || event.keyCode == 76 { suppressReturnRepeats = false }
-        super.keyUp(with: event)
-    }
-
     @discardableResult
     func performSentenceSpellingCheck() -> Bool {
-        guard correctSpellingOnEnter, !hasMarkedText() else { return false }
+        guard paragraphSpellingShortcutEnabled, !hasMarkedText() else { return false }
         let snapshot = TextInputSnapshot(identity: UInt(bitPattern: ObjectIdentifier(self)),
                                          text: string, selection: selectedRange())
         guard let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
@@ -69,7 +60,7 @@ public final class GhostAwareNSTextView: NSTextView {
         guard string == correction.edit.result.text else { return false }
         setSelectedRange(correction.edit.result.selection)
         onSentenceCorrected?(correction.count)
-        ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes"). Press Enter again to continue.")
+        ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes").")
         return true
     }
 
@@ -135,7 +126,7 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
     public var onTabAcceptFull: () -> Bool
     public var onAcceptNextWord: () -> Bool
     public var onEscapeDismiss: () -> Bool
-    public var correctSpellingOnEnter: Bool = false
+    public var paragraphSpellingShortcutEnabled: Bool = true
     public var onSentenceCorrected: ((Int) -> Void)?
 
     public func makeCoordinator() -> Coordinator {
@@ -174,7 +165,7 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         textView.onTabAcceptFull = onTabAcceptFull
         textView.onAcceptNextWord = onAcceptNextWord
         textView.onEscapeDismiss = onEscapeDismiss
-        textView.correctSpellingOnEnter = correctSpellingOnEnter
+        textView.paragraphSpellingShortcutEnabled = paragraphSpellingShortcutEnabled
         textView.onSentenceCorrected = onSentenceCorrected
 
         scrollView.documentView = textView
@@ -197,7 +188,7 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         textView.onTabAcceptFull = onTabAcceptFull
         textView.onAcceptNextWord = onAcceptNextWord
         textView.onEscapeDismiss = onEscapeDismiss
-        textView.correctSpellingOnEnter = correctSpellingOnEnter
+        textView.paragraphSpellingShortcutEnabled = paragraphSpellingShortcutEnabled
         textView.onSentenceCorrected = onSentenceCorrected
         textView.needsDisplay = true
     }
@@ -298,7 +289,7 @@ public struct PlaygroundView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("FreeTypist Playground")
                         .font(.system(size: 15, weight: .semibold))
-                    Text("Type naturally below. Press Tab to accept a completion or fix a typo, and Option+Tab to accept word-by-word.")
+                    Text("Tab accepts a suggestion. Option+Tab accepts the next word. Control–Option–S checks the whole paragraph.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -371,7 +362,7 @@ public struct PlaygroundView: View {
                     dismissSuggestion()
                     return true
                 },
-                correctSpellingOnEnter: settings.isEnabled && settings.correctSentenceOnEnter,
+                paragraphSpellingShortcutEnabled: settings.isEnabled && settings.paragraphSpellingShortcutEnabled,
                 onSentenceCorrected: { _ in
                     engine.dismiss()
                 }
@@ -398,7 +389,10 @@ public struct PlaygroundView: View {
 
             // Clean Action & Correction Bar
             HStack(spacing: 10) {
-                if let typo = activeTypoFix {
+                if let paragraph = engine.paragraphSpellingSuggestion {
+                    Text("Fix \(paragraph.count) spelling \(paragraph.count == 1 ? "mistake" : "mistakes") · Tab")
+                        .font(.caption)
+                } else if let typo = activeTypoFix {
                     HStack(spacing: 6) {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundColor(.green)
