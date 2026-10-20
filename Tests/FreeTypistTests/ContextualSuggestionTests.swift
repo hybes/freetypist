@@ -90,6 +90,8 @@ final class ContextualSuggestionTests: XCTestCase {
         for (before, generated, expected) in [
             ("We need to improve the perform", " performance of the app.", "We need to improve the performance of the app."),
             ("Can you send me the docum", " document?", "Can you send me the document?"),
+            ("Please send the\ndocum", "document.", "Please send the\ndocument."),
+            ("Please send the\n\n  docum", "  document.", "Please send the\n\n  document."),
             ("The navbar needs to", " to be responsive.", "The navbar needs to be responsive."),
             ("The navbar needs to ", " be responsive.", "The navbar needs to be responsive."),
             ("I", "I can help.", "I can help."),

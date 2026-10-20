@@ -150,7 +150,11 @@ public struct PromptBuilder {
         if context.precedingText.last?.isWhitespace != true,
            let wordRange = draft.range(of: #"[\p{L}\p{M}]+(?:['’][\p{L}\p{M}]*)?$"#, options: .regularExpression) {
             let word = String(draft[wordRange])
-            let before = String(draft[..<wordRange.lowerBound].reversed().drop(while: \.isWhitespace).reversed())
+            // Keep paragraph breaks in the prefill. Regenerating a newline
+            // would be removed by stream cleanup (or hit the double-newline
+            // stop sequence), hiding completions for the first word of a line.
+            let before = String(draft[..<wordRange.lowerBound].reversed()
+                .drop(while: { $0 == " " || $0 == "\t" }).reversed())
             regenerated = String(draft.dropFirst(before.count))
             draft = before
             // Short function words and pronouns must stay whole: "on" must not

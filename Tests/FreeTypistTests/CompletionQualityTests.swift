@@ -324,6 +324,7 @@ final class CompletionQualityTests: XCTestCase {
         for (seed, expectedStart) in [
             ("We need to improve the perform", "ance"),
             ("Can you send me the docum", "ent"),
+            ("Please send the\ndocum", "ent"),
             ("The navigation menu should be respons", "ive"),
             ("The navbar needs to", " "),
             ("Please let me know if you", " "),
