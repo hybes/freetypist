@@ -157,12 +157,12 @@ final class CompletionQualityTests: XCTestCase {
     }
 
     @MainActor
-    func testEarlierMistakesAreOfferedTogetherAtSentenceEndAndWordBoundary() async throws {
+    func testEarlierMistakesAreOfferedTogetherAtSentenceEnd() async throws {
         let defaults = UserDefaults(suiteName: "com.freetypist.quality.paragraph.\(UUID().uuidString)")!
         let settings = AppSettings(defaults: defaults)
         settings.debounceMs = 0
         let engine = CompletionEngine(settings: settings)
-        for ending in [".", " "] {
+        for ending in [".", ". "] {
             let text = "👩🏽‍💻 Check aactual reeplacement and speelling in this sentencee please\(ending)"
             engine.onTextContextChanged(precedingText: text, appName: "TextEdit", bundleId: "com.apple.TextEdit")
             try await Task.sleep(for: .milliseconds(30))
@@ -303,5 +303,26 @@ final class CompletionQualityTests: XCTestCase {
             XCTAssertGreaterThan(acceptedCount, 0, "No completion for \(seed)")
             engine.dismiss()
         }
+        for seed in ["The CSS navbar needs to ", "The async function returns ", "The React component should ",
+                     "I ", "The code works. "] {
+            let progress = StreamObservations()
+            let context = PromptContext(precedingText: seed, appName: "TextEdit",
+                                        bundleIdentifier: "com.apple.TextEdit", maxWords: 7)
+            let (completion, latency) = try await EmbeddedLocalProvider(allowFallback: false)
+                .complete(context: context, settings: settings) { text, milliseconds in
+                    await progress.record(text, milliseconds)
+                }
+            let observations = await progress.values
+            XCTAssertFalse(completion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, seed)
+            XCTAssertFalse(observations.isEmpty, "Expected streamed words for \(seed)")
+            XCTAssertFalse(completion.lowercased().contains("nabber"))
+            if seed == "I " { XCTAssertFalse(completion.hasPrefix("I'm")) }
+            print("REAL STREAM first \(observations.first?.1 ?? -1) ms / final \(latency) ms: \(seed)\(completion)")
+        }
     }
+}
+
+private actor StreamObservations {
+    var values: [(String, Int)] = []
+    func record(_ text: String, _ milliseconds: Int) { values.append((text, milliseconds)) }
 }

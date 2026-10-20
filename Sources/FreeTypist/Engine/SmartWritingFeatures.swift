@@ -374,122 +374,23 @@ public struct SmartWritingFeatures: Sendable {
             }
         }
 
-        // For 2-letter words like "im", only trigger after space or if it's an exact contraction
-        if word.count < 3 && !hasTrailingSingleSpace && lower != "im" {
-            return nil
-        }
-        if lower == "ty" && !hasTrailingSingleSpace {
-            return nil
-        }
-
-        // 1. Instant curated typo & contraction lookup
-        if let fixed = fastCommonTypos[lower] {
-            let casedFixed = fixed.contains("I'") ? fixed : preserveCase(original: word, replacement: fixed)
-            guard casedFixed != word else { return nil }
-            return AutocorrectSuggestion(
-                misspelledWord: word,
-                correctedWord: casedFixed + suffixSpace,
-                replacementLength: repLen
-            )
-        }
-
-        guard word.count >= 4 else { return nil }
-        let checker = NSSpellChecker.shared
-        let spellRange = checker.checkSpelling(of: word, startingAt: 0, language: "en_GB",
-                                              wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
-        guard spellRange.location != NSNotFound else {
-            return nil // Word is spelled correctly
-        }
-
-        // Prefer repairing a repeated keystroke to a guess that changes the word.
-        if let fixed = repeatedKeystrokeCorrection(word) {
-            return AutocorrectSuggestion(misspelledWord: word, correctedWord: fixed + suffixSpace,
-                                         replacementLength: word.count + suffixSpace.count)
-        }
-        let fullRange = NSRange(location: 0, length: word.utf16.count)
+        // "im" may still become "important". Repair missing apostrophes only
+        // once the word is finished, and never change a valid word's meaning.
         if !hasTrailingSingleSpace,
-           !(checker.completions(forPartialWordRange: fullRange, in: word,
-                                 language: "en_GB", inSpellDocumentWithTag: 0) ?? []).isEmpty {
-            return nil
+           word.count < 3 || fastCommonTypos[lower]?.contains("'") == true { return nil }
+        let wordRange = NSRange(location: trimmed.utf16.count - word.utf16.count, length: word.utf16.count)
+        guard let fixed = completedWordCorrection(word, ignoredWords: ignoredWords,
+                                                  context: precedingText, wordRange: wordRange) else { return nil }
+        if !hasTrailingSingleSpace, fastCommonTypos[lower] == nil {
+            // Do not mistake a short unfinished word or identifier for a typo.
+            let clearLongTypo = word.count >= 8 && !hasTechnicalContext(precedingText)
+                && editDistance(lower, fixed.lowercased()) == 1
+                && (NSSpellChecker.shared.completions(forPartialWordRange: NSRange(location: 0, length: word.utf16.count),
+                    in: word, language: "en_GB", inSpellDocumentWithTag: 0) ?? []).isEmpty
+            guard repeatedKeystrokeCorrection(word) == fixed || clearLongTypo else { return nil }
         }
-
-        // 2. Stutter / Doubled-Prefix Detector (e.g., "expeexperience" -> "experience", "recreceive" -> "receive")
-        if word.count >= 6 {
-            for prefixLen in 2...min(5, word.count / 2) {
-                let firstPart = lower.prefix(prefixLen)
-                let remainder = String(lower.dropFirst(prefixLen))
-                if remainder.hasPrefix(firstPart) && remainder.count >= 4 {
-                    let checkRem = checker.checkSpelling(of: remainder, startingAt: 0)
-                    if checkRem.location == NSNotFound {
-                        let cased = preserveCase(original: word, replacement: remainder)
-                        return AutocorrectSuggestion(
-                            misspelledWord: word,
-                            correctedWord: cased + suffixSpace,
-                            replacementLength: repLen
-                        )
-                    }
-                }
-            }
-        }
-
-        // 3. Accidental trailing extra letter on a valid word (e.g. "focuso" -> "focus", "workk" -> "work")
-        if word.count >= 5 {
-            let droppedLast = String(word.dropLast())
-            let checkDropped = checker.checkSpelling(of: droppedLast, startingAt: 0)
-            // Only suggest dropping the last letter if the user finished the word (pressed space) OR the current stem cannot be completed into any valid English word
-            if checkDropped.location == NSNotFound {
-                let nsWord = word as NSString
-                let completions = checker.completions(forPartialWordRange: NSRange(location: 0, length: nsWord.length), in: word, language: "en", inSpellDocumentWithTag: 0) ?? []
-                if hasTrailingSingleSpace || completions.isEmpty {
-                    return AutocorrectSuggestion(
-                        misspelledWord: word,
-                        correctedWord: droppedLast + suffixSpace,
-                        replacementLength: repLen
-                    )
-                }
-            }
-        }
-
-        // A lack of dictionary completions does not make an unfinished name or
-        // host query a spelling mistake. Wait for a word boundary before guessing.
-        guard hasTrailingSingleSpace || (tokens.count >= 2 && word.count >= 6 && word.first?.isUppercase != true) else { return nil }
-
-        // 4. macOS NSSpellChecker direct correction
-        if let correction = checker.correction(
-            forWordRange: fullRange,
-            in: word,
-            language: "en_GB",
-            inSpellDocumentWithTag: 0
-        ), correction.lowercased() != lower {
-            return AutocorrectSuggestion(
-                misspelledWord: word,
-                correctedWord: preserveCase(original: word, replacement: correction) + suffixSpace,
-                replacementLength: repLen
-            )
-        }
-
-        // 5. macOS NSSpellChecker guesses ranked by edit distance (catches transpositions & 1-2 char typos)
-        if let guesses = checker.guesses(forWordRange: fullRange, in: word, language: "en_GB", inSpellDocumentWithTag: 0),
-           !guesses.isEmpty {
-            // Only trigger mid-word if no valid word starts with `word`
-            let possibleCompletions = checker.completions(forPartialWordRange: fullRange, in: word, language: "en", inSpellDocumentWithTag: 0) ?? []
-            if hasTrailingSingleSpace || possibleCompletions.isEmpty {
-                for guess in guesses.prefix(5) {
-                    let gLower = guess.lowercased()
-                    guard !gLower.contains(" ") && !gLower.contains("-") else { continue }
-                    let dist = editDistance(lower, gLower)
-                    if dist <= 2 && gLower.first == lower.first {
-                        return AutocorrectSuggestion(
-                            misspelledWord: word,
-                            correctedWord: preserveCase(original: word, replacement: guess) + suffixSpace,
-                            replacementLength: repLen
-                        )
-                    }
-                }
-            }
-        }
-
-        return nil
+        return AutocorrectSuggestion(misspelledWord: word, correctedWord: fixed + suffixSpace,
+                                     replacementLength: repLen)
     }
 
     /// More conservative than an explicitly accepted inline suggestion.
@@ -505,18 +406,30 @@ public struct SmartWritingFeatures: Sendable {
 
     @MainActor
     static func completedWordCorrection(_ word: String, ignoredWords: Set<String> = [],
-                                        feedback: [String: SpellingFeedback] = [:]) -> String? {
+                                        feedback: [String: SpellingFeedback] = [:],
+                                        context: String? = nil, wordRange: NSRange? = nil) -> String? {
         // Consult preferences before the cache so rejecting or forgetting a word
         // takes effect immediately, including in already checked paragraphs.
         if let key = AppSettings.spellingKey(word), ignoredWords.contains(key) { return nil }
+        let fullText = (context ?? word) as NSString
+        let fullRange = wordRange ?? NSRange(location: 0, length: word.utf16.count)
+        guard fullRange.location >= 0, fullRange.location <= fullText.length,
+              fullRange.length >= 0, fullRange.length <= fullText.length - fullRange.location,
+              fullText.substring(with: fullRange) == word else { return nil }
+        let start = max(0, fullRange.location - 240)
+        let end = min(fullText.length, NSMaxRange(fullRange) + 240)
+        let window = fullText.rangeOfComposedCharacterSequences(for: NSRange(location: start, length: end - start))
+        let text = fullText.substring(with: window)
+        let range = NSRange(location: fullRange.location - window.location, length: fullRange.length)
+        let cacheKey = "\(word)\u{1e}\(range.location)\u{1e}\(text)"
         let now = Date()
-        if let cached = completedWordCache[word], now.timeIntervalSince(cached.checkedAt) < 60 {
+        if let cached = completedWordCache[cacheKey], now.timeIntervalSince(cached.checkedAt) < 60 {
             return cached.correction.flatMap { allowsCorrection(word, correction: $0, feedback: feedback) ? $0 : nil }
         }
-        let correction = uncachedCompletedWordCorrection(word)
+        let correction = uncachedCompletedWordCorrection(word, context: text, wordRange: range)
         // Keep only a small, short-lived in-memory vocabulary. Nothing is persisted.
         if completedWordCache.count >= 512 { completedWordCache.removeAll(keepingCapacity: true) }
-        completedWordCache[word] = (correction, now)
+        completedWordCache[cacheKey] = (correction, now)
         return correction.flatMap { allowsCorrection(word, correction: $0, feedback: feedback) ? $0 : nil }
     }
 
@@ -539,7 +452,7 @@ public struct SmartWritingFeatures: Sendable {
     }
 
     @MainActor
-    private static func uncachedCompletedWordCorrection(_ word: String) -> String? {
+    private static func uncachedCompletedWordCorrection(_ word: String, context: String, wordRange: NSRange) -> String? {
         guard (2...48).contains(word.count),
               word.allSatisfy({ $0.isLetter }),
               word.dropFirst().allSatisfy({ !$0.isUppercase }) else { return nil }
@@ -552,20 +465,47 @@ public struct SmartWritingFeatures: Sendable {
         // These valid words and informal abbreviations must not be rewritten automatically.
         let ambiguous = ["ill", "id", "form", "fro", "lets", "wont", "were", "well", "its",
                          "cant", "thats", "therefor", "pls", "plz", "thx", "ty"]
-        guard !ambiguous.contains(lower) else { return nil }
+        guard !ambiguous.contains(lower), !developerTerms.contains(lower), !isWord(word) else { return nil }
         if let fixed = fastCommonTypos[lower], fixed != lower {
             return fixed.contains("I'") ? fixed : preserveCase(original: word, replacement: fixed)
         }
-        guard word.count >= 4, !isWord(word) else { return nil }
+        guard word.count >= 4 else { return nil }
 
         if let fixed = repeatedKeystrokeCorrection(word) { return fixed }
         // Do not guess at unfamiliar capitalised names.
         guard word.first?.isUppercase != true,
-              let fixed = checker.correction(forWordRange: NSRange(location: 0, length: word.utf16.count),
-                  in: word, language: "en_GB", inSpellDocumentWithTag: 0),
+              let fixed = checker.correction(forWordRange: wordRange,
+                  in: context, language: "en_GB", inSpellDocumentWithTag: 0),
               fixed.allSatisfy(\.isLetter), fixed.lowercased() != lower,
               fixed.first == word.first, editDistance(lower, fixed.lowercased()) <= 2 else { return nil }
+        // A general dictionary is not evidence that an unfamiliar code term is
+        // wrong. In technical prose keep only clear transpositions at this stage;
+        // curated typos and repeated-key repairs have already been handled.
+        if hasTechnicalContext(context), !isAdjacentTransposition(lower, fixed.lowercased()) { return nil }
         return fixed
+    }
+
+    private static let developerTerms: Set<String> = [
+        "navbar", "navbars", "frontend", "backend", "middleware", "webhook", "webhooks",
+        "onclick", "onchange", "foreach", "keyof", "typeof", "usememo", "useeffect", "usestate",
+        "tailwind", "nextjs", "vite", "npm", "pnpm", "graphql", "jsonb", "prisma", "zustand",
+        "devtools", "unmount", "rerender", "autofocus", "aria", "href", "src", "div", "tbody",
+        "flexbox", "css", "html", "jsx", "tsx", "sql", "api", "cli"
+    ]
+
+    private static func hasTechnicalContext(_ text: String) -> Bool {
+        let markers: Set<String> = ["code", "function", "variable", "component", "typescript", "javascript",
+                                    "react", "swift", "rust", "database", "repository", "git", "compiler"]
+        let words = Set(text.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
+        return !words.isDisjoint(with: developerTerms) || !words.isDisjoint(with: markers)
+    }
+
+    private static func isAdjacentTransposition(_ original: String, _ replacement: String) -> Bool {
+        let a = Array(original), b = Array(replacement)
+        guard a.count == b.count else { return false }
+        let changed = a.indices.filter { a[$0] != b[$0] }
+        guard changed.count == 2, changed[1] == changed[0] + 1 else { return false }
+        return a[changed[0]] == b[changed[1]] && a[changed[1]] == b[changed[0]]
     }
 
     @MainActor

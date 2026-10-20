@@ -137,14 +137,14 @@ final class SpellingLearningTests: XCTestCase {
         let original = "Check speelling and reeplacement "
         engine.onTextContextChanged(precedingText: original, bundleId: "test.editor")
         XCTAssertTrue(engine.handleEscape())
-        let updated = snapshot(original + "for aactual correcetions today ")
+        let updated = snapshot(original + "for aactual correcetions today.")
         engine.onTextContextChanged(precedingText: updated.text, bundleId: "test.editor")
         XCTAssertEqual(engine.paragraphSpellingSuggestion?.count, 2)
         let acceptance = try XCTUnwrap(engine.prepareAcceptance(nextWord: false))
         let plannedEdit = try XCTUnwrap(acceptance.replacement(in: updated))
         let rechecked = try XCTUnwrap(engine.paragraphCorrection(in: updated))
         XCTAssertEqual(plannedEdit.result.text, rechecked.edit.result.text)
-        XCTAssertEqual(plannedEdit.result.text, original + "for actual corrections today ")
+        XCTAssertEqual(plannedEdit.result.text, original + "for actual corrections today.")
         engine.dismiss()
     }
 
@@ -174,11 +174,11 @@ final class SpellingLearningTests: XCTestCase {
         let (settings, _) = makeSettings()
         settings.learnSpellingPreferences = false
         let engine = CompletionEngine(settings: settings)
-        engine.onTextContextChanged(precedingText: "Please im", bundleId: "test.editor")
-        XCTAssertEqual(engine.activeAutocorrect?.misspelledWord, "im")
+        engine.onTextContextChanged(precedingText: "Please speell", bundleId: "test.editor")
+        XCTAssertEqual(engine.activeAutocorrect?.misspelledWord, "speell")
         XCTAssertTrue(engine.handleEscape())
-        engine.onTextContextChanged(precedingText: "Please immediatly ", bundleId: "test.editor")
-        XCTAssertEqual(engine.activeAutocorrect?.correctedWord, "immediately ")
+        engine.onTextContextChanged(precedingText: "Please speelling ", bundleId: "test.editor")
+        XCTAssertEqual(engine.activeAutocorrect?.correctedWord, "spelling ")
         engine.dismiss()
     }
 

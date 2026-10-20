@@ -2,7 +2,57 @@ import Foundation
 
 public protocol ModelProvider: Sendable {
     func complete(context: PromptContext, settings: AppSettings) async throws -> (text: String, latencyMs: Int)
+    func complete(context: PromptContext, settings: AppSettings,
+                  onProgress: @escaping @Sendable (String, Int) async -> Void) async throws -> (text: String, latencyMs: Int)
     func testConnection(settings: AppSettings) async throws -> (success: Bool, message: String, latencyMs: Int)
+}
+
+public extension ModelProvider {
+    func complete(context: PromptContext, settings: AppSettings,
+                  onProgress: @escaping @Sendable (String, Int) async -> Void) async throws -> (text: String, latencyMs: Int) {
+        try await complete(context: context, settings: settings)
+    }
+}
+
+/// Accumulates llama.cpp's event stream. Only complete words reach the editor.
+struct CompletionStream {
+    private(set) var rawText = ""
+    private(set) var finished = false
+    private(set) var truncated = false
+
+    mutating func consume(_ line: String) throws {
+        guard line.hasPrefix("data:") else { return }
+        let data = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+        if data == "[DONE]" { finished = true; return }
+        guard !data.isEmpty else { return }
+        let json = try JSONSerialization.jsonObject(with: Data(data.utf8)) as? [String: Any]
+        if json?["error"] != nil { throw URLError(.badServerResponse) }
+        guard let choice = (json?["choices"] as? [[String: Any]])?.first else { return }
+        if let content = (choice["delta"] as? [String: Any])?["content"] as? String { rawText += content }
+        if let reason = choice["finish_reason"] as? String {
+            finished = true
+            truncated = reason == "length"
+        }
+    }
+
+    func completion(context: PromptContext) -> String {
+        var content = rawText
+        if let prefill = PromptBuilder.completionMessages(context: context).last, prefill["role"] == "assistant",
+           let draft = prefill["content"], !draft.isEmpty {
+            if !finished, draft.hasPrefix(content) { return "" }
+            if content.hasPrefix(draft) { content = String(content.dropFirst(draft.count)) }
+        }
+        if !finished {
+            // A token is not a word: "100" can still become "1000", and a
+            // Unicode character can arrive in several model tokens. Publish
+            // only through the last whitespace until the final event.
+            guard let boundary = content.lastIndex(where: \.isWhitespace) else { return "" }
+            content = String(content[...boundary])
+        }
+        return PromptBuilder.cleanCompletionText(content, precedingText: context.precedingText,
+            maxWords: context.maxWords, truncated: truncated)
+            .trimmingCharacters(in: .newlines)
+    }
 }
 
 /// Thread-safe LRU cache to avoid redundant LLM calls when backspacing or retyping
@@ -74,6 +124,11 @@ public struct EmbeddedLocalProvider: ModelProvider {
     }
 
     public func complete(context: PromptContext, settings: AppSettings) async throws -> (text: String, latencyMs: Int) {
+        try await complete(context: context, settings: settings, onProgress: { _, _ in })
+    }
+
+    public func complete(context: PromptContext, settings: AppSettings,
+                         onProgress: @escaping @Sendable (String, Int) async -> Void) async throws -> (text: String, latencyMs: Int) {
         try Task.checkCancellation()
         let modelIdentity = await MainActor.run {
             LocalInferenceService.shared.currentLoadedModelPath ?? LocalModelManager.shared.selectedModel.id
@@ -127,49 +182,45 @@ public struct EmbeddedLocalProvider: ModelProvider {
             "reasoning_format": "none",
             "chat_template_kwargs": ["enable_thinking": false],
             "stop": ["\n\n", "<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<turn|>"],
-            "stream": false
+            "stream": true
         ]
 
+        var lastShown = ""
+        func elapsedMilliseconds() -> Int {
+            Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
+        }
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
             try Task.checkCancellation()
-            let endTime = DispatchTime.now()
-            let latencyMs = Int((endTime.uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
 
             guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                bytes.task.cancel()
                 return try await fallback(context: context, settings: settings)
             }
 
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let choices = json["choices"] as? [[String: Any]],
-               let firstChoice = choices.first,
-               let message = firstChoice["message"] as? [String: Any] {
-                var rawContent = (message["content"] as? String) ?? ""
-                // Some llama.cpp templates include the assistant prefill in the response.
-                if let draft = PromptBuilder.completionMessages(context: context).last?["content"],
-                   !draft.isEmpty, rawContent.hasPrefix(draft) {
-                    rawContent = String(rawContent.dropFirst(draft.count))
+            defer { bytes.task.cancel() }
+            var stream = CompletionStream()
+            for try await line in bytes.lines {
+                try Task.checkCancellation()
+                try stream.consume(line)
+                let partial = stream.completion(context: context)
+                if !partial.trimmingCharacters(in: .whitespaces).isEmpty, partial != lastShown {
+                    lastShown = partial
+                    await onProgress(partial, elapsedMilliseconds())
                 }
-                let cleaned = PromptBuilder.cleanCompletionText(
-                    rawContent,
-                    precedingText: context.precedingText,
-                    maxWords: context.maxWords,
-                    truncated: firstChoice["finish_reason"] as? String == "length"
-                )
-
-                if !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    if allowFallback { CompletionLRUCache.shared.set(cleaned, forKey: cacheKey) }
-                    return (cleaned, latencyMs)
-                }
+                if stream.finished { break }
             }
-
+            try Task.checkCancellation()
+            let cleaned = stream.completion(context: context)
+            if allowFallback, !cleaned.isEmpty { CompletionLRUCache.shared.set(cleaned, forKey: cacheKey) }
             // An empty or rejected model result means there is no useful suggestion.
             // Do not replace it with an unrelated memorised phrase.
-            return ("", latencyMs)
+            return (cleaned, elapsedMilliseconds())
         } catch {
             try Task.checkCancellation()
             if !allowFallback { throw error }
+            if !lastShown.isEmpty { return (lastShown, elapsedMilliseconds()) }
             return try await fallback(context: context, settings: settings)
         }
     }

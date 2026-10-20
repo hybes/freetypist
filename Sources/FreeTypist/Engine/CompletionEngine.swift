@@ -221,8 +221,18 @@ public final class CompletionEngine: ObservableObject {
         }
 
         // Spelling is local and does not wait for the AI completion debounce.
+        let trimmed = precedingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sentenceEnded = trimmed.last.map { ".!?".contains($0) } ?? false
         let atWordBoundary = precedingText.last.map { $0.isWhitespace || ".!?,;:".contains($0) } ?? false
-        let paragraph = atWordBoundary && settings.showSuggestedTypoFixes && !appDisablesAutocorrect
+        let inlineCorrection = !appDisablesAutocorrect
+            && (settings.hideCompletionsOnSuspectedTypo || settings.showSuggestedTypoFixes)
+            ? SmartWritingFeatures.detectAutocorrect(in: precedingText, ignoredWords: settings.rememberedSpellings,
+                feedback: settings.activeSpellingFeedback) : nil
+        // Earlier mistakes must not monopolise every pause while the user writes
+        // the rest of the sentence. Offer the batch at sentence end, or alongside
+        // a correction to the word just typed.
+        let paragraph = atWordBoundary && (sentenceEnded || inlineCorrection != nil)
+            && settings.showSuggestedTypoFixes && !appDisablesAutocorrect
             ? paragraphCorrection(in: TextInputSnapshot(identity: 0,
                 text: precedingText + followingText, selection: NSRange(location: precedingText.utf16.count, length: 0)))
             : nil
@@ -233,8 +243,7 @@ public final class CompletionEngine: ObservableObject {
 
         // 2. Check Inline Autocorrect
         if !appDisablesAutocorrect && (settings.hideCompletionsOnSuspectedTypo || settings.showSuggestedTypoFixes) {
-            if let typoFix = SmartWritingFeatures.detectAutocorrect(in: precedingText, ignoredWords: settings.rememberedSpellings,
-                feedback: settings.activeSpellingFeedback),
+            if let typoFix = inlineCorrection,
                !isDismissedInlineCorrection(typoFix, precedingText: precedingText, fullText: fullText) {
                 activeTask?.cancel()
                 if settings.showSuggestedTypoFixes {
@@ -281,8 +290,8 @@ public final class CompletionEngine: ObservableObject {
             return
         }
 
-        let trimmed = precedingText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !force, let last = trimmed.last, ".!?".contains(last) {
+        if !force, sentenceEnded,
+           precedingText.last?.isWhitespace != true || precedingText.last?.isNewline == true {
             let id = requestID
             let delay = max(0, settings.debounceMs)
             activeTask = Task { [weak self] in
@@ -294,7 +303,7 @@ public final class CompletionEngine: ObservableObject {
             }
             return
         }
-        if trimmed.count < settings.minTriggerCharacters && !force {
+        if !force, trimmed.isEmpty || precedingText.count < settings.minTriggerCharacters {
             dismiss()
             return
         }
@@ -305,9 +314,7 @@ public final class CompletionEngine: ObservableObject {
                 let typedSuffix = String(precedingText.dropFirst(previousText.count))
                 if current.remainingText.hasPrefix(typedSuffix) {
                     let newRemaining = String(current.remainingText.dropFirst(typedSuffix.count))
-                    if newRemaining.isEmpty {
-                        dismiss()
-                    } else {
+                    if !newRemaining.isEmpty {
                         self.currentSuggestion = CompletionItem(
                             fullText: newRemaining,
                             providerName: current.providerName,
@@ -315,8 +322,10 @@ public final class CompletionEngine: ObservableObject {
                             replacementLength: 0
                         )
                         self.lastRequestedText = precedingText
+                        return
                     }
-                    return
+                    // The writer typed the whole suggestion themselves. Request
+                    // its continuation instead of stopping until another key.
                 }
             }
         }
@@ -377,37 +386,19 @@ public final class CompletionEngine: ObservableObject {
             self.lastError = nil
 
             do {
-                let (completionText, latency) = try await provider.complete(context: context, settings: self.settings)
+                let (completionText, latency) = try await provider.complete(context: context, settings: self.settings) {
+                    [weak self] partial, latency in
+                    await self?.offerPrediction(partial, latency: latency, request: id)
+                }
 
                 guard !Task.isCancelled, self.requestID == id else { return }
                 self.isGenerating = false
-                self.lastLatencyMs = latency
-
-                let cleaned = completionText.trimmingCharacters(in: .newlines)
-                if !cleaned.isEmpty {
-                    let alreadyShown = self.currentSuggestion?.remainingText == cleaned
-                    let source = self.settings.activeProvider == .localEmbedded && latency <= 3
-                        ? "Instant Predictor / Local Cache" : self.settings.activeProvider.rawValue
-                    self.currentSuggestion = CompletionItem(
-                        fullText: cleaned,
-                        providerName: source,
-                        latencyMs: latency,
-                        replacementLength: 0
-                    )
-                    if !alreadyShown { self.stats.recordShown(latencyMs: latency, fromCache: latency <= 3) }
-
-                    if self.settings.enableWordAlternatives {
-                        self.activeWordAlternatives = SmartWritingFeatures.generateWordAlternatives(
-                            primarySuggestion: cleaned,
-                            precedingText: precedingText,
-                            tone: tone
-                        )
-                    } else {
-                        self.activeWordAlternatives = []
-                    }
+                offerPrediction(completionText, latency: latency, request: id)
+                if settings.enableWordAlternatives, let currentSuggestion {
+                    activeWordAlternatives = SmartWritingFeatures.generateWordAlternatives(
+                        primarySuggestion: currentSuggestion.remainingText, precedingText: precedingText, tone: tone)
                 } else {
-                    self.currentSuggestion = nil
-                    self.activeWordAlternatives = []
+                    activeWordAlternatives = []
                 }
             } catch {
                 guard !Task.isCancelled, self.requestID == id else { return }
@@ -417,6 +408,25 @@ public final class CompletionEngine: ObservableObject {
                 self.activeWordAlternatives = []
             }
         }
+    }
+
+    private func offerPrediction(_ text: String, latency: Int, request: UUID) {
+        guard requestID == request, !Task.isCancelled else { return }
+        let cleaned = text.trimmingCharacters(in: .newlines)
+        guard !cleaned.trimmingCharacters(in: .whitespaces).isEmpty else {
+            currentSuggestion = nil
+            return
+        }
+        let firstOffer = currentSuggestion == nil
+        guard currentSuggestion?.remainingText != cleaned else { return }
+        let source = settings.activeProvider == .localEmbedded && latency <= 3
+            ? "Instant Predictor / Local Cache" : settings.activeProvider.rawValue
+        if firstOffer {
+            lastLatencyMs = latency
+            stats.recordShown(latencyMs: latency, fromCache: latency <= 3)
+        }
+        currentSuggestion = CompletionItem(fullText: cleaned, providerName: source,
+                                          latencyMs: lastLatencyMs, replacementLength: 0)
     }
 
     struct PreparedAcceptance {

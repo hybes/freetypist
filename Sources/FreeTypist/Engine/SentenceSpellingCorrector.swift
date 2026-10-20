@@ -50,7 +50,8 @@ enum SentenceSpellingCorrector {
         let absoluteRange = NSRange(location: paragraphRange.location + match.range.location, length: match.range.length)
         guard !ignoredRanges.contains(where: { NSIntersectionRange($0, absoluteRange).length > 0 }) else { return nil }
         let word = (paragraph as NSString).substring(with: match.range)
-        guard let fixed = SmartWritingFeatures.completedWordCorrection(word, ignoredWords: ignoredWords, feedback: feedback),
+        guard let fixed = SmartWritingFeatures.completedWordCorrection(word, ignoredWords: ignoredWords, feedback: feedback,
+            context: paragraph, wordRange: match.range),
               fixed != word else { return nil }
         return TextReplacement(original: snapshot,
             range: absoluteRange, insertion: fixed)
@@ -77,7 +78,8 @@ enum SentenceSpellingCorrector {
             let absoluteRange = NSRange(location: offset + match.range.location, length: match.range.length)
             guard !ignoredRanges.contains(where: { NSIntersectionRange($0, absoluteRange).length > 0 }) else { continue }
             let word = nsText.substring(with: match.range)
-            guard let fixed = SmartWritingFeatures.completedWordCorrection(word, ignoredWords: ignoredWords, feedback: feedback),
+            guard let fixed = SmartWritingFeatures.completedWordCorrection(word, ignoredWords: ignoredWords, feedback: feedback,
+                context: paragraph, wordRange: match.range),
                   fixed != word else { continue }
             changes.append((match.range, fixed))
         }

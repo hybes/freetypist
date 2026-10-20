@@ -71,10 +71,13 @@ public struct PromptBuilder {
 
     public static func buildSystemPrompt(context: PromptContext) -> String {
         var instructions: [String] = []
+        let task = startsNewSentence(context)
+            ? "Write the next sentence of the writer's draft in its existing language and style."
+            : "Complete the unfinished sentence in its existing language and style."
 
         instructions.append("""
         You are FreeTypist, an on-device inline autocomplete engine for macOS.
-        Complete the unfinished sentence in its existing language and style. Output only the missing words, at most \(context.maxWords). Finish a partial word first if needed. Do not reply to the writer. Do not repeat the input, explain, add quotes, or output reasoning.
+        \(task) Output only the missing words, at most \(context.maxWords). Finish a partial word first if needed. Do not reply to the writer. Do not repeat the input, explain, add quotes, or output reasoning.
         """)
 
         if !context.appName.isEmpty {
@@ -98,6 +101,11 @@ public struct PromptBuilder {
 
         instructions.append("Continue the draft directly from its final character. Use background only when relevant; never copy a writing example or a previous sentence. Stop at the end of the sentence.")
         return instructions.joined(separator: "\n\n")
+    }
+
+    private static func startsNewSentence(_ context: PromptContext) -> Bool {
+        context.precedingText.last?.isWhitespace == true
+            && context.precedingText.trimmingCharacters(in: .whitespacesAndNewlines).last.map({ ".!?".contains($0) }) == true
     }
 
     public static func buildUserPrompt(context: PromptContext, includeDraft: Bool = true) -> String {
@@ -131,8 +139,21 @@ public struct PromptBuilder {
     /// llama.cpp b11669 continues a final assistant message rather than opening
     /// a new reply. This anchors small instruct models to the actual draft.
     static func completionMessages(context: PromptContext) -> [[String: String]] {
+        if startsNewSentence(context) {
+            // Prefilling a complete assistant sentence encourages immediate EOS.
+            // Supply the finished draft as context when starting its next sentence.
+            return [
+                ["role": "system", "content": buildSystemPrompt(context: context)],
+                ["role": "user", "content": buildUserPrompt(context: context)]
+            ]
+        }
         let prefix = String(context.precedingText.suffix(700))
-        let draft = AppSettings.shared.sanitizeSecretsLocally ? SecretSanitizer.sanitize(prefix).sanitized : prefix
+        // Space-prefixed word tokens must remain available to the model. A
+        // literal trailing space in the prefill splits that token boundary and
+        // biases the next token towards numbers/symbols. Output normalisation
+        // still uses the exact cursor text, so no user whitespace is removed.
+        let trimmed = String(prefix.reversed().drop(while: \.isWhitespace).reversed())
+        let draft = AppSettings.shared.sanitizeSecretsLocally ? SecretSanitizer.sanitize(trimmed).sanitized : trimmed
         return [
             ["role": "system", "content": buildSystemPrompt(context: context)],
             ["role": "user", "content": buildUserPrompt(context: context, includeDraft: false)],
@@ -208,6 +229,18 @@ public struct PromptBuilder {
             }
         }
 
+        // A prediction may append words, but must not turn a complete pronoun
+        // into a different word ("I" + "'m"). An apostrophe the user already
+        // typed is different: "I'" + "m ready" remains a valid completion.
+        let lastWord = String(precedingText.split(whereSeparator: \.isWhitespace).last ?? "")
+        let pronouns: Set<String> = ["i", "you", "he", "she", "it", "we", "they", "that", "there", "who"]
+        if pronouns.contains(lastWord.lowercased()) {
+            let contraction = #"['’](?:m|s|d|re|ve|ll)\b"#
+            let repeatedPronoun = NSRegularExpression.escapedPattern(for: lastWord)
+            if text.range(of: #"^\s*(?:"# + repeatedPronoun + ")?" + contraction,
+                          options: [.regularExpression, .caseInsensitive]) != nil { return "" }
+        }
+
         // 5. Strip the longest repeated suffix at a word boundary. Small local models
         // sometimes echo several words of the prompt before their continuation.
         let trimmedPreceding = precedingText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -232,7 +265,7 @@ public struct PromptBuilder {
 
         // 7. Enforce word count cap from Cotypist completionLength setting
         var chunks = text.split(whereSeparator: \.isWhitespace)
-        if truncated, chunks.count <= maxWords, text.last?.isLetter == true {
+        if truncated, chunks.count <= maxWords, text.last.map({ $0.isLetter || $0.isNumber }) == true {
             // A token budget can cut through a word. Keep only completed words.
             guard chunks.count > 1, let last = chunks.last else { return "" }
             text = String(text[..<last.startIndex]).trimmingCharacters(in: .newlines)
@@ -268,8 +301,10 @@ public struct PromptBuilder {
         } else if !wasCodeBlock && !text.isEmpty && text.first?.isLetter == true && !precedingText.isEmpty {
             // Add leading space if starting a new word after a completed word
             let lastPrecedingWord = String(precedingText.split(whereSeparator: \.isWhitespace).last ?? "")
-            if precedingText.last?.isLetter != true ||
-                !OfflinePredictor.isLikelyPartialWordContinuation(stem: lastPrecedingWord, continuation: text) {
+            let completesTypedApostrophe = precedingText.last.map { "'’".contains($0) } == true
+                && text.range(of: #"^(?:m|s|d|re|ve|ll|t)\b"#, options: .regularExpression) != nil
+            if !completesTypedApostrophe && (precedingText.last?.isLetter != true ||
+                !OfflinePredictor.isLikelyPartialWordContinuation(stem: lastPrecedingWord, continuation: text)) {
                 text = " " + text
             }
         }
