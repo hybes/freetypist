@@ -1,6 +1,7 @@
 import SwiftUI
 
 public struct GhostTextView: View {
+    @ObservedObject private var replacementFeedback = ReplacementFeedback.shared
     @ObservedObject var engine = CompletionEngine.shared
     @ObservedObject var settings = AppSettings.shared
 
@@ -13,7 +14,12 @@ public struct GhostTextView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            if let typo = engine.activeAutocorrect {
+            if let message = replacementFeedback.message {
+                Text(message)
+                    .font(.system(size: effectiveFontSize))
+                    .padding(5)
+                    .background(Color(nsColor: .textBackgroundColor))
+            } else if let typo = engine.activeAutocorrect {
                 // Inline Autocorrect Strikethrough Red + Correction Green
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(typo.misspelledWord)

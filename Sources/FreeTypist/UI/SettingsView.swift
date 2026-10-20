@@ -161,6 +161,16 @@ public struct SettingsView: View {
 
                     Divider()
 
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Check sentence spelling when I press Enter", isOn: $settings.correctSentenceOnEnter)
+                        Text("At the end of a paragraph, Enter fixes clear spelling mistakes. Review the changes, then press Enter again to send or start a new line. Shift–Enter keeps its usual behaviour.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Divider()
+
                     HStack(spacing: 16) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Completion length")

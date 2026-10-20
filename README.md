@@ -57,6 +57,10 @@ New installations select **Qwen 3.5 2B** on Macs with at least 16 GB RAM, or **Q
 
 FreeTypist detects Cotypist while it is running and offers **Quit Cotypist** in Setup and General. It requests a normal quit and reports a refusal or a pending dialog. To stop Cotypist reopening at login, disable its own **Launch automatically at login** option or use **Manage Login Items…** in General.
 
+**Check sentence spelling when I press Enter** is an optional General setting. At the end of a paragraph, the first unmodified Enter corrects clear spelling mistakes in that paragraph and leaves the text for review. Press Enter again to send or insert a newline. When there are no corrections, Enter behaves normally. Shift–Enter and other modified Enter shortcuts retain their usual behaviour. The check uses the local British English spellchecker, preserves spacing and punctuation, and avoids URLs, code and ambiguous valid words. It is a spelling check, not a grammar rewrite.
+
+Sentence checking requires a readable text field with a verified selection. It skips selected text, mid-line cursors, secure/excluded fields and paragraphs longer than 2,000 UTF-16 units. Inline replacements and sentence corrections verify the exact field, original text, selection and result; if these change, the edit stops. Long replacements require the field to support an atomic Accessibility write, so an interrupted keyboard fallback cannot truncate the original. Unsupported fields show a notice if an attempted replacement cannot be confirmed. No clipboard contents are replaced. Apps determine their own undo and rich-text behaviour; Playground supports undo as one edit.
+
 Run `make test` for the regression suite. The tests use isolated settings and files. `FreeTypist --test-local-engine` waits for the selected model to load and checks a completion; it exits with an error if the engine cannot start.
 
 ## Downloads and updates
@@ -80,7 +84,7 @@ Audit of the supplied Cotypist 2026.5 screenshots against FreeTypist's code on 2
 | Area | FreeTypist status |
 | --- | --- |
 | Setup | Resumable wizard, real model test and live Accessibility/keyboard-hook checks. Cotypist conflict detection and normal quit request. macOS's built-in text-suggestion setting is not part of the wizard. |
-| Core typing | Inline suggestions, spelling fixes, typo suppression, mid-line completion and completion length are implemented and exposed. |
+| Core typing | Inline suggestions, spelling fixes, typo suppression, mid-line completion and completion length are implemented and exposed. Optional Enter-to-check paragraph spelling, with a second Enter to send or insert a newline. |
 | Model selection | Qwen 3.5 and older Qwen/Llama options. Hardware-based recommendation and verified downloads. Gemma is not yet offered or benchmarked against Qwen. |
 | Startup and appearance | Menu-bar app and word count. Launch-at-login is only a saved preference; hiding the menu icon and a separate floating accessory button are missing. |
 | Context | Clipboard and accessible window text are implemented, with a combined toggle. Separate controls, screenshot/OCR context and screenshot-based appearance matching are missing. |

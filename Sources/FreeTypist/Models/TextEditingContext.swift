@@ -10,7 +10,17 @@ struct TextEditingContext {
         let length = (text as NSString).length
         let location = min(max(0, selection.location), length)
         let range = NSRange(location: location, length: min(max(0, selection.length), length - location))
-        self.selection = Range(range, in: text) == nil ? NSRange(location: length, length: 0) : range
+        self.selection = Self.isValidRange(range, in: text) ? range : NSRange(location: length, length: 0)
+    }
+
+    static func isValidRange(_ range: NSRange, in text: String) -> Bool {
+        let length = text.utf16.count
+        guard range.location >= 0, range.length >= 0,
+              range.location <= length, range.length <= length - range.location else { return false }
+        let start = String.Index(utf16Offset: range.location, in: text)
+        let end = String.Index(utf16Offset: NSMaxRange(range), in: text)
+        return (start == text.endIndex || text.indices.contains(start))
+            && (end == text.endIndex || text.indices.contains(end))
     }
 
     var precedingText: String { (text as NSString).substring(to: selection.location) }

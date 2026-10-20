@@ -184,8 +184,6 @@ public struct SmartWritingFeatures: Sendable {
         // Missing apostrophes & contractions
         "im": "I'm",
         "ive": "I've",
-        "id": "I'd",
-        "ill": "I'll",
         "dont": "don't",
         "doesnt": "doesn't",
         "didnt": "didn't",
@@ -245,7 +243,6 @@ public struct SmartWritingFeatures: Sendable {
         "baout": "about",
         "fro": "for",
         "fomr": "from",
-        "form": "from",
         "recieve": "receive",
         "recieved": "received",
         "definately": "definitely",
@@ -368,8 +365,7 @@ public struct SmartWritingFeatures: Sendable {
         if word.count < 3 && !hasTrailingSingleSpace && lower != "im" {
             return nil
         }
-        // Only trigger "ill" / "id" / "form" when followed by a space so mid-word typing ("ideal", "illustrate", "format") is never interrupted
-        if ["ill", "id", "form", "ty"].contains(lower) && !hasTrailingSingleSpace {
+        if lower == "ty" && !hasTrailingSingleSpace {
             return nil
         }
 
@@ -465,6 +461,49 @@ public struct SmartWritingFeatures: Sendable {
         }
 
         return nil
+    }
+
+    /// More conservative than an explicitly accepted inline suggestion.
+    /// Real words, names, abbreviations and code identifiers are left alone.
+    @MainActor
+    static func completedWordCorrection(_ word: String) -> String? {
+        guard (2...48).contains(word.count),
+              word.allSatisfy({ $0.isLetter }),
+              word.dropFirst().allSatisfy({ !$0.isUppercase }) else { return nil }
+        let lower = word.lowercased()
+        let checker = NSSpellChecker.shared
+        func isWord(_ candidate: String) -> Bool {
+            checker.checkSpelling(of: candidate, startingAt: 0, language: "en_GB",
+                                  wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
+        }
+        // These valid words and informal abbreviations must not be rewritten automatically.
+        let ambiguous = ["ill", "id", "form", "fro", "lets", "wont", "were", "well", "its",
+                         "cant", "thats", "therefor", "pls", "plz", "thx", "ty"]
+        guard !ambiguous.contains(lower) else { return nil }
+        if let fixed = fastCommonTypos[lower], fixed != lower {
+            return fixed.contains("I'") ? fixed : preserveCase(original: word, replacement: fixed)
+        }
+        guard word.count >= 4, !isWord(word) else { return nil }
+
+        // Repeated keystrokes: aactual, reeplacement, speelling, sentencee.
+        let letters = Array(lower)
+        var candidates = Set<String>()
+        for index in 1..<letters.count where letters[index] == letters[index - 1] {
+            var shortened = letters
+            shortened.remove(at: index)
+            let candidate = String(shortened)
+            if isWord(candidate) { candidates.insert(candidate) }
+        }
+        if candidates.count == 1, let fixed = candidates.first {
+            return preserveCase(original: word, replacement: fixed)
+        }
+        // Do not guess at unfamiliar capitalised names.
+        guard word.first?.isUppercase != true,
+              let fixed = checker.correction(forWordRange: NSRange(location: 0, length: word.utf16.count),
+                  in: word, language: "en_GB", inSpellDocumentWithTag: 0),
+              fixed.allSatisfy(\.isLetter), fixed.lowercased() != lower,
+              fixed.first == word.first, editDistance(lower, fixed.lowercased()) <= 2 else { return nil }
+        return fixed
     }
 
     private static func editDistance(_ a: String, _ b: String) -> Int {

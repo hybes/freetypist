@@ -14,11 +14,23 @@ public final class GhostAwareNSTextView: NSTextView {
     public var onTabAcceptFull: (() -> Bool)?
     public var onAcceptNextWord: (() -> Bool)?
     public var onEscapeDismiss: (() -> Bool)?
+    public var correctSpellingOnEnter = false
+    public var onSentenceCorrected: ((Int) -> Void)?
+    private var suppressReturnRepeats = false
 
     public override func keyDown(with event: NSEvent) {
+        ReplacementFeedback.shared.clear()
         let keyCode = event.keyCode
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let active = !ghostSuggestion.isEmpty || hasInterceptableAction
+        if (keyCode == 36 || keyCode == 76), event.isARepeat, suppressReturnRepeats { return }
+        if (keyCode == 36 || keyCode == 76),
+           flags.intersection([.command, .control, .option, .shift]).isEmpty,
+           !event.isARepeat, correctSpellingOnEnter, !hasMarkedText(),
+           performSentenceSpellingCheck() {
+            suppressReturnRepeats = true
+            return
+        }
 
         // Tab (keyCode 48)
         if keyCode == 48 && active && !flags.contains(.command) && !flags.contains(.control) {
@@ -40,6 +52,25 @@ public final class GhostAwareNSTextView: NSTextView {
         }
 
         super.keyDown(with: event)
+    }
+
+    public override func keyUp(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 { suppressReturnRepeats = false }
+        super.keyUp(with: event)
+    }
+
+    @discardableResult
+    func performSentenceSpellingCheck() -> Bool {
+        guard correctSpellingOnEnter, !hasMarkedText() else { return false }
+        let snapshot = TextInputSnapshot(identity: UInt(bitPattern: ObjectIdentifier(self)),
+                                         text: string, selection: selectedRange())
+        guard let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
+        insertText(correction.edit.insertion, replacementRange: correction.edit.range)
+        guard string == correction.edit.result.text else { return false }
+        setSelectedRange(correction.edit.result.selection)
+        onSentenceCorrected?(correction.count)
+        ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes"). Press Enter again to continue.")
+        return true
     }
 
     public override func draw(_ dirtyRect: NSRect) {
@@ -104,6 +135,8 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
     public var onTabAcceptFull: () -> Bool
     public var onAcceptNextWord: () -> Bool
     public var onEscapeDismiss: () -> Bool
+    public var correctSpellingOnEnter: Bool = false
+    public var onSentenceCorrected: ((Int) -> Void)?
 
     public func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -141,6 +174,8 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         textView.onTabAcceptFull = onTabAcceptFull
         textView.onAcceptNextWord = onAcceptNextWord
         textView.onEscapeDismiss = onEscapeDismiss
+        textView.correctSpellingOnEnter = correctSpellingOnEnter
+        textView.onSentenceCorrected = onSentenceCorrected
 
         scrollView.documentView = textView
         return scrollView
@@ -162,6 +197,8 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
         textView.onTabAcceptFull = onTabAcceptFull
         textView.onAcceptNextWord = onAcceptNextWord
         textView.onEscapeDismiss = onEscapeDismiss
+        textView.correctSpellingOnEnter = correctSpellingOnEnter
+        textView.onSentenceCorrected = onSentenceCorrected
         textView.needsDisplay = true
     }
 
@@ -192,6 +229,7 @@ public struct PlaygroundEditorRepresentable: NSViewRepresentable {
 }
 
 public struct PlaygroundView: View {
+    @ObservedObject private var replacementFeedback = ReplacementFeedback.shared
     @ObservedObject var settings = AppSettings.shared
     @ObservedObject var modelManager = LocalModelManager.shared
     @ObservedObject var inferenceService = LocalInferenceService.shared
@@ -332,6 +370,10 @@ public struct PlaygroundView: View {
                 onEscapeDismiss: {
                     dismissSuggestion()
                     return true
+                },
+                correctSpellingOnEnter: settings.isEnabled && settings.correctSentenceOnEnter,
+                onSentenceCorrected: { _ in
+                    engine.dismiss()
                 }
             )
             .frame(minHeight: 195, maxHeight: .infinity)
@@ -348,6 +390,10 @@ public struct PlaygroundView: View {
             }
             .onChange(of: selection) { _, _ in
                 generateSuggestion(for: inputText)
+            }
+
+            if let message = replacementFeedback.message {
+                Text(message).font(.caption).foregroundColor(.secondary)
             }
 
             // Clean Action & Correction Bar

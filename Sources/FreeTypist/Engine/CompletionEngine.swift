@@ -362,6 +362,48 @@ public final class CompletionEngine: ObservableObject {
         }
     }
 
+    struct PreparedAcceptance {
+        fileprivate let requestID: UUID
+        let text: String
+        let deleteCount: Int
+        fileprivate let nextWord: Bool
+    }
+
+    func matchesContext(_ context: TextEditingContext, bundleId: String?) -> Bool {
+        canAccept && context.selectedText.isEmpty && lastBundleId == bundleId
+            && lastRequestedText == context.precedingText && lastFollowingText == context.followingText
+    }
+
+    func prepareAcceptance(nextWord: Bool) -> PreparedAcceptance? {
+        guard canAccept else { return nil }
+        let value: (String, Int)
+        var wordOnly = false
+        if let slash = activeSlashCommand { value = (slash.expansion, slash.replacementLength) }
+        else if let emoji = activeEmojiCandidates.first { value = (emoji.emoji, emoji.replacementLength) }
+        else if let typo = activeAutocorrect { value = (typo.correctedWord, typo.replacementLength) }
+        else if let current = currentSuggestion {
+            if nextWord && current.replacementLength == 0 {
+                guard let word = nextWordParts(current) else { return nil }
+                value = (word.accepted, 0)
+                wordOnly = true
+            } else { value = (current.remainingText, current.replacementLength) }
+        } else { return nil }
+        guard !value.0.isEmpty else { return nil }
+        activeTask?.cancel()
+        activeTask = nil
+        isGenerating = false
+        // Invalidate any inference response already on its way back.
+        requestID = UUID()
+        return PreparedAcceptance(requestID: requestID, text: value.0, deleteCount: value.1, nextWord: wordOnly)
+    }
+
+    /// Statistics and learning are updated only after the target confirms the edit.
+    func commitAcceptance(_ acceptance: PreparedAcceptance) {
+        guard requestID == acceptance.requestID else { return }
+        if acceptance.nextWord { _ = acceptNextWord() }
+        else { _ = acceptFull() }
+    }
+
     public func acceptFull() -> (textToInsert: String, deleteBackwardsCount: Int)? {
         guard canAccept else { dismiss(); return nil }
         if let slash = activeSlashCommand {
@@ -409,25 +451,13 @@ public final class CompletionEngine: ObservableObject {
         activeTask = nil
         requestID = UUID()
         isGenerating = false
-        var suggestion = current
-        guard var word = suggestion.advanceOneWord() else {
+        let suggestion = current
+        guard let parts = nextWordParts(current) else {
             dismiss()
             return nil
         }
-
-        if !settings.includeTrailingPunctuationOnWordAccept,
-           let lastChar = word.last,
-           [".", ",", ";", ":", "!", "?"].contains(lastChar),
-           word.count > 1 {
-            word.removeLast()
-        }
-
-        var remaining = suggestion.remainingText
-        if settings.includeTrailingSpaceOnWordAccept {
-            let spacing = String(remaining.prefix(while: { $0.isWhitespace }))
-            word += spacing
-            remaining = String(remaining.dropFirst(spacing.count))
-        }
+        let word = parts.accepted
+        let remaining = parts.remaining
         stats.recordAccepted(text: word, appName: lastAppName, source: suggestion.providerName)
         learning.recordAcceptedCompletion(
             precedingText: lastRequestedText,
@@ -447,6 +477,23 @@ public final class CompletionEngine: ObservableObject {
         }
 
         return word
+    }
+
+    private func nextWordParts(_ current: CompletionItem) -> (accepted: String, remaining: String)? {
+        var suggestion = current
+        guard var word = suggestion.advanceOneWord() else { return nil }
+        var remaining = suggestion.remainingText
+        if !settings.includeTrailingPunctuationOnWordAccept,
+           let last = word.last, [".", ",", ";", ":", "!", "?"].contains(last), word.count > 1 {
+            word.removeLast()
+            // Keep punctuation for a subsequent acceptance instead of losing it.
+            remaining = String(last) + remaining
+        } else if settings.includeTrailingSpaceOnWordAccept {
+            let spacing = String(remaining.prefix(while: \.isWhitespace))
+            word += spacing
+            remaining = String(remaining.dropFirst(spacing.count))
+        }
+        return (word, remaining)
     }
 
     public func acceptAlternative(at index: Int) -> String? {

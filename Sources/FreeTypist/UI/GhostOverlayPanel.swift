@@ -42,10 +42,11 @@ public final class GhostOverlayPanel: NSPanel {
 
     private func setupObservers() {
         CompletionEngine.shared.$currentSuggestion
+            .combineLatest(ReplacementFeedback.shared.$message)
             .receive(on: RunLoop.main)
-            .sink { [weak self] suggestion in
+            .sink { [weak self] suggestion, message in
                 guard let self = self else { return }
-                if let sugg = suggestion, !sugg.remainingText.isEmpty {
+                if message != nil || suggestion?.remainingText.isEmpty == false {
                     self.showOverlay()
                 } else {
                     self.hideOverlay()

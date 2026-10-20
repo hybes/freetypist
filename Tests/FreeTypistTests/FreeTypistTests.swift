@@ -650,11 +650,55 @@ final class FreeTypistTests: XCTestCase {
         XCTAssertTrue(settings.enableEmojiSuggestions)
         XCTAssertFalse(settings.useClipboardContext)
         XCTAssertFalse(settings.trackCrossAppContext)
+        XCTAssertFalse(settings.correctSentenceOnEnter)
         settings.enableEmojiSuggestions = false
         settings.useClipboardContext = true
+        settings.correctSentenceOnEnter = true
         let reloaded = AppSettings(defaults: defaults)
         XCTAssertFalse(reloaded.enableEmojiSuggestions)
         XCTAssertTrue(reloaded.useClipboardContext)
+        XCTAssertTrue(reloaded.correctSentenceOnEnter)
+    }
+
+    @MainActor
+    func testAcceptanceRequiresCurrentContextAndWaitsForConfirmation() throws {
+        let engine = makeEngine()
+        engine.onTextContextChanged(precedingText: "Ship :rocket:", followingText: " today", bundleId: "test.editor")
+        let matching = TextEditingContext(text: "Ship :rocket: today", selection: NSRange(location: 13, length: 0))
+        XCTAssertTrue(engine.matchesContext(matching, bundleId: "test.editor"))
+        XCTAssertFalse(engine.matchesContext(matching, bundleId: "other.editor"))
+        XCTAssertFalse(engine.matchesContext(TextEditingContext(text: "Changed :rocket: today",
+            selection: NSRange(location: 16, length: 0)), bundleId: "test.editor"))
+        let prepared = try XCTUnwrap(engine.prepareAcceptance(nextWord: false))
+        XCTAssertEqual(prepared.text, "🚀")
+        XCTAssertEqual(prepared.deleteCount, 8)
+        XCTAssertNotNil(engine.currentSuggestion)
+        engine.commitAcceptance(prepared)
+        XCTAssertNil(engine.currentSuggestion)
+    }
+
+    @MainActor
+    func testAStaleAcceptanceCannotConsumeANewSuggestion() throws {
+        let engine = makeEngine()
+        engine.onTextContextChanged(precedingText: "Ship :rocket:")
+        let prepared = try XCTUnwrap(engine.prepareAcceptance(nextWord: false))
+        engine.onTextContextChanged(precedingText: "Please dont ")
+        engine.commitAcceptance(prepared)
+        XCTAssertEqual(engine.activeAutocorrect?.correctedWord, "don't ")
+    }
+
+    @MainActor
+    func testSingleWordAcceptanceKeepsDeferredPunctuation() async throws {
+        let engine = makeEngine(provider: StubProvider(text: "help."))
+        AppSettings.shared.includeTrailingPunctuationOnWordAccept = false
+        defer { AppSettings.shared.includeTrailingPunctuationOnWordAccept = true }
+        engine.onTextContextChanged(precedingText: "Thank you for your ", force: true)
+        try await Task.sleep(for: .milliseconds(40))
+        let prepared = try XCTUnwrap(engine.prepareAcceptance(nextWord: true))
+        XCTAssertEqual(prepared.text, "help")
+        engine.commitAcceptance(prepared)
+        XCTAssertEqual(engine.currentSuggestion?.remainingText, ".")
+        XCTAssertEqual(engine.acceptFull()?.textToInsert, ".")
     }
 
     @MainActor

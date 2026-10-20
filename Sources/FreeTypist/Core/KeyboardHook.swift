@@ -15,6 +15,9 @@ public final class KeyboardHook: @unchecked Sendable {
     }
     private let typingBuffer = TypingBuffer()
     private var lastFieldHash: UInt?
+    private var sentenceCorrectionInProgress = false
+    private var suppressReturnRepeats = false
+    private var correctedSentence: TextInputSnapshot?
 
     private init() {}
 
@@ -37,7 +40,7 @@ public final class KeyboardHook: @unchecked Sendable {
         eventTap = nil
         runLoopSource = nil
 
-        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
+        let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue) | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue)
         let observer = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
@@ -73,6 +76,11 @@ public final class KeyboardHook: @unchecked Sendable {
             queue: .main
         ) { [weak self] _ in
             self?.typingBuffer.reset()
+            self?.correctedSentence = nil
+            MainActor.assumeIsolated {
+                AccessibilityService.shared.cancelPendingInsertion()
+                ReplacementFeedback.shared.clear()
+            }
             if AppSettings.shared.pausedAppBundleId != nil {
                 AppSettings.shared.pausedAppBundleId = nil
             }
@@ -130,7 +138,16 @@ public final class KeyboardHook: @unchecked Sendable {
             return Unmanaged.passUnretained(event)
         }
 
+        if type == .keyUp {
+            if [36, 76].contains(event.getIntegerValueField(.keyboardEventKeycode)) { suppressReturnRepeats = false }
+            return Unmanaged.passUnretained(event)
+        }
         if type == .leftMouseDown || type == .rightMouseDown {
+            MainActor.assumeIsolated {
+                AccessibilityService.shared.cancelPendingInsertion()
+                ReplacementFeedback.shared.clear()
+            }
+            correctedSentence = nil
             typingBuffer.reset()
             lastFieldHash = nil
             Task { @MainActor in
@@ -144,8 +161,7 @@ public final class KeyboardHook: @unchecked Sendable {
         trace("Key event received")
 
         // Ignore synthetic keystrokes posted by AccessibilityService during replacements
-        if event.getIntegerValueField(.eventSourceUserData) == AccessibilityService.syntheticEventMarker ||
-           AccessibilityService.shared.isPerformingSyntheticInsertion {
+        if event.getIntegerValueField(.eventSourceUserData) == AccessibilityService.syntheticEventMarker {
             return Unmanaged.passUnretained(event)
         }
 
@@ -156,6 +172,18 @@ public final class KeyboardHook: @unchecked Sendable {
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
+        let plainReturn = [36, 76].contains(keyCode)
+            && flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty
+        if plainReturn && (sentenceCorrectionInProgress ||
+            (suppressReturnRepeats && event.getIntegerValueField(.keyboardEventAutorepeat) != 0)) { return nil }
+        MainActor.assumeIsolated {
+            AccessibilityService.shared.cancelPendingInsertion()
+            ReplacementFeedback.shared.clear()
+        }
+        if plainReturn && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            let handled = MainActor.assumeIsolated { handleSentenceReturn() }
+            if handled { suppressReturnRepeats = true; return nil }
+        } else { correctedSentence = nil }
         let hasActiveSuggestion = hasSuggestion() && AppSettings.shared.isEnabled
         let frontBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let tabDisabledInApp = AppSettings.shared.rule(for: frontBundleId)?.disableTabKey ?? false
@@ -164,43 +192,10 @@ public final class KeyboardHook: @unchecked Sendable {
         let plainBacktick = keyCode == 50 && flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty
         if ((keyCode == 48 && !tabDisabledInApp) || plainBacktick) && hasActiveSuggestion
             && !flags.contains(.maskCommand) && !flags.contains(.maskControl) {
-            guard !AppSettings.shared.isAppExcluded(bundleIdentifier: frontBundleId),
-                  let caret = AccessibilityService.shared.getCurrentCaretInfo(),
-                  caret.elementHash == lastFieldHash, caret.selectedText.isEmpty else {
-                Task { @MainActor in CompletionEngine.shared.dismiss() }
-                return Unmanaged.passUnretained(event)
+            let handled = MainActor.assumeIsolated {
+                handleSuggestionAcceptance(nextWord: flags.contains(.maskAlternate) || flags.contains(.maskShift) || plainBacktick)
             }
-            let isOptionPressed = flags.contains(.maskAlternate)
-            let isShiftPressed = flags.contains(.maskShift)
-
-            Task { @MainActor in
-                // If there is an active typo fix or slash command, always apply the full replacement
-                let isReplacement = CompletionEngine.shared.activeAutocorrect != nil
-                    || CompletionEngine.shared.activeSlashCommand != nil
-                    || !CompletionEngine.shared.activeEmojiCandidates.isEmpty
-                    || (CompletionEngine.shared.currentSuggestion?.replacementLength ?? 0) > 0
-
-                if (isOptionPressed || isShiftPressed || plainBacktick) && !isReplacement {
-                    if let word = CompletionEngine.shared.acceptNextWord() {
-                        self.typingBuffer.append(word)
-                        AccessibilityService.shared.insertText(word)
-                        MenuBarController.shared.rebuildMenu()
-                    }
-                } else {
-                    if let accepted = CompletionEngine.shared.acceptFull() {
-                        self.typingBuffer.replaceTrailing(
-                            count: accepted.deleteBackwardsCount,
-                            with: accepted.textToInsert
-                        )
-                        AccessibilityService.shared.insertText(
-                            accepted.textToInsert,
-                            deleteBackwardsCount: accepted.deleteBackwardsCount
-                        )
-                        MenuBarController.shared.rebuildMenu()
-                    }
-                }
-            }
-            return nil
+            return handled ? nil : Unmanaged.passUnretained(event)
         }
 
         // Keycode 53 = Escape
@@ -247,6 +242,68 @@ public final class KeyboardHook: @unchecked Sendable {
         }
 
         return Unmanaged.passUnretained(event)
+    }
+
+    @MainActor
+    private func handleSuggestionAcceptance(nextWord: Bool) -> Bool {
+        let service = AccessibilityService.shared
+        let engine = CompletionEngine.shared
+        let bundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        guard !service.isPerformingSyntheticInsertion,
+              let target = service.captureTextTarget(), let snapshot = target.snapshot(),
+              snapshot.identity == lastFieldHash, engine.matchesContext(snapshot.context, bundleId: bundle),
+              let acceptance = engine.prepareAcceptance(nextWord: nextWord),
+              let edit = TextReplacement.trailing(acceptance.text, count: acceptance.deleteCount, in: snapshot) else {
+            engine.dismiss()
+            return false
+        }
+        Task { @MainActor in
+            let result = await service.apply(edit, to: target)
+            if result == .applied {
+                self.typingBuffer.replace(with: edit.result.context.precedingText)
+                engine.commitAcceptance(acceptance)
+                MenuBarController.shared.rebuildMenu()
+            } else {
+                engine.dismiss()
+                if result == .unsupported {
+                    ReplacementFeedback.shared.show("This field could not confirm the replacement. Check the text before continuing.")
+                }
+            }
+        }
+        return true
+    }
+
+    @MainActor
+    private func handleSentenceReturn() -> Bool {
+        let settings = AppSettings.shared
+        let service = AccessibilityService.shared
+        let bundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        guard settings.correctSentenceOnEnter, settings.isEnabled,
+              !settings.isAppExcluded(bundleIdentifier: bundle),
+              settings.rule(for: bundle)?.disableAutocorrect != true,
+              !service.isPerformingSyntheticInsertion,
+              let target = service.captureTextTarget(), let snapshot = target.snapshot(),
+              snapshot != correctedSentence,
+              let correction = SentenceSpellingCorrector.correction(in: snapshot) else { return false }
+        CompletionEngine.shared.dismiss()
+        if let caret = service.getCurrentCaretInfo(), caret.hasValidCaretRect {
+            GhostOverlayPanel.shared.updatePosition(caretScreenRect: caret.screenRect, fontSize: caret.estimatedFontSize)
+        }
+        sentenceCorrectionInProgress = true
+        Task { @MainActor in
+            defer { self.sentenceCorrectionInProgress = false }
+            let result = await service.apply(correction.edit, to: target)
+            if result == .applied {
+                self.correctedSentence = correction.edit.result
+                self.typingBuffer.replace(with: correction.edit.result.context.precedingText)
+                ReplacementFeedback.shared.show("Fixed \(correction.count) spelling \(correction.count == 1 ? "mistake" : "mistakes"). Press Enter again to continue.")
+            } else if result == .unsupported {
+                // Allow the next Enter to behave normally even in an unsupported field.
+                self.correctedSentence = target.snapshot()
+                ReplacementFeedback.shared.show("This field could not confirm the spelling changes. Check the text; Enter again continues.")
+            }
+        }
+        return true
     }
 
     @MainActor
