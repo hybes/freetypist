@@ -107,6 +107,9 @@ public final class GhostOverlayPanel: NSPanel {
             setFrame(frame, display: false)
             return true
         }
+        // Tab must never accept an invisible completion when the caret is too
+        // close to the display edge to show even the start of its text.
+        engine.dismiss()
         return false
     }
 

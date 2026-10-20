@@ -108,6 +108,22 @@ final class GhostOverlayTests: XCTestCase {
     }
 
     @MainActor
+    func testSuggestionThatCannotFitBesideTheCaretCannotBeAccepted() throws {
+        let engine = CompletionEngine.shared
+        let panel = GhostOverlayPanel.shared
+        let settings = AppSettings.shared
+        let previousBadges = settings.showShortcutBadges
+        settings.showShortcutBadges = false
+        defer { engine.dismiss(); panel.invalidateCaretPosition(); settings.showShortcutBadges = previousBadges }
+        engine.currentSuggestion = CompletionItem(fullText: "be responsive", providerName: "Test")
+        let screen = try XCTUnwrap(NSScreen.screens.first).visibleFrame
+        panel.updatePosition(caretScreenRect: CGRect(x: screen.maxX - 10, y: screen.midY, width: 1, height: 14))
+        XCTAssertNil(engine.currentSuggestion)
+        XCTAssertNil(engine.prepareAcceptance(nextWord: false))
+        XCTAssertFalse(panel.isVisible)
+    }
+
+    @MainActor
     func testLongInlineTextClipsAtDisplayEdgeWithoutCoveringTheDraft() throws {
         let screen = CGRect(x: -1920, y: -100, width: 1920, height: 1080)
         let caret = CGRect(x: -90, y: 500, width: 1, height: 14)
