@@ -159,16 +159,9 @@ public final class AccessibilityService: @unchecked Sendable {
         if isValidCaret {
             // AX screen coordinates have (0,0) at the top-left of the primary screen.
             // Cocoa NSWindow coordinates have (0,0) at the bottom-left of the primary screen.
-            let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 1080
-            let lineHeight = min(max(axCaretRect.height, 14), 32)
-            estimatedFontSize = min(max(round(lineHeight * 0.76), 12), 20)
-            let cocoaY = primaryScreenHeight - axCaretRect.origin.y - lineHeight
-            convertedRect = CGRect(
-                x: axCaretRect.origin.x,
-                y: cocoaY,
-                width: max(axCaretRect.width, 1),
-                height: lineHeight
-            )
+            let primaryScreenTop = NSScreen.screens.first?.frame.maxY ?? 1080
+            estimatedFontSize = min(max(round(axCaretRect.height * 0.76), 12), 20)
+            convertedRect = Self.cocoaCaretRect(from: axCaretRect, primaryScreenTop: primaryScreenTop)
         }
 
         return CaretInfo(
@@ -193,42 +186,10 @@ public final class AccessibilityService: @unchecked Sendable {
         precedingText: String,
         loc: Int
     ) -> (rect: CGRect, valid: Bool) {
-        if let rect = queryBoundsForRange(axElement: axElement, location: loc, length: 0),
-           Self.isPlausibleAXRect(rect) { return (rect, true) }
-
-        // Strategy A: Bounds of the character immediately before the cursor (most accurate for inline placement!)
-        if loc > 0 && loc <= nsText.length {
-            let previousRange = nsText.rangeOfComposedCharacterSequence(at: loc - 1)
-            let prevChar = nsText.substring(with: previousRange)
-            if prevChar != "\n" && prevChar != "\r" {
-                if let prevRect = queryBoundsForRange(axElement: axElement, location: previousRange.location, length: previousRange.length),
-                   Self.isPlausibleAXRect(prevRect) {
-                    let caretAtRightEdge = CGRect(
-                        x: prevRect.origin.x + prevRect.width,
-                        y: prevRect.origin.y,
-                        width: 1,
-                        height: max(prevRect.height, 16)
-                    )
-                    return (caretAtRightEdge, true)
-                }
-            }
-        }
-
-        // Strategy B: Zero-length or 1-char range at cursor location
-        if let zeroRect = queryBoundsForRange(axElement: axElement, location: loc, length: 0),
-           Self.isPlausibleAXRect(zeroRect) {
-            return (zeroRect, true)
-        }
-        if loc < nsText.length,
-           let nextRect = queryBoundsForRange(axElement: axElement, location: loc, length: 1),
-           Self.isPlausibleAXRect(nextRect) {
-            let caretAtLeftEdge = CGRect(
-                x: nextRect.origin.x,
-                y: nextRect.origin.y,
-                width: 1,
-                height: max(nextRect.height, 16)
-            )
-            return (caretAtLeftEdge, true)
+        if let rect = Self.caretBounds(in: nsText, location: loc, boundsForRange: { range in
+            queryBoundsForRange(axElement: axElement, location: range.location, length: range.length)
+        }) {
+            return (rect, true)
         }
 
         // Strategy C: WebKit / Chromium / Electron AXSelectedTextMarkerRange -> AXBoundsForTextMarkerRange
@@ -289,6 +250,45 @@ public final class AccessibilityService: @unchecked Sendable {
 
         // Never fall back to (0,0) or mouseLocation!
         return (.zero, false)
+    }
+
+    /// NSTextView can report a zero-length AX range one line above its real
+    /// insertion point. Character ranges have the correct vertical bounds.
+    /// Retain the insertion point's x (including bidirectional text), but anchor
+    /// its line to a neighbouring glyph. Prefer the next glyph at soft wraps.
+    static func caretBounds(in text: NSString, location: Int,
+                            boundsForRange: (NSRange) -> CGRect?) -> CGRect? {
+        guard location >= 0, location <= text.length else { return nil }
+        let zero = boundsForRange(NSRange(location: location, length: 0))
+            .flatMap { isPlausibleAXRect($0) ? $0 : nil }
+
+        func aligned(to range: NSRange, trailing: Bool) -> CGRect? {
+            guard !text.substring(with: range).contains(where: \.isNewline),
+                  let glyph = boundsForRange(range), isPlausibleAXRect(glyph) else { return nil }
+            if let zero {
+                // A previous character can belong to the preceding wrapped line.
+                // Do not move a valid insertion point back to that line.
+                guard zero.minX >= glyph.minX - 2, zero.minX <= glyph.maxX + 2 else { return nil }
+            }
+            return CGRect(x: zero?.minX ?? (trailing ? glyph.maxX : glyph.minX),
+                          y: glyph.minY, width: zero?.width ?? 0, height: glyph.height)
+        }
+        if location < text.length,
+           let next = aligned(to: text.rangeOfComposedCharacterSequence(at: location), trailing: false) {
+            return next
+        }
+        if location > 0,
+           let previous = aligned(to: text.rangeOfComposedCharacterSequence(at: location - 1), trailing: true) {
+            return previous
+        }
+        return zero
+    }
+
+    static func cocoaCaretRect(from axRect: CGRect, primaryScreenTop: CGFloat) -> CGRect {
+        // Flip the actual rectangle before estimating a font size. Clamping the
+        // height here moves the caret, especially in large text and other displays.
+        CGRect(x: axRect.minX, y: primaryScreenTop - axRect.maxY,
+               width: max(axRect.width, 1), height: axRect.height)
     }
 
     private func queryBoundsForRange(axElement: AXUIElement, location: Int, length: Int) -> CGRect? {

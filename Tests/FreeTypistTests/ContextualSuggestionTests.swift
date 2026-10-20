@@ -3,6 +3,15 @@ import XCTest
 @testable import FreeTypist
 
 final class ContextualSuggestionTests: XCTestCase {
+    @MainActor
+    func testCompletedWordsStartPredictionsWithoutTheFullMidWordDelay() {
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, atWordBoundary: true, force: false), 80)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, atWordBoundary: false, force: false), 200)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 40, atWordBoundary: true, force: false), 40)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: -1, atWordBoundary: true, force: false), 0)
+        XCTAssertEqual(CompletionEngine.predictionDelayMs(configured: 200, atWordBoundary: false, force: true), 0)
+    }
+
     private func settings() -> AppSettings {
         let suite = "com.freetypist.tests.context.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

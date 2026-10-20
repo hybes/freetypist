@@ -334,7 +334,8 @@ public final class CompletionEngine: ObservableObject {
         activeTask?.cancel()
         lastRequestedText = precedingText
 
-        let debounceDelay = force ? 0 : max(0, settings.debounceMs)
+        let debounceDelay = Self.predictionDelayMs(configured: settings.debounceMs,
+                                                  atWordBoundary: atWordBoundary, force: force)
         let provider = providerOverride ?? ModelProviderFactory.provider(for: settings.activeProvider)
         let tone = settings.effectiveTone(for: bundleId)
         let customInstructions = settings.effectiveCustomInstructions(for: bundleId)
@@ -408,6 +409,13 @@ public final class CompletionEngine: ObservableObject {
                 self.activeWordAlternatives = []
             }
         }
+    }
+
+    static func predictionDelayMs(configured: Int, atWordBoundary: Bool, force: Bool) -> Int {
+        if force { return 0 }
+        // A completed word is a useful prediction point. Start promptly after
+        // spaces, while retaining the longer pause during a partially typed word.
+        return atWordBoundary ? min(max(0, configured), 80) : max(0, configured)
     }
 
     private func offerPrediction(_ text: String, latency: Int, request: UUID) {

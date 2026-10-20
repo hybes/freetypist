@@ -10,8 +10,8 @@ public final class GhostOverlayPanel: NSPanel {
     private var cancellables = Set<AnyCancellable>()
     private var lastCaretRect: CGRect = .zero
     private var hasValidCaretPosition: Bool = false
-    private var lastPositionUpdate: ContinuousClock.Instant?
-    public var detectedFontSize: CGFloat = 13.5
+    private var caretApplicationPID: pid_t?
+    public private(set) var detectedFontSize: CGFloat = 13.5
 
     public override var canBecomeKey: Bool { false }
     public override var canBecomeMain: Bool { false }
@@ -58,7 +58,7 @@ public final class GhostOverlayPanel: NSPanel {
 
     public func invalidateCaretPosition() {
         hasValidCaretPosition = false
-        lastPositionUpdate = nil
+        caretApplicationPID = nil
         lastCaretRect = .zero
         hideOverlay()
     }
@@ -66,47 +66,70 @@ public final class GhostOverlayPanel: NSPanel {
     public func updatePosition(caretScreenRect: CGRect, fontSize: CGFloat = 13.5) {
         guard caretScreenRect != .zero,
               caretScreenRect.origin.x.isFinite,
-              caretScreenRect.origin.y.isFinite else {
+              caretScreenRect.origin.y.isFinite,
+              caretScreenRect.width.isFinite, caretScreenRect.width >= 0,
+              caretScreenRect.height.isFinite, caretScreenRect.height > 0 else {
             invalidateCaretPosition()
             return
         }
 
         lastCaretRect = caretScreenRect
         hasValidCaretPosition = true
-        lastPositionUpdate = .now
-        detectedFontSize = fontSize
-        fitToContent()
+        caretApplicationPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if fontSize.isFinite, detectedFontSize != fontSize {
+            detectedFontSize = fontSize
+            (contentView as? NSHostingView<GhostTextView>)?.rootView = GhostTextView(fontSize: fontSize)
+        }
+        if !layoutAtCaret() { hideOverlay() }
+    }
 
-        // Place inline ghost text directly at the cursor edge & baseline (like Cotypist SingleCompletionOverlayWindow)
-        let isPureInline = !AppSettings.shared.showShortcutBadges
-            && CompletionEngine.shared.activeAutocorrect == nil
-            && CompletionEngine.shared.activeEmojiCandidates.isEmpty
-        let xNudge: CGFloat = isPureInline ? 0 : 2
-        let yNudge: CGFloat = isPureInline ? -1 : -2
+    private func layoutAtCaret() -> Bool {
+        guard hasValidCaretPosition else { return false }
+        contentView?.layoutSubtreeIfNeeded()
+        guard let size = contentView?.fittingSize, size.width > 1, size.height > 1 else { return false }
 
-        let targetOrigin = NSPoint(
-            x: caretScreenRect.origin.x + caretScreenRect.width + xNudge,
-            y: ReplacementFeedback.shared.message == nil && CompletionEngine.shared.activeAutocorrect?.replacementRange == nil
-                ? caretScreenRect.origin.y + yNudge
-                : caretScreenRect.origin.y - frame.height - 6
-        )
+        let engine = CompletionEngine.shared
+        let belowCaret = ReplacementFeedback.shared.message != nil
+            || engine.activeAutocorrect?.replacementRange != nil
+            || engine.paragraphSpellingSuggestion != nil
+        let pureInline = !AppSettings.shared.showShortcutBadges && !belowCaret
+            && engine.activeAutocorrect == nil && engine.activeEmojiCandidates.isEmpty
 
-        let screen = NSScreen.screens.first { $0.frame.insetBy(dx: -40, dy: -40).contains(targetOrigin) }
+        let screen = NSScreen.screens.first { $0.frame.intersects(lastCaretRect) }
             ?? NSScreen.main
             ?? NSScreen.screens.first
 
-        if let screen {
-            let maxX = screen.visibleFrame.maxX - frame.width - 8
-            let minX = screen.visibleFrame.minX + 8
-            let maxY = screen.visibleFrame.maxY - frame.height - 8
-            let minY = screen.visibleFrame.minY + 8
-            setFrameOrigin(NSPoint(
-                x: min(max(targetOrigin.x, minX), maxX),
-                y: min(max(targetOrigin.y, minY), maxY)
-            ))
-        } else {
-            setFrameOrigin(targetOrigin)
+        if let frame = Self.placement(caret: lastCaretRect, contentSize: size,
+                                      visibleFrame: screen?.visibleFrame, pureInline: pureInline,
+                                      belowCaret: belowCaret) {
+            // Size and origin move together. A later content resize must not
+            // preserve an old top edge and shift streamed text off its baseline.
+            setFrame(frame, display: false)
+            return true
         }
+        return false
+    }
+
+    static func placement(caret: CGRect, contentSize: CGSize, visibleFrame: CGRect?,
+                          pureInline: Bool, belowCaret: Bool) -> CGRect? {
+        var size = CGSize(width: min(max(contentSize.width, 16), 680),
+                          height: min(max(contentSize.height, 18), 80))
+        var origin = CGPoint(x: caret.maxX + (pureInline ? 0 : 2),
+                             y: belowCaret ? caret.minY - size.height - 6 : caret.midY - size.height / 2)
+        if let visibleFrame {
+            let usable = visibleFrame.insetBy(dx: 8, dy: 8)
+            if pureInline {
+                // Clip long suggestions at the display edge, rather than
+                // shifting them backwards over the text already written.
+                guard origin.x >= usable.minX, usable.maxX - origin.x >= 16 else { return nil }
+                size.width = min(size.width, usable.maxX - origin.x)
+            } else {
+                size.width = min(size.width, usable.width)
+                origin.x = min(max(origin.x, usable.minX), usable.maxX - size.width)
+            }
+            origin.y = min(max(origin.y, usable.minY), usable.maxY - size.height)
+        }
+        return CGRect(origin: origin, size: size)
     }
 
     public func showOverlay() {
@@ -115,23 +138,10 @@ public final class GhostOverlayPanel: NSPanel {
             return
         }
         // The playground draws ghost text inline inside its own NSTextView.
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if frontPID == ProcessInfo.processInfo.processIdentifier || frontPID != caretApplicationPID {
             hideOverlay()
             return
-        }
-
-        // Immediate spelling suggestions already have a freshly read caret.
-        // Avoid a second complete AX round trip before drawing them.
-        let positionIsFresh = lastPositionUpdate.map { $0.duration(to: .now) < .milliseconds(100) } ?? false
-        if !positionIsFresh {
-            if let caretInfo = AccessibilityService.shared.getCurrentCaretInfo(), caretInfo.hasValidCaretRect {
-                updatePosition(caretScreenRect: caretInfo.screenRect, fontSize: caretInfo.estimatedFontSize)
-            } else {
-                hideOverlay()
-                return
-            }
-        } else {
-            updatePosition(caretScreenRect: lastCaretRect, fontSize: detectedFontSize)
         }
 
         guard hasValidCaretPosition else {
@@ -139,7 +149,10 @@ public final class GhostOverlayPanel: NSPanel {
             return
         }
 
-        fitToContent()
+        // KeyboardHook supplies the caret for this request and invalidates it
+        // on clicks, scrolling and app switches. Drawing each streamed word
+        // needs no second read of the focused app's text and window metadata.
+        guard layoutAtCaret() else { hideOverlay(); return }
         orderFrontRegardless()
     }
 
@@ -149,12 +162,4 @@ public final class GhostOverlayPanel: NSPanel {
         }
     }
 
-    private func fitToContent() {
-        contentView?.layoutSubtreeIfNeeded()
-        guard let size = contentView?.fittingSize, size.width > 1, size.height > 1 else { return }
-        setContentSize(NSSize(
-            width: min(max(size.width, 16), 680),
-            height: min(max(size.height, 18), 80)
-        ))
-    }
 }

@@ -77,6 +77,8 @@ Local model requests continue an assistant prefill using the bundled [llama.cpp 
 
 The embedded model streams completed words as they arrive, so Tab can accept them before the full suggestion finishes. Changing text, moving the cursor, dismissing or accepting cancels that stream; late results cannot overwrite the new context. A space after a finished sentence allows the next sentence to be suggested, and `I ` can trigger a prediction. Predictions cannot append a contraction to a completed pronoun (`I` → `I'm`).
 
+After a word boundary, prediction debounce is capped at 80 ms; pauses within a word retain the configured delay. External suggestions use adjacent character bounds to avoid native text views reporting an empty caret range one line too high. The overlay keeps its position as streamed words arrive, clips long inline suggestions at the display edge, and reuses the caret already read for the request. Clicks, scrolling and app switches invalidate that position.
+
 ## Downloads and updates
 
 [type.cnnct.uk](https://type.cnnct.uk) serves the download page through Cloudflare Workers. Installers and Sparkle's signed update feed live in the existing MinIO store under `brth/connect-dorset/freetypist/releases`, separate from CNNCT Image. The app offers **Check for Updates…** in its menus and General settings. Sparkle asks about automatic checks; users can change the setting in General.

@@ -41,7 +41,7 @@ public final class KeyboardHook: @unchecked Sendable {
 
         let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue)
-            | (1 << CGEventType.rightMouseDown.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue) | (1 << CGEventType.scrollWheel.rawValue)
         let observer = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
@@ -81,12 +81,11 @@ public final class KeyboardHook: @unchecked Sendable {
             MainActor.assumeIsolated {
                 AccessibilityService.shared.cancelPendingInsertion()
                 ReplacementFeedback.shared.clear()
+                CompletionEngine.shared.dismiss()
+                GhostOverlayPanel.shared.invalidateCaretPosition()
             }
             if AppSettings.shared.pausedAppBundleId != nil {
                 AppSettings.shared.pausedAppBundleId = nil
-            }
-            Task { @MainActor in
-                CompletionEngine.shared.dismiss()
             }
         }
     }
@@ -145,18 +144,16 @@ public final class KeyboardHook: @unchecked Sendable {
             if !isTypingInFreeTypist() { scheduleContextRefresh(caretMoved: true) }
             return Unmanaged.passUnretained(event)
         }
-        if type == .leftMouseDown || type == .rightMouseDown {
+        if type == .leftMouseDown || type == .rightMouseDown || type == .scrollWheel {
             contextRefreshTask?.cancel()
             MainActor.assumeIsolated {
                 AccessibilityService.shared.cancelPendingInsertion()
                 ReplacementFeedback.shared.clear()
-            }
-            typingBuffer.reset()
-            lastFieldHash = nil
-            Task { @MainActor in
                 CompletionEngine.shared.dismiss()
                 GhostOverlayPanel.shared.invalidateCaretPosition()
             }
+            typingBuffer.reset()
+            lastFieldHash = nil
         }
         guard type == .keyDown else {
             return Unmanaged.passUnretained(event)

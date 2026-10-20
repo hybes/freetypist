@@ -303,7 +303,7 @@ final class CompletionQualityTests: XCTestCase {
             XCTAssertGreaterThan(acceptedCount, 0, "No completion for \(seed)")
             engine.dismiss()
         }
-        for seed in ["The CSS navbar needs to ", "The async function returns ", "The React component should ",
+        for seed in ["The navbar needs to ", "The CSS navbar needs to ", "The async function returns ", "The React component should ",
                      "I ", "The code works. "] {
             let progress = StreamObservations()
             let context = PromptContext(precedingText: seed, appName: "TextEdit",

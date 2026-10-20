@@ -4,12 +4,12 @@ public struct GhostTextView: View {
     @ObservedObject private var replacementFeedback = ReplacementFeedback.shared
     @ObservedObject var engine = CompletionEngine.shared
     @ObservedObject var settings = AppSettings.shared
+    private let fontSize: CGFloat
 
-    public init() {}
+    public init(fontSize: CGFloat = 13.5) { self.fontSize = fontSize }
 
     private var effectiveFontSize: CGFloat {
-        let base = GhostOverlayPanel.shared.detectedFontSize
-        return min(max(base + CGFloat(settings.ghostFontSizeOffset), 11), 22)
+        min(max(fontSize + CGFloat(settings.ghostFontSizeOffset), 11), 22)
     }
 
     public var body: some View {
