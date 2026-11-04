@@ -1,47 +1,317 @@
+export const service = 'freetypist-website';
 export const defaultDsn = 'https://cdd8a725c00b40dd8ded87246c3c35b1@error.cnnct.uk/45';
 
-const sensitiveKey = /authorization|cookie|password|secret|token|api[_-]?key|ip[_-]?address/i;
+const consolePrefix = `[${service}] `;
+const maxText = 16384;
+const maxDepth = 12;
+const redacted = '[REDACTED]';
 
-function scrubText(value) {
-  return value
-    .replace(/https?:\/\/[^\s<>"']+/gi, value => {
-      try {
-        const url = new URL(value);
-        return `${url.origin}${url.pathname}`;
-      } catch { return '[REDACTED URL]'; }
-    })
-    .replace(/([?&](?:[^=\s&]+)=)[^\s&#]*/g, '$1[REDACTED]')
-    .replace(/\b((?:proxy[-_])?authorization|(?:set[-_])?cookie)\s*[:=]\s*[^\r\n]+/gi, '$1=[REDACTED]')
-    .replace(/\b(Bearer\s+)[\w.~+/=-]+/gi, '$1[REDACTED]')
-    .replace(/\b(authorization|cookie|password|secret|token|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
-    .replace(/\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b/gi, '[REDACTED EMAIL]');
+// Secret key rules. Keys are split into words (camelCase, `-`, `_`, `.`), so `X-API-Key`, `apiKey` and
+// `api_key` all become `xapikey`/`apikey`, and dotted names such as `request.data.otp` are checked by leaf.
+const secretParts = [
+  'password', 'passwd', 'passphrase', 'passcode', 'secret', 'token', 'apikey', 'accesskey', 'privatekey',
+  'authorization', 'cookie', 'sessionid', 'sessionkey', 'csrf', 'xsrf', 'signature', 'credential',
+  'recoverycode', 'backupcode', 'verificationcode', 'invitecode', 'signupcode', 'onetimecode',
+  'onetimepassword', 'mfacode', 'otpcode', 'cardnumber', 'creditcard', 'securitycode', 'protectionbypass',
+];
+const secretWords = new Set(['otp', 'totp', 'hotp', 'mfa', '2fa', 'cvv', 'cvc', 'cvv2', 'pwd', 'jwt']);
+const secretNames = new Set(['auth', 'session', 'sid', 'pin', 'invite', 'signup']);
+const secretQueryNames = new Set(['code', 'state', 'key', 'sig', 'access']);
+const queryKeys = new Set(['query', 'querystring', 'search', 'urlquery']);
+const authSchemes = new Set(['bearer', 'basic', 'digest', 'token', 'negotiate']);
+const headerLine = /\b(proxy-authorization|authorization|set-cookie|cookie)[ \t]*:/i;
+const cardNumber = /\b(?:\d[ -]?){12,18}\d\b/g;
+const runtimeNoise = /ExperimentalWarning|DeprecationWarning|MaxListenersExceededWarning|MODULE_TYPELESS_PACKAGE_JSON/;
+
+function decodeKey(key) {
+  if (!key.includes('%')) return key;
+  try { return decodeURIComponent(key); } catch { return key; }
 }
 
-function scrub(value, depth = 0) {
-  if (depth > 10) return '[TRUNCATED]';
-  if (typeof value === 'string') return scrubText(value);
-  if (Array.isArray(value)) return value.map(entry => scrub(entry, depth + 1));
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
-    key, sensitiveKey.test(key) ? '[REDACTED]' : scrub(entry, depth + 1),
-  ]));
+function words(segment) {
+  return segment.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+export function isSecretKey(rawKey, query = false) {
+  const key = decodeKey(String(rawKey)).slice(0, 256);
+  if (!key) return false;
+  const segments = key.split('.');
+  const leaf = words(segments[segments.length - 1]);
+  const all = words(key);
+  const leafName = leaf.join('');
+  const fullName = all.join('');
+  if (secretParts.some(part => leafName.includes(part) || fullName.includes(part))) return true;
+  if (all.some(word => secretWords.has(word))) return true;
+  if (secretNames.has(leafName) || secretNames.has(fullName)) return true;
+  return query && secretQueryNames.has(leafName);
+}
+
+function isKeyChar(code) {
+  return (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57)
+    || code === 95 || code === 45 || code === 46 || code === 37 || code === 91 || code === 93;
+}
+
+const isSpace = code => code === 32 || code === 9 || code === 13 || code === 10 || code === 12;
+
+function closingQuote(text, start, quote, limit = text.length) {
+  for (let index = start + 1; index < limit; index++) {
+    const code = text.charCodeAt(index);
+    if (code === 92) index++;
+    else if (code === quote) return index;
+  }
+  return -1;
+}
+
+// Returns the end of a secret value. Quoted sections (`a="secret"`) and bracketed values (`{...}`, `[...]`)
+// belong to the value, so the whole secret is removed even when it is an array or object.
+function valueEnd(text, start, query) {
+  let index = start;
+  let depth = 0;
+  while (index < text.length) {
+    const code = text.charCodeAt(index);
+    if ((code === 34 || code === 39) && (depth > 0 || index === start || text[index - 1] === '=')) {
+      const end = closingQuote(text, index, code);
+      index = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    if (code === 34 || code === 39) break;
+    if (code === 123 || code === 91) { depth++; index++; continue; }
+    if ((code === 125 || code === 93) && depth > 0) { depth--; index++; continue; }
+    if (depth === 0) {
+      if (isSpace(code) || code === 38 || code === 60 || code === 62) break;
+      if (query ? code === 35 : (code === 44 || code === 59 || code === 41 || code === 93 || code === 125)) break;
+    }
+    index++;
+  }
+  return index;
+}
+
+function wordEnd(text, start) {
+  let index = start;
+  while (index < text.length && !isSpace(text.charCodeAt(index))) index++;
+  return index;
+}
+
+function skipSpaces(text, start) {
+  let index = start;
+  while (index < text.length && (text.charCodeAt(index) === 32 || text.charCodeAt(index) === 9)) index++;
+  return index;
+}
+
+function looksEncoded(value) {
+  return value.length >= 8 && /^[A-Za-z0-9+/=._-]+$/.test(value) && /[0-9+/=]|.[A-Z]/.test(value);
+}
+
+// One left-to-right pass per line. Each key run is read once and the scan always moves forward, so the cost
+// stays linear in the length of the text.
+function scrubLine(line, forceQuery) {
+  let output = '';
+  let copied = 0;
+  let index = 0;
+  const firstText = skipSpaces(line, 0);
+  const replace = (start, end, quoted) => {
+    output += line.slice(copied, start) + (quoted ? `"${redacted}"` : redacted);
+    copied = end;
+  };
+  while (index < line.length) {
+    const code = line.charCodeAt(index);
+    let keyStart = index;
+    let keyEnd;
+    let keyText;
+    if (code === 34 || code === 39) {
+      const end = closingQuote(line, index, code, Math.min(line.length, index + 200));
+      if (end === -1) { index++; continue; }
+      const after = skipSpaces(line, end + 1);
+      if (line[after] !== ':' && line[after] !== '=') { index++; continue; }
+      keyText = line.slice(index + 1, end);
+      keyEnd = end + 1;
+    } else if (isKeyChar(code)) {
+      keyEnd = index;
+      while (keyEnd < line.length && isKeyChar(line.charCodeAt(keyEnd))) keyEnd++;
+      keyText = line.slice(index, keyEnd);
+    } else { index++; continue; }
+
+    const previous = keyStart > 0 ? line[keyStart - 1] : '';
+    const query = forceQuery || previous === '?' || previous === '&' || previous === '#';
+    const separatorAt = skipSpaces(line, keyEnd);
+    const separator = line[separatorAt];
+    const lower = keyText.toLowerCase();
+
+    if (separator !== ':' && separator !== '=') {
+      if (authSchemes.has(lower) && lower !== 'token' && separatorAt > keyEnd && separatorAt < line.length) {
+        const end = wordEnd(line, separatorAt);
+        const credential = line.slice(separatorAt, end);
+        if (lower === 'bearer' || looksEncoded(credential)) { replace(separatorAt, end); index = end; continue; }
+      }
+      index = keyEnd;
+      continue;
+    }
+
+    if (separator === ':' && line.startsWith('//', separatorAt + 1)) {
+      // URL authority: keep the user name, remove a password in `scheme://user:password@host`.
+      const authorityStart = separatorAt + 3;
+      let authorityEnd = authorityStart;
+      let colon = -1;
+      while (authorityEnd < line.length) {
+        const char = line[authorityEnd];
+        if (char === '/' || char === '?' || char === '#' || char === '@' || isSpace(line.charCodeAt(authorityEnd))) break;
+        if (char === ':' && colon === -1) colon = authorityEnd;
+        authorityEnd++;
+      }
+      if (line[authorityEnd] === '@' && colon !== -1) replace(colon + 1, authorityEnd);
+      index = authorityEnd;
+      continue;
+    }
+
+    const valueStart = skipSpaces(line, separatorAt + 1);
+    // A leading `area:` followed by a phrase is a label (`session: could not verify the request`).
+    const label = !query && separator === ':' && keyStart === firstText && valueStart > separatorAt + 1
+      && wordEnd(line, valueStart) < line.trimEnd().length;
+    if (label || !isSecretKey(keyText, query)) { index = separatorAt + 1; continue; }
+
+    let end = valueEnd(line, valueStart, query);
+    if (authSchemes.has(line.slice(valueStart, end).toLowerCase()) && end < line.length) {
+      end = valueEnd(line, skipSpaces(line, end), query);
+    }
+    if (end > valueStart) replace(valueStart, end, line[valueStart] === '"' && line[end - 1] === '"');
+    index = Math.max(end, separatorAt + 1);
+  }
+  return output + line.slice(copied);
+}
+
+function luhn(digits) {
+  let sum = 0;
+  for (let index = 0; index < digits.length; index++) {
+    let digit = digits.charCodeAt(digits.length - 1 - index) - 48;
+    if (index % 2) { digit *= 2; if (digit > 9) digit -= 9; }
+    sum += digit;
+  }
+  return sum % 10 === 0;
+}
+
+export function scrubText(value, { query = false } = {}) {
+  const full = String(value);
+  const text = full.length > maxText ? full.slice(0, maxText) : full;
+  const marker = full.length > maxText ? `…[truncated ${full.length - maxText} chars]` : '';
+  const lines = text.split('\n').map(line => {
+    const header = headerLine.exec(line);
+    if (header) return `${scrubLine(line.slice(0, header.index), query)}${header[0]} ${redacted}`;
+    return scrubLine(line, query);
+  });
+  return lines.join('\n').replace(cardNumber, match => {
+    const digits = match.replace(/\D/g, '');
+    return /^[2-6]/.test(digits) && luhn(digits) ? '[REDACTED CARD]' : match;
+  }) + marker;
+}
+
+function scrubString(value, key) {
+  const leaf = words(String(key).split('.').pop() || '').join('');
+  if (queryKeys.has(leaf)) return scrubText(value, { query: true });
+  const trimmed = value.trimStart();
+  if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && value.length <= maxText) {
+    try { return JSON.stringify(scrubValue(JSON.parse(value), key)); } catch {}
+  }
+  return scrubText(value);
+}
+
+export function scrubValue(value, key = '', depth = 0, seen = new WeakSet()) {
+  if (value === null || value === undefined || typeof value === 'boolean') return value;
+  if (key !== '' && isSecretKey(key)) return redacted;
+  if (typeof value === 'string') return scrubString(value, key);
+  if (typeof value !== 'object') return value;
+  if (depth > maxDepth) return '[TRUNCATED]';
+  if (value instanceof Date) return value;
+  if (value instanceof Error) {
+    return { name: value.name, message: scrubText(value.message), stack: value.stack && scrubText(value.stack) };
+  }
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  try {
+    const leaf = words(String(key).split('.').pop() || '').join('');
+    if (Array.isArray(value)) {
+      const pairs = queryKeys.has(leaf) || leaf === 'headers';
+      return value.map(entry => (pairs && Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string'
+        ? [entry[0], isSecretKey(entry[0], true) ? redacted : scrubValue(entry[1], key, depth + 2, seen)]
+        : scrubValue(entry, key, depth + 1, seen)));
+    }
+    const query = queryKeys.has(leaf);
+    return Object.fromEntries(Object.entries(value).map(([childKey, entry]) => [
+      childKey, query && isSecretKey(childKey, true) ? redacted : scrubValue(entry, childKey, depth + 1, seen),
+    ]));
+  } finally {
+    seen.delete(value);
+  }
 }
 
 export function sanitizeEvent(event) {
   try {
-    const safe = scrub(event);
-    delete safe.user;
-    if (safe.request) {
-      delete safe.request.headers;
-      delete safe.request.cookies;
-      delete safe.request.data;
-      delete safe.request.query_string;
-    }
-    return safe;
-  } catch { return null; }
+    return scrubValue(event);
+  } catch (error) {
+    try {
+      return {
+        event_id: event.event_id, timestamp: event.timestamp, level: event.level || 'error', platform: event.platform,
+        tags: { application: service, service },
+        message: `monitoring: event could not be scrubbed, ${scrubText(error?.message || error)}`,
+      };
+    } catch { return null; }
+  }
 }
 
-export function monitoringOptions(env = {}, runtime = 'worker') {
+export function sanitizeBreadcrumb(breadcrumb) {
+  try { return scrubValue(breadcrumb); } catch { return null; }
+}
+
+export function sanitizeSpan(span) {
+  try { return scrubValue(span); } catch { return { ...span, description: redacted, data: {} }; }
+}
+
+export function sanitizeLog(log, { runtime, hostName } = {}) {
+  const attributes = log.attributes || {};
+  const message = String(log.message ?? '');
+  const fromConsole = attributes['sentry.origin'] === 'auto.log.console';
+  // Console copies of our own logger lines are already sent directly; runtime warnings are noise.
+  if (fromConsole && (message.startsWith(consolePrefix) || runtimeNoise.test(message))) return null;
+  const serviceAttributes = { 'service.name': service, runtime, ...(hostName ? { 'host.name': hostName } : {}) };
+  try {
+    return { ...log, message: scrubText(message), attributes: { ...scrubValue(attributes), ...serviceAttributes } };
+  } catch (error) {
+    return { ...log, message: `monitoring: log could not be scrubbed, ${String(error?.message || error).slice(0, 200)}`, attributes: serviceAttributes };
+  }
+}
+
+// Logger for this site's own lines. GlitchTip shows the service name at the start of each line, so the
+// message starts with the area. The console copy carries the service prefix and goes to hosting logs.
+export function createLogger(sentryLogger, { output = process.env.NODE_ENV === 'test' ? null : console } = {}) {
+  const write = (level, message, attributes = {}) => {
+    try { output?.[level](`${consolePrefix}${scrubText(message)}`, scrubValue(attributes)); } catch {}
+    try { sentryLogger?.[level](message, attributes); } catch {}
+  };
+  return {
+    info: (message, attributes) => write('info', message, attributes),
+    warn: (message, attributes) => write('warn', message, attributes),
+    error: (message, attributes) => write('error', message, attributes),
+  };
+}
+
+// Allows one line per key per window. The next allowed line reports how many were held back. Callers must
+// include anything unique (paths, ids, statuses) in the key so that distinct data is never dropped.
+export function createRepeatGate(windowMs = 60_000, now = () => Date.now()) {
+  const seen = new Map();
+  return key => {
+    const time = now();
+    const entry = seen.get(key);
+    if (entry && time - entry.at < windowMs) { entry.held++; return null; }
+    if (seen.size > 500) seen.clear();
+    seen.set(key, { at: time, held: 0 });
+    return { repeats: entry?.held || 0 };
+  };
+}
+
+export function errorAttributes(error) {
+  return { 'error.type': error?.name || typeof error, 'error.message': String(error?.message ?? error) };
+}
+
+export function monitoringOptions(env = {}, runtime = 'worker', { consoleLoggingIntegration, hostName } = {}) {
   const environment = env.SENTRY_ENVIRONMENT || process.env.SENTRY_ENVIRONMENT || 'production';
   const explicitDsn = env.SENTRY_DSN?.trim();
   const testing = environment === 'test' || env.NODE_ENV === 'test' || process.env.NODE_ENV === 'test';
@@ -56,25 +326,22 @@ export function monitoringOptions(env = {}, runtime = 'worker') {
     tracePropagationTargets: [],
     sendDefaultPii: false,
     dataCollection: {
-      userInfo: false, cookies: false, httpHeaders: false, httpBodies: [], urlQueryParams: false,
+      userInfo: false, cookies: false, httpHeaders: true, httpBodies: [], urlQueryParams: true,
       graphQL: { document: false, variables: false }, genAI: { inputs: false, outputs: false },
       mcp: { inputs: false, outputs: false }, databaseQueryData: false, queues: false,
       stackFrameVariables: false, frameContextLines: 0,
     },
     sendClientReports: false,
-    beforeSendLog: () => null,
+    beforeSendLog: log => sanitizeLog(log, { runtime, hostName }),
     beforeSendMetric: () => null,
     maxBreadcrumbs: 50,
-    initialScope: { tags: { application: 'freetypist-website', monitoring_backend: 'glitchtip', runtime } },
-    integrations: defaults => defaults.filter(integration => ![
-      'BrowserSession', 'ProcessSession', 'CronTriggers', 'ConversationId',
-    ].includes(integration.name)),
+    initialScope: { tags: { application: service, service, monitoring_backend: 'glitchtip', runtime } },
+    integrations: defaults => [
+      ...defaults.filter(integration => !['BrowserSession', 'ProcessSession', 'CronTriggers', 'ConversationId'].includes(integration.name)),
+      ...(consoleLoggingIntegration ? [consoleLoggingIntegration({ levels: ['warn', 'error'] })] : []),
+    ],
     beforeSend: sanitizeEvent,
     beforeSendTransaction: sanitizeEvent,
-    beforeBreadcrumb: sanitizeEvent,
+    beforeBreadcrumb: sanitizeBreadcrumb,
   };
-}
-
-export function sanitizeSpan(span) {
-  return sanitizeEvent(span) || { ...span, description: '[REDACTED]', data: {} };
 }

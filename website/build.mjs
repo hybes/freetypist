@@ -3,6 +3,7 @@ import { SentryCli } from '@sentry/cli';
 import { cp, mkdir, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { scrubText } from './monitoring.mjs';
 
 process.chdir(fileURLToPath(new URL('.', import.meta.url)));
 const environment = process.env.SENTRY_ENVIRONMENT || 'production';
@@ -42,8 +43,8 @@ try {
   } else {
     console.log('GlitchTip source-map upload skipped (no build token or not production).');
   }
-} catch {
-  console.warn('GlitchTip source-map upload failed; continuing the build.');
+} catch (error) {
+  console.warn(`GlitchTip source-map upload failed; continuing the build. ${scrubText(error?.message || error)}`);
 } finally {
   await rm('dist/public/app.js.map', { force: true });
   await rm('dist/worker.mjs.map', { force: true });
