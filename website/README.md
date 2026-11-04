@@ -41,15 +41,29 @@ Identical release failures are logged once a minute per path, status and reason,
 
 **What is sent.** Personal data is kept: emails, names, phone numbers, URLs and paths, query values, request headers such as `User-Agent` and `Referer`, status codes, error messages and stack traces. Only secrets are redacted, in events, breadcrumbs, spans, logs and console copies: passwords, API keys and tokens, `Authorization`/`Proxy-Authorization`/`Cookie`/`Set-Cookie` headers, cookies and session ids, OAuth `code` and `state`, URL signatures, one-time, MFA, recovery, signup and invite codes, Vercel bypass values and card numbers. Keys match in any form (`api-key`, `X-API-Key`, `apiKey`) and at any depth. `code` and `state` are secrets in query strings and OAuth callback bodies, but error `code` fields are kept. Database bound parameters are redacted as a list when the statement names a secret column, because they cannot be matched to columns safely. Values over 16,384 characters are truncated with a marker. IP addresses and user details are not collected (`sendDefaultPii` is off); the site has no accounts, so events have no user.
 
-Sessions, metrics, replay, profiling, feedback and cron check-ins are disabled. Local development is disabled unless a DSN is explicitly set, and tests always disable reporting. If GlitchTip is unreachable, the SDK drops the data; the site and build carry on.
+Sessions, metrics, replay, profiling, feedback and cron check-ins are disabled. If GlitchTip is unreachable, the SDK drops the data; the site and build carry on.
+
+**When it reports.** Only code built by `wrangler deploy` or `wrangler versions upload` reports. Wrangler passes its command to the custom build as `WRANGLER_COMMAND`, and `build.mjs` bakes it into both bundles:
+
+| How the code runs | Reports | `environment` |
+| --- | --- | --- |
+| `npm run deploy` / `wrangler deploy`, by hand or from Workers Builds | Yes | `production` |
+| `wrangler versions upload` (Workers Builds non-production branches) | Yes | `preview` |
+| `npm run dev` / `wrangler dev`, including `--tunnel` | No | `development` |
+| Plain `npm run build`, `node` scripts, anything else | No | `development` |
+| `npm test` | Never, even when forced | `development` |
+
+In the browser, a deployed bundle also needs the page on a public host. Pages on `localhost`, `127.0.0.1`, `::1`, `0.0.0.0`, `*.local`, `*.localhost`, `*.test`, private or link-local addresses (`10.x`, `192.168.x`, `172.16–31.x`, `169.254.x`), dotless LAN names and `file://` do not report. As a second check, `beforeSend`, `beforeSendTransaction` and `beforeSendLog` drop anything whose request URL, `Host` header, URL attribute, current page or current Worker request is on one of those hosts. Setting `SENTRY_DSN` or `SENTRY_ENVIRONMENT=production` does not turn reporting on.
+
+To report from a local run on purpose, set `SENTRY_FORCE=1`. Export it before `npm run dev` or `npm run build` to force both bundles, or put it in `.dev.vars` to force only the Worker. Forced runs skip the local-host check and are tagged `development` unless `SENTRY_ENVIRONMENT` says otherwise. Leave it unset afterwards.
 
 Optional overrides are listed in `.env.example`. It is a reference, not a file that the build loads. Export build variables in the shell or set them in Workers Builds. `SENTRY_DSN` is a Worker runtime variable; use `.dev.vars` for local Worker overrides. `PUBLIC_SENTRY_DSN` is the browser's build-time override, and its origin is added to `connect-src` automatically. Scripts remain same-origin.
 
-For local reporting, export `PUBLIC_SENTRY_DSN` before `npm run dev` for browser errors, or set `SENTRY_DSN` in `.dev.vars` for Worker errors. Do not copy the production environment setting into local configuration. Optional `SENTRY_ENVIRONMENT` and `SENTRY_RELEASE` can be set at build time and overridden for the Worker at runtime. Releases default to `freetypist-website@<git commit>`.
+To send local reports somewhere other than the default project, combine `SENTRY_FORCE=1` with `PUBLIC_SENTRY_DSN` (browser) or `SENTRY_DSN` in `.dev.vars` (Worker). Optional `SENTRY_ENVIRONMENT` and `SENTRY_RELEASE` can be set at build time and overridden for the Worker at runtime. Without `SENTRY_ENVIRONMENT`, the environment follows the table above. Releases default to `freetypist-website@<git commit>`.
 
-When the build-only secret `SENTRY_AUTH_TOKEN` is present in production, source maps for both bundles are uploaded to `https://error.cnnct.uk/` for `connect-dorset/freetypist-website`. The build continues if the token is missing or upload fails. Maps are removed before deployment, including from public assets. There is no commit association or deploy record. Keep the token out of Worker runtime variables.
+When the build-only secret `SENTRY_AUTH_TOKEN` is present in a production build (`wrangler deploy`), source maps for both bundles are uploaded to `https://error.cnnct.uk/` for `connect-dorset/freetypist-website`. The build continues if the token is missing or upload fails. Maps are removed before deployment, including from public assets. There is no commit association or deploy record. Keep the token out of Worker runtime variables.
 
-Run `npm run monitoring:verify` to send one warn log, one error log and one error event through the Worker SDK and check that GlitchTip returns HTTP 200 for each envelope. Their messages start with `glitchtip-check:` and can be ignored or resolved. Ordinary tests use an in-memory transport.
+Run `npm run monitoring:verify` to force-send one warn log, one error log and one error event through the Worker SDK and check that GlitchTip returns HTTP 200 for each envelope. Their messages start with `glitchtip-check:` and can be ignored or resolved. Ordinary tests use an in-memory transport.
 
 ## Workers Builds
 
@@ -64,4 +78,4 @@ After the PR merges, connect `hybes/freetypist` to the existing Worker with thes
 | Build variables | `NODE_VERSION` (24) |
 | Build secret | `SENTRY_AUTH_TOKEN` (optional; enables source-map uploads) |
 
-The deploy command runs the bundle build through Wrangler. No runtime variables are required for the supplied DSN. Optional build variables: `PUBLIC_SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`. Optional Worker runtime variables: `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`. Cloudflare supplies the deployment credentials when the repository is connected to Workers Builds.
+The deploy command runs the bundle build through Wrangler, which sets `WRANGLER_COMMAND` and so turns reporting on. No runtime variables are required for the supplied DSN. Do not set `SENTRY_FORCE` in Workers Builds. Optional build variables: `PUBLIC_SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`. Optional Worker runtime variables: `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`. Cloudflare supplies the deployment credentials when the repository is connected to Workers Builds.

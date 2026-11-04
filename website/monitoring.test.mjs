@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { consoleLoggingIntegration, getDefaultIntegrations, withSentry } from '@sentry/cloudflare';
 import { getDefaultIntegrations as browserIntegrations } from '@sentry/browser';
 import {
-  createLogger, createRepeatGate, defaultDsn, isSecretKey, monitoringOptions, sanitizeBreadcrumb, sanitizeEvent,
+  createLogger, createRepeatGate, defaultDsn, isLocalHost, isSecretKey, monitoringOptions, sanitizeBreadcrumb, sanitizeEvent,
   sanitizeLog, sanitizeSpan, scrubText, scrubValue,
 } from './monitoring.mjs';
 import { handleRequest } from './worker.mjs';
@@ -14,28 +14,147 @@ test('tests cannot send events, including with an explicit DSN', () => {
   assert.equal(monitoringOptions({ SENTRY_DSN: defaultDsn }).enabled, false);
 });
 
-test('production uses the default DSN and development needs an explicit DSN', () => {
+// Runs monitoringOptions in a fresh process with the given environment, as a deployed bundle would see it.
+function optionsIn(env, calls) {
   const result = execFileSync(process.execPath, ['--input-type=module', '-e', `
     import { monitoringOptions } from './monitoring.mjs';
-    console.log(JSON.stringify([
-      monitoringOptions(),
-      monitoringOptions({ SENTRY_ENVIRONMENT: 'development' }),
-      monitoringOptions({ SENTRY_ENVIRONMENT: 'development', SENTRY_DSN: 'https://public@errors.example/1' }),
-      monitoringOptions({ SENTRY_ENVIRONMENT: 'test', SENTRY_DSN: 'https://public@errors.example/1' }),
-    ]));
-  `], { cwd: new URL('.', import.meta.url), env: { ...process.env, NODE_ENV: 'production', SENTRY_ENVIRONMENT: '' }, encoding: 'utf8' });
-  const [production, development, explicitDevelopment, testing] = JSON.parse(result);
-  assert.equal(production.enabled, true);
-  assert.equal(production.dsn, defaultDsn);
-  assert.equal(development.enabled, false);
-  assert.equal(development.tracesSampleRate, 0);
-  assert.equal(explicitDevelopment.enabled, true);
-  assert.equal(explicitDevelopment.dsn, 'https://public@errors.example/1');
-  assert.equal(testing.enabled, false);
+    const calls = ${JSON.stringify(calls)};
+    console.log(JSON.stringify(calls.map(([env, runtime, url]) => {
+      const { enabled, environment, dsn, tracesSampleRate } = monitoringOptions(env, runtime, { currentUrl: () => url });
+      return { enabled, environment, dsn, tracesSampleRate };
+    })));
+  `], {
+    cwd: new URL('.', import.meta.url), encoding: 'utf8',
+    env: { ...process.env, NODE_ENV: 'production', SENTRY_ENVIRONMENT: '', SENTRY_FORCE: '', WRANGLER_COMMAND: '', ...env },
+  });
+  return JSON.parse(result);
+}
+
+test('local runs are off and tagged development, even with a DSN or a production environment', () => {
+  const [plain, withDsn, productionTag, browser] = optionsIn({}, [
+    [{}, 'worker'],
+    [{ SENTRY_DSN: 'https://public@errors.example/1' }, 'worker'],
+    [{ SENTRY_ENVIRONMENT: 'production' }, 'worker'],
+    [{}, 'browser', 'https://type.cnnct.uk/'],
+  ]);
+  assert.deepEqual(plain, { enabled: false, environment: 'development', dsn: defaultDsn, tracesSampleRate: 0 });
+  assert.equal(withDsn.enabled, false);
+  assert.equal(productionTag.enabled, false);
+  assert.equal(browser.enabled, false);
+  for (const command of ['dev', 'types', 'build']) assert.equal(optionsIn({ WRANGLER_COMMAND: command }, [[{}, 'worker']])[0].enabled, false, command);
+});
+
+test('wrangler deploy reports as production and versions upload as preview', () => {
+  const [worker, browser, localPage, lanPage, filePage] = optionsIn({ WRANGLER_COMMAND: 'deploy' }, [
+    [{}, 'worker'],
+    [{}, 'browser', 'https://type.cnnct.uk/'],
+    [{}, 'browser', 'http://localhost:8787/'],
+    [{}, 'browser', 'http://192.168.1.20:8787/'],
+    [{}, 'browser', 'file:///Users/ben/index.html'],
+  ]);
+  assert.deepEqual(worker, { enabled: true, environment: 'production', dsn: defaultDsn, tracesSampleRate: 0.01 });
+  assert.deepEqual(browser, { enabled: true, environment: 'production', dsn: defaultDsn, tracesSampleRate: 0.01 });
+  assert.equal(localPage.enabled, false);
+  assert.equal(lanPage.enabled, false);
+  assert.equal(filePage.enabled, false);
+  const [preview] = optionsIn({ WRANGLER_COMMAND: 'versions upload' }, [[{}, 'worker']]);
+  assert.deepEqual(preview, { enabled: true, environment: 'preview', dsn: defaultDsn, tracesSampleRate: 0 });
+});
+
+test('SENTRY_FORCE turns local reporting on deliberately, but never in tests', () => {
+  const [buildForce, workerVar, browser] = optionsIn({ SENTRY_FORCE: '1' }, [
+    [{}, 'worker'], [{ SENTRY_FORCE: '' }, 'browser', 'http://localhost:8787/'], [{}, 'browser', 'http://localhost:8787/'],
+  ]);
+  assert.deepEqual(buildForce, { enabled: true, environment: 'development', dsn: defaultDsn, tracesSampleRate: 0 });
+  assert.equal(workerVar.enabled, true);
+  assert.equal(browser.enabled, true);
+  assert.equal(optionsIn({}, [[{ SENTRY_FORCE: 'true' }, 'worker']])[0].enabled, true);
+  assert.equal(optionsIn({ SENTRY_FORCE: '0' }, [[{}, 'worker']])[0].enabled, false);
+  assert.equal(monitoringOptions({ SENTRY_FORCE: '1' }).enabled, false);
+});
+
+test('local hosts are recognised and public hosts are not', () => {
+  for (const host of ['localhost', 'LOCALHOST', 'localhost:8787', 'app.localhost', '127.0.0.1', '127.1.2.3:8787', '0.0.0.0',
+    '::1', '[::1]', '[::1]:8787', '[::ffff:7f00:1]', '[fd12::1]', '[fe80::1]', '10.0.0.4', '192.168.1.20', '172.16.0.1',
+    '172.31.255.255', '169.254.1.1', 'bens-mac.local', 'freetypist.test', 'nas', 'devbox:3000', 'printer.lan', 'host.internal']) {
+    assert.ok(isLocalHost(host), host);
+  }
+  for (const host of ['type.cnnct.uk', 'type.cnnct.uk:443', 'error.cnnct.uk', '8.8.8.8', '172.15.0.1', '172.32.0.1', '11.0.0.1',
+    '[2606:4700::1]', 'localhost.example.com', 'testing.dev', '']) {
+    assert.ok(!isLocalHost(host), host);
+  }
+});
+
+test('send hooks drop local events, transactions and logs and keep production ones', () => {
+  let current;
+  const options = monitoringOptions({ SENTRY_ENVIRONMENT: 'production' }, 'worker', { currentUrl: () => current });
+  const event = url => ({ message: 'x', request: { url, headers: {} } });
+  const log = attributes => ({ level: 'error', message: 'release: failed', attributes });
+  assert.ok(options.beforeSend(event('https://type.cnnct.uk/release.json')));
+  assert.ok(options.beforeSendTransaction(event('https://type.cnnct.uk/')));
+  assert.ok(options.beforeSendLog(log({ 'url.full': 'https://type.cnnct.uk/download', 'url.path': '/download', url: '/download' })));
+  assert.ok(options.beforeSendLog(log({})));
+  for (const url of ['http://localhost:8787/release.json', 'http://127.0.0.1:8787/', 'http://[::1]:8787/', 'http://192.168.1.20/']) {
+    assert.equal(options.beforeSend(event(url)), null, url);
+    assert.equal(options.beforeSendTransaction(event(url)), null, url);
+    assert.equal(options.beforeSendLog(log({ 'url.full': url })), null, url);
+  }
+  assert.equal(options.beforeSend({ request: { url: '/x', headers: { host: 'localhost:8787' } } }), null);
+  assert.equal(options.beforeSendLog(log({ 'server.address': 'bens-mac.local' })), null);
+  current = 'http://localhost:8787/';
+  assert.equal(options.beforeSendLog(log({})), null);
+  assert.equal(options.beforeSend({ message: 'no request' }), null);
+  current = 'https://type.cnnct.uk/';
+  assert.ok(options.beforeSendLog(log({})));
+  const forced = monitoringOptions({ SENTRY_FORCE: '1' }, 'worker', { currentUrl: () => 'http://localhost:8787/' });
+  assert.ok(forced.beforeSend(event('http://localhost:8787/')));
+  assert.ok(forced.beforeSendLog(log({ 'url.full': 'http://localhost:8787/' })));
+});
+
+// Runs the real Worker and Cloudflare SDK in a fresh process with an in-memory transport, so nothing leaves the machine.
+function workerEnvelopes(env, urls) {
+  const result = execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import { consoleLoggingIntegration, getIsolationScope, withSentry } from '@sentry/cloudflare';
+    import { monitoringOptions } from './monitoring.mjs';
+    import { handleRequest } from './worker.mjs';
+    const sent = [];
+    const pending = [];
+    const worker = withSentry(env => ({
+      ...monitoringOptions(env, 'worker', {
+        consoleLoggingIntegration,
+        currentUrl: () => getIsolationScope().getScopeData().sdkProcessingMetadata?.normalizedRequest?.url,
+      }),
+      cacheClient: false, tracesSampleRate: 0,
+      transport: () => ({ send: async envelope => { sent.push(...envelope[1].map(([header]) => header.type)); return { statusCode: 200 }; }, flush: async () => true }),
+    }), { fetch(request, env) {
+      console.error('third-party: widget failed');
+      return handleRequest(request, env, async () => new Response('down', { status: 503 }));
+    } });
+    for (const url of ${JSON.stringify(urls)}) {
+      const response = await worker.fetch(new Request(url + '/release.json'), {}, { waitUntil: promise => pending.push(promise) });
+      await response.text();
+    }
+    await Promise.all(pending);
+    console.log(JSON.stringify(sent));
+  `], {
+    cwd: new URL('.', import.meta.url), encoding: 'utf8',
+    env: { ...process.env, NODE_ENV: 'production', SENTRY_ENVIRONMENT: '', SENTRY_FORCE: '', WRANGLER_COMMAND: '', ...env },
+  });
+  return JSON.parse(result.trim().split('\n').pop());
+}
+
+test('a deployed Worker reports errors and logs from its public host only', () => {
+  const sent = workerEnvelopes({ WRANGLER_COMMAND: 'deploy' }, ['https://type.cnnct.uk']);
+  assert.ok(sent.includes('event'), sent.join());
+  assert.ok(sent.includes('log'), sent.join());
+  assert.deepEqual(workerEnvelopes({ WRANGLER_COMMAND: 'deploy' }, ['http://localhost:8787', 'http://192.168.1.20:8787']), []);
+  assert.deepEqual(workerEnvelopes({ WRANGLER_COMMAND: 'dev' }, ['https://type.cnnct.uk', 'http://localhost:8787']), []);
+  assert.deepEqual(workerEnvelopes({}, ['https://type.cnnct.uk']), []);
+  assert.ok(workerEnvelopes({ SENTRY_FORCE: '1' }, ['http://localhost:8787']).includes('event'));
 });
 
 test('GlitchTip options keep errors, logs, static traces and supported integrations', () => {
-  const options = monitoringOptions({}, 'worker', { consoleLoggingIntegration });
+  const options = monitoringOptions({ SENTRY_ENVIRONMENT: 'production' }, 'worker', { consoleLoggingIntegration });
   assert.equal(options.dsn, defaultDsn);
   assert.equal(options.sampleRate, 1);
   assert.equal(options.tracesSampleRate, 0.01);
@@ -205,7 +324,7 @@ test('the Worker SDK sends handled errors, unexpected errors and structured logs
   const envelopes = [];
   const pending = [];
   const options = {
-    ...monitoringOptions({}, 'worker', { consoleLoggingIntegration }), enabled: true, cacheClient: false, tracesSampleRate: 0,
+    ...monitoringOptions({ SENTRY_ENVIRONMENT: 'production' }, 'worker', { consoleLoggingIntegration }), enabled: true, cacheClient: false, tracesSampleRate: 0,
     transport: () => ({
       send: async envelope => { envelopes.push(envelope); return { statusCode: 200 }; },
       flush: async () => true,

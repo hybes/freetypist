@@ -6,7 +6,7 @@ import { monitoringOptions, sanitizeSpan } from './monitoring.mjs';
 // with `glitchtip-check:` and can be ignored or resolved in GlitchTip afterwards.
 const sent = [];
 const worker = withSentry(() => ({
-  ...monitoringOptions({ SENTRY_DSN: process.env.SENTRY_DSN, SENTRY_ENVIRONMENT: 'production' }, 'worker', { consoleLoggingIntegration }),
+  ...monitoringOptions({ SENTRY_DSN: process.env.SENTRY_DSN, SENTRY_ENVIRONMENT: 'production', SENTRY_FORCE: '1' }, 'worker', { consoleLoggingIntegration }),
   tracesSampleRate: 0,
   beforeSendSpan: withStaticSpan(sanitizeSpan),
   transportOptions: { fetch: async (url, options) => {

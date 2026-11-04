@@ -354,13 +354,78 @@ export function errorAttributes(error) {
   return { 'error.type': error?.name || typeof error, 'error.message': String(error?.message ?? error) };
 }
 
-export function monitoringOptions(env = {}, runtime = 'worker', { consoleLoggingIntegration, hostName } = {}) {
-  const environment = env.SENTRY_ENVIRONMENT || process.env.SENTRY_ENVIRONMENT || 'production';
+// Hosts that only exist on this machine or the local network: loopback, private and link-local addresses,
+// reserved development suffixes and LAN names without a dot.
+export function isLocalHost(rawHost) {
+  let host = String(rawHost ?? '').trim().toLowerCase();
+  if (host.startsWith('[')) host = host.slice(1, host.includes(']') ? host.indexOf(']') : undefined);
+  else if (host.split(':').length === 2) host = host.split(':')[0];
+  host = host.replace(/\.$/, '');
+  if (!host) return false;
+  if (host.includes(':')) {
+    if (host === '::1' || host === '::' || /^(f[cd]|fe[89ab])/.test(host)) return true;
+    const mapped = host.match(/^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/);
+    if (!mapped) return false;
+    if (mapped[1]) return isLocalHost(mapped[1]);
+    const [high, low] = [parseInt(mapped[2], 16), parseInt(mapped[3], 16)];
+    return isLocalHost(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+  }
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    return a === 0 || a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
+  }
+  return !host.includes('.') || /\.(localhost|local|test|internal|lan|home\.arpa)$/.test(host);
+}
+
+// Host name of an absolute URL, or of a bare `host[:port]` when `bare` is set. Paths and relative URLs give ''.
+function hostOf(value, bare = false) {
+  const text = String(value?.value ?? value ?? '').trim();
+  const absolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(text);
+  if (!absolute && !(bare && /^[a-z0-9.\-[\]:]+$/i.test(text))) return '';
+  try { return new URL(absolute ? text : `http://${text}`).hostname; } catch { return ''; }
+}
+
+// True when an event, transaction or log came from a local address: its request URL or Host header, a URL
+// attribute on a log, or the page or request being handled when it was captured.
+function fromLocalHost(item, currentUrl) {
+  const headers = item?.request?.headers || {};
+  const attributes = item?.attributes || {};
+  let current;
+  try { current = currentUrl?.(); } catch {}
+  const urls = [item?.request?.url, attributes['url.full'], attributes['http.url'], attributes.url, current];
+  const hosts = [headers.host, headers.Host, attributes['server.address']];
+  return urls.some(value => isLocalHost(hostOf(value))) || hosts.some(value => isLocalHost(hostOf(value, true)));
+}
+
+// Wrangler tells the build which command it runs for (build.mjs bakes it into both bundles). Only
+// `wrangler deploy` and `wrangler versions upload` produce code that runs on Cloudflare; `wrangler dev`,
+// a plain `npm run build`, tests and scripts have no command or `dev`.
+const deployCommands = new Map([['deploy', 'production'], ['versions upload', 'preview']]);
+const isOn = value => /^(1|true|yes)$/i.test(String(value ?? '').trim());
+
+export function deployment(env = {}) {
+  const hosted = deployCommands.get(String(process.env.WRANGLER_COMMAND ?? '').trim());
+  return {
+    deployed: Boolean(hosted),
+    force: isOn(env.SENTRY_FORCE) || isOn(process.env.SENTRY_FORCE),
+    environment: env.SENTRY_ENVIRONMENT || process.env.SENTRY_ENVIRONMENT || hosted || 'development',
+  };
+}
+
+// Sends only from real deployments. In the browser the page must also be on a public host. SENTRY_FORCE=1
+// turns sending on anywhere except tests, for deliberate local checks.
+export function monitoringOptions(env = {}, runtime = 'worker', { consoleLoggingIntegration, hostName, currentUrl } = {}) {
+  const { deployed, force, environment } = deployment(env);
   const explicitDsn = env.SENTRY_DSN?.trim();
   const testing = environment === 'test' || env.NODE_ENV === 'test' || process.env.NODE_ENV === 'test';
+  let pageHost = '';
+  try { pageHost = runtime === 'browser' ? hostOf(currentUrl?.()) : ''; } catch { pageHost = ''; }
+  const hosted = deployed && (runtime !== 'browser' || (pageHost !== '' && !isLocalHost(pageHost)));
+  const remote = item => force || !fromLocalHost(item, currentUrl);
   return {
     dsn: explicitDsn || defaultDsn,
-    enabled: !testing && (environment === 'production' || Boolean(explicitDsn)),
+    enabled: !testing && (force || hosted),
     environment,
     release: env.SENTRY_RELEASE || process.env.SENTRY_RELEASE || undefined,
     sampleRate: 1,
@@ -375,7 +440,7 @@ export function monitoringOptions(env = {}, runtime = 'worker', { consoleLogging
       stackFrameVariables: false, frameContextLines: 0,
     },
     sendClientReports: false,
-    beforeSendLog: log => sanitizeLog(log, { runtime, hostName }),
+    beforeSendLog: log => (remote(log) ? sanitizeLog(log, { runtime, hostName }) : null),
     beforeSendMetric: () => null,
     maxBreadcrumbs: 50,
     initialScope: { tags: { application: service, service, monitoring_backend: 'glitchtip', runtime } },
@@ -383,8 +448,8 @@ export function monitoringOptions(env = {}, runtime = 'worker', { consoleLogging
       ...defaults.filter(integration => !['BrowserSession', 'ProcessSession', 'CronTriggers', 'ConversationId'].includes(integration.name)),
       ...(consoleLoggingIntegration ? [consoleLoggingIntegration({ levels: ['warn', 'error'] })] : []),
     ],
-    beforeSend: sanitizeEvent,
-    beforeSendTransaction: sanitizeEvent,
+    beforeSend: event => (remote(event) ? sanitizeEvent(event) : null),
+    beforeSendTransaction: event => (remote(event) ? sanitizeEvent(event) : null),
     beforeBreadcrumb: sanitizeBreadcrumb,
   };
 }
