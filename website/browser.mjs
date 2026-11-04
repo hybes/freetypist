@@ -1,9 +1,10 @@
-import { init, captureException, withStaticSpan } from '@sentry/browser';
-import { monitoringOptions, sanitizeSpan } from './monitoring.mjs';
+import { init, captureException, consoleLoggingIntegration, logger, withStaticSpan } from '@sentry/browser';
+import { createLogger, errorAttributes, monitoringOptions, sanitizeSpan } from './monitoring.mjs';
 
 init({
-  ...monitoringOptions({ SENTRY_DSN: process.env.PUBLIC_SENTRY_DSN }, 'browser'),
+  ...monitoringOptions({ SENTRY_DSN: process.env.PUBLIC_SENTRY_DSN }, 'browser', { consoleLoggingIntegration }),
   beforeSendSpan: withStaticSpan(sanitizeSpan),
 });
 
-export { captureException };
+export const log = createLogger(logger);
+export { captureException, errorAttributes };
