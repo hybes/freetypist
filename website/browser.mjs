@@ -2,7 +2,9 @@ import { init, captureException, consoleLoggingIntegration, logger, withStaticSp
 import { createLogger, errorAttributes, monitoringOptions, sanitizeSpan } from './monitoring.mjs';
 
 init({
-  ...monitoringOptions({ SENTRY_DSN: process.env.PUBLIC_SENTRY_DSN }, 'browser', { consoleLoggingIntegration }),
+  ...monitoringOptions({ SENTRY_DSN: process.env.PUBLIC_SENTRY_DSN }, 'browser', {
+    consoleLoggingIntegration, currentUrl: () => globalThis.location?.href,
+  }),
   beforeSendSpan: withStaticSpan(sanitizeSpan),
 });
 

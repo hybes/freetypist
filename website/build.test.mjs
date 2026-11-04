@@ -61,3 +61,21 @@ test('builds skip missing tokens, upload when configured and tolerate upload fai
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test('deploy builds bake the Wrangler command, and dry runs build as local', async () => {
+  const cwd = fileURLToPath(new URL('.', import.meta.url));
+  const baked = async () => (await readFile(join(cwd, 'dist/worker.mjs'), 'utf8')).match(/deployCommands\.get\(String\("([^"]*)"/)?.[1];
+  const env = { ...process.env, SENTRY_ENVIRONMENT: '', SENTRY_AUTH_TOKEN: '', WRANGLER_COMMAND: 'deploy' };
+  execFileSync(process.execPath, ['build.mjs'], { cwd, env, stdio: 'ignore' });
+  assert.equal(await baked(), 'deploy');
+  // Parent processes stand in for the Wrangler CLI, which runs the custom build, and a script above it.
+  const run = `process.stdout.write(require('node:child_process').execFileSync(process.execPath, JSON.parse(process.argv[1]), { encoding: 'utf8' }))`;
+  const build = ['build.mjs'];
+  const wrangler = flags => ['-e', run, JSON.stringify(build), 'node_modules/wrangler/wrangler-dist/cli.js', 'deploy', ...flags];
+  const output = execFileSync(process.execPath, wrangler(['--dry-run']), { cwd, env, encoding: 'utf8' });
+  assert.match(output, /Dry run: this build will not report/);
+  assert.equal(await baked(), '');
+  assert.doesNotMatch(await readFile(join(cwd, 'dist/public/app.js'), 'utf8'), /deployCommands\.get\(String\("deploy"/);
+  execFileSync(process.execPath, ['-e', run, JSON.stringify(wrangler([])), 'sh -c "wrangler deploy --dry-run && wrangler deploy"'], { cwd, env, stdio: 'ignore' });
+  assert.equal(await baked(), 'deploy');
+});

@@ -1,4 +1,4 @@
-import { captureException, consoleLoggingIntegration, logger, withSentry, withStaticSpan } from '@sentry/cloudflare';
+import { captureException, consoleLoggingIntegration, getIsolationScope, logger, withSentry, withStaticSpan } from '@sentry/cloudflare';
 import { createLogger, createRepeatGate, defaultDsn, errorAttributes, monitoringOptions, sanitizeSpan } from './monitoring.mjs';
 
 const releaseOrigin = 'https://store.brth.uk/connect-dorset/freetypist/releases';
@@ -125,6 +125,9 @@ export async function handleRequest(request, env, upstream = fetch) {
 }
 
 export default withSentry(env => ({
-  ...monitoringOptions(env, 'worker', { consoleLoggingIntegration }),
+  ...monitoringOptions(env, 'worker', {
+    consoleLoggingIntegration,
+    currentUrl: () => getIsolationScope().getScopeData().sdkProcessingMetadata?.normalizedRequest?.url,
+  }),
   beforeSendSpan: withStaticSpan(sanitizeSpan),
 }), { fetch(request, env) { return handleRequest(request, env); } });
