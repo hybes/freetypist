@@ -1,3 +1,5 @@
+import { captureException } from '../browser.mjs';
+
 const examples = {
   completion: { before: 'Thanks for ', suggestion: 'your help.', after: 'Thanks for your help.', hint: 'Press Tab to accept', description: 'FreeTypist suggests “your help.” after “Thanks for ”. Tab accepts the suggestion.' },
   spelling: { before: 'I’ll definately be there.', target: 'definately', after: 'I’ll definitely be there.', hint: 'Fix “definately” with Tab', description: 'Tab corrects “I’ll definately be there.” to “I’ll definitely be there.”' },
@@ -108,7 +110,8 @@ fetch('/release.json', { cache: 'no-store', signal: AbortSignal.timeout(10000) }
   trust.className = 'release-line';
   trust.textContent = `${Math.round(release.size / 1e6)} MB download · Notarised by Apple`;
   status.replaceChildren(platform, trust);
-}).catch(() => {
+}).catch(error => {
+  captureException(error, { tags: { operation: 'release_metadata' } });
   status.textContent = 'The download is being prepared. Please check back shortly.';
   download.textContent = 'Download being prepared';
   download.setAttribute('aria-disabled', 'true');

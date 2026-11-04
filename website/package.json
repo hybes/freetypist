@@ -3,9 +3,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --port 8787",
+    "build": "node build.mjs",
+    "dev": "SENTRY_ENVIRONMENT=development wrangler dev --port 8787",
     "deploy": "wrangler deploy",
-    "test": "node --test worker.test.mjs"
+    "test": "NODE_ENV=test node --test *.test.mjs",
+    "monitoring:verify": "node verify-glitchtip.mjs"
   },
-  "devDependencies": { "wrangler": "4.151.2" }
+  "devDependencies": {
+    "@sentry/cli": "3.8.2",
+    "esbuild": "0.28.2",
+    "wrangler": "4.151.2"
+  },
+  "dependencies": {
+    "@sentry/browser": "11.10.0",
+    "@sentry/cloudflare": "11.10.0"
+  }
 }

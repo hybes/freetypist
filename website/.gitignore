@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+dist/
+.wrangler-build-test-*/

@@ -64,4 +64,6 @@ test('Cloudflare execution context is not mistaken for the upstream fetch functi
   assert.equal(response.status, 200);
   assert.match(await response.text(), /FreeTypist/);
   assert.match(response.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
+  assert.match(response.headers.get('Content-Security-Policy'), /connect-src 'self' https:\/\/error\.cnnct\.uk;/);
+  assert.match(response.headers.get('Content-Security-Policy'), /script-src 'self';/);
 });

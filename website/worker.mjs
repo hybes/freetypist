@@ -1,3 +1,6 @@
+import { captureException, withSentry, withStaticSpan } from '@sentry/cloudflare';
+import { defaultDsn, monitoringOptions, sanitizeSpan } from './monitoring.mjs';
+
 const releaseOrigin = 'https://store.brth.uk/connect-dorset/freetypist/releases';
 const archiveName = /^FreeTypist-\d+\.\d+\.\d+-arm64\.(dmg|zip)(\.sha256)?$/;
 
@@ -28,7 +31,10 @@ export async function handleRequest(request, env, upstream = fetch) {
       return new Response(request.method === 'HEAD' ? null : JSON.stringify(release), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
       });
-    } catch { return unavailable('The Mac download is being prepared. Please try again shortly.'); }
+    } catch (error) {
+      captureException(error, { tags: { operation: 'release_metadata' } });
+      return unavailable('The Mac download is being prepared. Please try again shortly.');
+    }
   }
   if (url.pathname === '/appcast.xml' || url.pathname.startsWith('/releases/')) {
     const name = url.pathname === '/appcast.xml' ? 'appcast.xml' : url.pathname.slice('/releases/'.length);
@@ -44,14 +50,21 @@ export async function handleRequest(request, env, upstream = fetch) {
       outgoing.set('X-Content-Type-Options', 'nosniff');
       if (name === 'appcast.xml') outgoing.set('Content-Type', 'application/xml; charset=utf-8');
       return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers: outgoing });
-    } catch { return unavailable('Download unavailable. Please try again.', 502); }
+    } catch (error) {
+      captureException(error, { tags: { operation: 'release_download' } });
+      return unavailable('Download unavailable. Please try again.', 502);
+    }
   }
   const response = await env.ASSETS.fetch(request);
   const headers = new Headers(response.headers);
-  headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  const ingestOrigin = new URL(process.env.PUBLIC_SENTRY_DSN?.trim() || defaultDsn).origin;
+  headers.set('Content-Security-Policy', `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' ${ingestOrigin}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`);
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
   return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers });
 }
 
-export default { fetch(request, env) { return handleRequest(request, env); } };
+export default withSentry(env => ({
+  ...monitoringOptions(env),
+  beforeSendSpan: withStaticSpan(sanitizeSpan),
+}), { fetch(request, env) { return handleRequest(request, env); } });
