@@ -18,7 +18,7 @@ Wrangler runs `npm run build` before development and deployment. It bundles the 
 
 Worker and browser errors and logs go to [GlitchTip](https://error.cnnct.uk), organisation `connect-dorset`, project `freetypist-website`. The public DSN is the default in code. All monitoring options, the scrubber and the logger live in `monitoring.mjs`.
 
-**Issues.** Uncaught errors and handled failures (`captureException`) become issues tagged `service` and `application` (`freetypist-website`), `runtime` (`worker` or `browser`) and, where relevant, `operation` and `stage`. Errors are sampled at 100%; production traces at 1%.
+**Issues.** Uncaught errors and handled failures (`captureException`) become issues tagged `service` and `application` (`freetypist-website`), `runtime` (`worker` or `browser`) and, where relevant, `operation` and `stage`. Errors are sampled at 100%; production and preview traces at 1%.
 
 **Logs.** The Logs page receives structured logs from both runtimes. Every line has these attributes:
 
@@ -49,11 +49,12 @@ Sessions, metrics, replay, profiling, feedback and cron check-ins are disabled. 
 | --- | --- | --- |
 | `npm run deploy` / `wrangler deploy`, by hand or from Workers Builds | Yes | `production` |
 | `wrangler versions upload` (Workers Builds non-production branches) | Yes | `preview` |
+| `wrangler deploy --dry-run` | No | `development` |
 | `npm run dev` / `wrangler dev`, including `--tunnel` | No | `development` |
 | Plain `npm run build`, `node` scripts, anything else | No | `development` |
 | `npm test` | Never, even when forced | `development` |
 
-In the browser, a deployed bundle also needs the page on a public host. Pages on `localhost`, `127.0.0.1`, `::1`, `0.0.0.0`, `*.local`, `*.localhost`, `*.test`, private or link-local addresses (`10.x`, `192.168.x`, `172.16–31.x`, `169.254.x`), dotless LAN names and `file://` do not report. As a second check, `beforeSend`, `beforeSendTransaction` and `beforeSendLog` drop anything whose request URL, `Host` header, URL attribute, current page or current Worker request is on one of those hosts. Setting `SENTRY_DSN` or `SENTRY_ENVIRONMENT=production` does not turn reporting on.
+In the browser, a deployed bundle also needs the page on a public host. Pages on `localhost`, `127.0.0.1`, `::1`, `0.0.0.0`, `*.local`, `*.localhost`, `*.test`, private, link-local or Tailscale addresses (`10.x`, `192.168.x`, `172.16–31.x`, `169.254.x`, `100.64–127.x`, `*.ts.net`), dotless LAN names and `file://` do not report. As a second check, `beforeSend`, `beforeSendTransaction` and `beforeSendLog` drop anything whose request URL, `Host` header, URL attribute, current page or current Worker request is on one of those hosts. Setting `SENTRY_DSN` or `SENTRY_ENVIRONMENT=production` does not turn reporting on. Wrangler reports a dry run as `deploy`, so `build.mjs` checks the Wrangler process that started it for `--dry-run`. Wrangler rebuilds `dist/` for every `dev` and `deploy`, so a deploy bundle only runs locally if `dist/` is started without Wrangler; the host check is then the only guard.
 
 To report from a local run on purpose, set `SENTRY_FORCE=1`. Export it before `npm run dev` or `npm run build` to force both bundles, or put it in `.dev.vars` to force only the Worker. Forced runs skip the local-host check and are tagged `development` unless `SENTRY_ENVIRONMENT` says otherwise. Leave it unset afterwards.
 

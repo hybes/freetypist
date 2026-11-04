@@ -6,6 +6,27 @@ import { fileURLToPath } from 'node:url';
 import { deployment, scrubText } from './monitoring.mjs';
 
 process.chdir(fileURLToPath(new URL('.', import.meta.url)));
+
+// Wrangler sets WRANGLER_COMMAND=deploy for `wrangler deploy --dry-run` too, and gives the build no other sign of
+// it, so look for the flag on the Wrangler CLI process that started this build, and only that one: a shell or
+// CI script above it may mention `--dry-run` for another command. If `ps` is unavailable this finds nothing and
+// the build stays a deployment build.
+function wranglerDryRun() {
+  let pid = process.ppid;
+  for (let depth = 0; depth < 8 && pid > 1; depth++) {
+    let line;
+    try { line = execFileSync('ps', ['-o', 'ppid=', '-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return false; }
+    const [, parent, args = ''] = line.match(/^(\d+)\s*(.*)$/s) || [];
+    if (/wrangler-dist[\\/]cli\.js(\s|$)/.test(args)) return /\s--dry-run(=true)?(\s|$)/.test(args);
+    pid = Number(parent);
+  }
+  return false;
+}
+if (process.env.WRANGLER_COMMAND && wranglerDryRun()) {
+  console.log('Dry run: this build will not report to GlitchTip.');
+  process.env.WRANGLER_COMMAND = '';
+}
+
 // Production or preview only under `wrangler deploy` or `wrangler versions upload`; development otherwise.
 const { environment } = deployment();
 let commit = 'local';

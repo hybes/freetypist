@@ -58,7 +58,7 @@ test('wrangler deploy reports as production and versions upload as preview', () 
   assert.equal(lanPage.enabled, false);
   assert.equal(filePage.enabled, false);
   const [preview] = optionsIn({ WRANGLER_COMMAND: 'versions upload' }, [[{}, 'worker']]);
-  assert.deepEqual(preview, { enabled: true, environment: 'preview', dsn: defaultDsn, tracesSampleRate: 0 });
+  assert.deepEqual(preview, { enabled: true, environment: 'preview', dsn: defaultDsn, tracesSampleRate: 0.01 });
 });
 
 test('SENTRY_FORCE turns local reporting on deliberately, but never in tests', () => {
@@ -76,11 +76,11 @@ test('SENTRY_FORCE turns local reporting on deliberately, but never in tests', (
 test('local hosts are recognised and public hosts are not', () => {
   for (const host of ['localhost', 'LOCALHOST', 'localhost:8787', 'app.localhost', '127.0.0.1', '127.1.2.3:8787', '0.0.0.0',
     '::1', '[::1]', '[::1]:8787', '[::ffff:7f00:1]', '[fd12::1]', '[fe80::1]', '10.0.0.4', '192.168.1.20', '172.16.0.1',
-    '172.31.255.255', '169.254.1.1', 'bens-mac.local', 'freetypist.test', 'nas', 'devbox:3000', 'printer.lan', 'host.internal']) {
+    '172.31.255.255', '169.254.1.1', '100.101.102.103', 'bens-mac.tail1234.ts.net', 'bens-mac.local', 'freetypist.test', 'nas', 'devbox:3000', 'printer.lan', 'host.internal']) {
     assert.ok(isLocalHost(host), host);
   }
   for (const host of ['type.cnnct.uk', 'type.cnnct.uk:443', 'error.cnnct.uk', '8.8.8.8', '172.15.0.1', '172.32.0.1', '11.0.0.1',
-    '[2606:4700::1]', 'localhost.example.com', 'testing.dev', '']) {
+    '[2606:4700::1]', '100.63.0.1', '100.128.0.1', 'localhost.example.com', 'testing.dev', '']) {
     assert.ok(!isLocalHost(host), host);
   }
 });

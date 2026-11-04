@@ -354,8 +354,8 @@ export function errorAttributes(error) {
   return { 'error.type': error?.name || typeof error, 'error.message': String(error?.message ?? error) };
 }
 
-// Hosts that only exist on this machine or the local network: loopback, private and link-local addresses,
-// reserved development suffixes and LAN names without a dot.
+// Hosts that only exist on this machine or the local network: loopback, private, link-local and Tailscale
+// (100.64/10, *.ts.net) addresses, reserved development suffixes and LAN names without a dot.
 export function isLocalHost(rawHost) {
   let host = String(rawHost ?? '').trim().toLowerCase();
   if (host.startsWith('[')) host = host.slice(1, host.includes(']') ? host.indexOf(']') : undefined);
@@ -373,9 +373,10 @@ export function isLocalHost(rawHost) {
   const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
   if (ipv4) {
     const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
-    return a === 0 || a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
+    return a === 0 || a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254)
+      || (a === 100 && b >= 64 && b <= 127);
   }
-  return !host.includes('.') || /\.(localhost|local|test|internal|lan|home\.arpa)$/.test(host);
+  return !host.includes('.') || /\.(localhost|local|test|internal|lan|home\.arpa|ts\.net)$/.test(host);
 }
 
 // Host name of an absolute URL, or of a bare `host[:port]` when `bare` is set. Paths and relative URLs give ''.
@@ -429,7 +430,7 @@ export function monitoringOptions(env = {}, runtime = 'worker', { consoleLogging
     environment,
     release: env.SENTRY_RELEASE || process.env.SENTRY_RELEASE || undefined,
     sampleRate: 1,
-    tracesSampleRate: environment === 'production' ? 0.01 : 0,
+    tracesSampleRate: environment === 'production' || (deployed && environment === 'preview') ? 0.01 : 0,
     traceLifecycle: 'static',
     tracePropagationTargets: [],
     sendDefaultPii: false,
