@@ -113,7 +113,7 @@ test('free text keeps context and redacts secret values only', () => {
     ['see /reset?%74oken=abc&email=a@b.co', 'see /reset?%74oken=[REDACTED]&email=a@b.co'],
     ['https://x.test/a?x-vercel-protection-bypass=s3cret', 'https://x.test/a?x-vercel-protection-bypass=[REDACTED]'],
     ['https://bucket.test/f?X-Amz-Signature=abc&X-Amz-Credential=k&X-Amz-Expires=60', 'https://bucket.test/f?X-Amz-Signature=[REDACTED]&X-Amz-Credential=[REDACTED]&X-Amz-Expires=60'],
-    ['cookie=a="secret value"; theme=dark', 'cookie=[REDACTED]; theme=dark'],
+    ['cookie=a="secret value"; theme=dark', 'cookie=[REDACTED]'],
     ['request failed\nAuthorization: Basic dXNlcjpwYXNz\nCookie: _vercel_jwt="x"; a=b\nSet-Cookie: sid=1; Path=/', 'request failed\nAuthorization: [REDACTED]\nCookie: [REDACTED]\nSet-Cookie: [REDACTED]'],
     ['headers sent proxy-authorization: bearer abc def', 'headers sent proxy-authorization: [REDACTED]'],
     ['upstream said BEARER abc.def-123 was rejected', 'upstream said BEARER [REDACTED] was rejected'],
@@ -122,7 +122,13 @@ test('free text keeps context and redacts secret values only', () => {
     ['{"password":"x=1","note":"call me"}', '{"password":"[REDACTED]","note":"call me"}'],
     ['secret=["a","b"] codes={"backup":["1","2"]} left', 'secret=[REDACTED] codes={"backup":["1","2"]} left'],
     ['recovery_codes=[1, 2, 3] next', 'recovery_codes=[REDACTED] next'],
-    ['insert failed: duplicate key, parameters: ["ben@example.com", "password=hunter2"]', 'insert failed: duplicate key, parameters: ["ben@example.com", "password=[REDACTED]"]'],
+    ['lookup failed, parameters: ["ben@example.com", "password=hunter2"]', 'lookup failed, parameters: ["ben@example.com", "password=[REDACTED]"]'],
+    ['query failed: INSERT INTO users (email, password) VALUES ($1, $2); parameters: ["ben@example.com", "hunter2"]', 'query failed: INSERT INTO users (email, password) VALUES ($1, $2); parameters: [REDACTED]'],
+    ['query failed: SELECT * FROM orders WHERE email = $1; parameters: ["ben@example.com"]', 'query failed: SELECT * FROM orders WHERE email = $1; parameters: ["ben@example.com"]'],
+    ['password: ["hunter2", "secret2"]', 'password: [REDACTED]'],
+    ['password: "hunter2 secret"', 'password: "[REDACTED]"'],
+    ['token: abc123 expired', 'token: [REDACTED] expired'],
+    ['Cookie=a="secret"; b="othersecret"', 'Cookie=[REDACTED]'],
     ['card 4242 4242 4242 4242 declined, order 1762214400000', 'card [REDACTED CARD] declined, order 1762214400000'],
     ['invite_code=XY12 signup-code: QQ9', 'invite_code=[REDACTED] signup-code: [REDACTED]'],
   ];
@@ -166,14 +172,24 @@ test('objects keep personal data and redact whole secret values at any depth', (
   const span = sanitizeSpan({ description: 'GET https://x.test/a?token=private', data: { 'url.query': 'token=private&state=private&page=1', 'http.request.header.cookie': 'private', 'url.full': 'https://x.test/a?signature=private' } });
   assert.doesNotMatch(JSON.stringify(span), /private/);
   assert.equal(span.data['url.query'], 'token=[REDACTED]&state=[REDACTED]&page=1');
+  assert.equal(sanitizeEvent({ request: { data: { card: 4242424242424242, amount: 1999, at: 1762214400000 } } }).request.data.card, '[REDACTED CARD]');
+  assert.equal(sanitizeEvent({ request: { data: { amount: 1999, at: 1762214400000 } } }).request.data.at, 1762214400000);
+  assert.deepEqual(JSON.parse(scrubValue('{"card":4242424242424242}', 'data')), { card: '[REDACTED CARD]' });
+  assert.deepEqual(sanitizeEvent({ request: { data: { code: 'oauth-abc', state: 'csrf-xyz', next: '/account' } } }).request.data, { code: '[REDACTED]', state: '[REDACTED]', next: '/account' });
+  assert.equal(scrubValue('code=oauth-abc&state=csrf-xyz&next=%2F', 'data'), 'code=[REDACTED]&state=[REDACTED]&next=%2F');
+  assert.deepEqual(scrubValue({ error: { code: 'INVALID_KEY', status: 401 } }), { error: { code: 'INVALID_KEY', status: 401 } });
+  assert.deepEqual(scrubValue({ sql: 'INSERT INTO users (email, password) VALUES ($1, $2)', parameters: ['ben@example.com', 'hunter2'] }).parameters, '[REDACTED]');
+  assert.deepEqual(scrubValue({ sql: 'SELECT * FROM orders WHERE email = $1', parameters: ['ben@example.com'] }).parameters, ['ben@example.com']);
   const circular = { name: 'a' };
   circular.self = circular;
   assert.equal(scrubValue(circular).self, '[Circular]');
   const shared = { email: 'a@b.co' };
   assert.deepEqual(scrubValue({ a: shared, b: shared }), { a: shared, b: shared });
-  const broken = sanitizeEvent({ event_id: '1', get user() { throw new Error('unsafe getter'); } });
+  const broken = sanitizeEvent({ event_id: '1', get user() { throw new Error('password=hunter2'); } });
   assert.equal(broken.event_id, '1');
-  assert.match(broken.message, /could not be scrubbed/);
+  assert.equal(broken.message, 'monitoring: event could not be scrubbed (Error)');
+  const brokenLog = sanitizeLog({ level: 'warn', message: 'x', attributes: { context: { get note() { throw new Error('password=hunter2'); } } } }, { runtime: 'worker' });
+  assert.equal(brokenLog.message, 'monitoring: log could not be scrubbed (Error)');
 });
 
 test('the scrubber is linear and caps very long values', () => {

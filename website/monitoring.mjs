@@ -32,14 +32,22 @@ function words(segment) {
   return segment.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 }
 
-export function isSecretKey(rawKey, query = false) {
+function keyNames(rawKey) {
   const key = decodeKey(String(rawKey)).slice(0, 256);
-  if (!key) return false;
   const segments = key.split('.');
-  const leaf = words(segments[segments.length - 1]);
   const all = words(key);
-  const leafName = leaf.join('');
-  const fullName = all.join('');
+  return { all, leafName: words(segments[segments.length - 1]).join(''), fullName: all.join('') };
+}
+
+// Unambiguous secret names (password, token, cookie…), never treated as a leading label.
+function isStrongSecretKey(rawKey) {
+  const { leafName, fullName } = keyNames(rawKey);
+  return secretParts.some(part => leafName.includes(part) || fullName.includes(part));
+}
+
+export function isSecretKey(rawKey, query = false) {
+  if (!String(rawKey)) return false;
+  const { all, leafName, fullName } = keyNames(rawKey);
   if (secretParts.some(part => leafName.includes(part) || fullName.includes(part))) return true;
   if (all.some(word => secretWords.has(word))) return true;
   if (secretNames.has(leafName) || secretNames.has(fullName)) return true;
@@ -164,17 +172,43 @@ function scrubLine(line, forceQuery) {
     }
 
     const valueStart = skipSpaces(line, separatorAt + 1);
-    // A leading `area:` followed by a phrase is a label (`session: could not verify the request`).
+    // A leading `area:` followed by a phrase is a label (`session: could not verify the request`). Unambiguous
+    // secret names and quoted or bracketed values are never labels.
     const label = !query && separator === ':' && keyStart === firstText && valueStart > separatorAt + 1
-      && wordEnd(line, valueStart) < line.trimEnd().length;
+      && !'"\'[{'.includes(line[valueStart]) && wordEnd(line, valueStart) < line.trimEnd().length
+      && !isStrongSecretKey(keyText);
     if (label || !isSecretKey(keyText, query)) { index = separatorAt + 1; continue; }
 
-    let end = valueEnd(line, valueStart, query);
+    // A cookie list (`cookie=a="x"; b="y"`) is one value, so redact to the end of the line.
+    let end = !query && keyNames(keyText).leafName.includes('cookie') ? line.length : valueEnd(line, valueStart, query);
     if (authSchemes.has(line.slice(valueStart, end).toLowerCase()) && end < line.length) {
       end = valueEnd(line, skipSpaces(line, end), query);
     }
     if (end > valueStart) replace(valueStart, end, line[valueStart] === '"' && line[end - 1] === '"');
     index = Math.max(end, separatorAt + 1);
+  }
+  return output + line.slice(copied);
+}
+
+const sqlStatement = /\b(?:insert|update|select|delete|values|where)\b/i;
+const boundParameters = /\b(?:parameters|params|bindings|binds)\b[ \t]*[:=][ \t]*/gi;
+const parameterKeys = new Set(['parameters', 'params', 'bindings', 'binds', 'values']);
+const statementKeys = ['sql', 'query', 'statement', 'text', 'dbstatement', 'dbquerytext'];
+
+const namesSecretColumn = text => words(text.slice(0, maxText)).some(word => isStrongSecretKey(word) || secretWords.has(word));
+
+// Database errors can carry bound parameters. When the statement names a secret column, the parameter list
+// cannot be matched to columns safely, so the whole list is redacted.
+function scrubBoundParameters(line) {
+  if (!sqlStatement.test(line) || !namesSecretColumn(line)) return line;
+  let output = '';
+  let copied = 0;
+  boundParameters.lastIndex = 0;
+  for (let match = boundParameters.exec(line); match; match = boundParameters.exec(line)) {
+    const start = match.index + match[0].length;
+    const end = valueEnd(line, start, false);
+    if (end > start) { output += line.slice(copied, start) + redacted; copied = end; }
+    boundParameters.lastIndex = Math.max(end, boundParameters.lastIndex);
   }
   return output + line.slice(copied);
 }
@@ -195,18 +229,19 @@ export function scrubText(value, { query = false } = {}) {
   const marker = full.length > maxText ? `…[truncated ${full.length - maxText} chars]` : '';
   const lines = text.split('\n').map(line => {
     const header = headerLine.exec(line);
-    if (header) return `${scrubLine(line.slice(0, header.index), query)}${header[0]} ${redacted}`;
-    return scrubLine(line, query);
+    if (header) return `${scrubLine(scrubBoundParameters(line.slice(0, header.index)), query)}${header[0]} ${redacted}`;
+    return scrubLine(scrubBoundParameters(line), query);
   });
-  return lines.join('\n').replace(cardNumber, match => {
-    const digits = match.replace(/\D/g, '');
-    return /^[2-6]/.test(digits) && luhn(digits) ? '[REDACTED CARD]' : match;
-  }) + marker;
+  return lines.join('\n').replace(cardNumber, match => (isCardNumber(match.replace(/\D/g, '')) ? '[REDACTED CARD]' : match)) + marker;
 }
+
+const isCardNumber = digits => digits.length >= 13 && digits.length <= 19 && /^[2-6]/.test(digits) && luhn(digits);
+const formBody = /^[^\s=&]+=[^\s&]*(?:&[^\s=&]+=[^\s&]*)*$/;
 
 function scrubString(value, key) {
   const leaf = words(String(key).split('.').pop() || '').join('');
   if (queryKeys.has(leaf)) return scrubText(value, { query: true });
+  if ((leaf === 'data' || leaf === 'body') && value.length <= maxText && formBody.test(value)) return scrubText(value, { query: true });
   const trimmed = value.trimStart();
   if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && value.length <= maxText) {
     try { return JSON.stringify(scrubValue(JSON.parse(value), key)); } catch {}
@@ -218,6 +253,8 @@ export function scrubValue(value, key = '', depth = 0, seen = new WeakSet()) {
   if (value === null || value === undefined || typeof value === 'boolean') return value;
   if (key !== '' && isSecretKey(key)) return redacted;
   if (typeof value === 'string') return scrubString(value, key);
+  if (typeof value === 'number') return Number.isSafeInteger(value) && isCardNumber(String(value)) ? '[REDACTED CARD]' : value;
+  if (typeof value === 'bigint') return isCardNumber(String(value)) ? '[REDACTED CARD]' : value;
   if (typeof value !== 'object') return value;
   if (depth > maxDepth) return '[TRUNCATED]';
   if (value instanceof Date) return value;
@@ -234,9 +271,15 @@ export function scrubValue(value, key = '', depth = 0, seen = new WeakSet()) {
         ? [entry[0], isSecretKey(entry[0], true) ? redacted : scrubValue(entry[1], key, depth + 2, seen)]
         : scrubValue(entry, key, depth + 1, seen)));
     }
-    const query = queryKeys.has(leaf);
-    return Object.fromEntries(Object.entries(value).map(([childKey, entry]) => [
-      childKey, query && isSecretKey(childKey, true) ? redacted : scrubValue(entry, childKey, depth + 1, seen),
+    // Query objects and OAuth callback bodies (`code` with `state`) use query rules, so `code`, `state` and `key`
+    // are secrets there. Elsewhere `code` stays, because it is usually an error or status code.
+    const query = queryKeys.has(leaf) || (typeof value.code === 'string' && typeof value.state === 'string');
+    const entries = Object.entries(value);
+    const statement = entries.find(([childKey, entry]) => typeof entry === 'string' && statementKeys.includes(words(childKey).join('')))?.[1];
+    const secretParameters = statement !== undefined && sqlStatement.test(statement) && namesSecretColumn(statement);
+    return Object.fromEntries(entries.map(([childKey, entry]) => [
+      childKey, (query && isSecretKey(childKey, true)) || (secretParameters && parameterKeys.has(words(childKey).join('')))
+        ? redacted : scrubValue(entry, childKey, depth + 1, seen),
     ]));
   } finally {
     seen.delete(value);
@@ -251,7 +294,7 @@ export function sanitizeEvent(event) {
       return {
         event_id: event.event_id, timestamp: event.timestamp, level: event.level || 'error', platform: event.platform,
         tags: { application: service, service },
-        message: `monitoring: event could not be scrubbed, ${scrubText(error?.message || error)}`,
+        message: `monitoring: event could not be scrubbed (${error?.name || typeof error})`,
       };
     } catch { return null; }
   }
@@ -275,7 +318,7 @@ export function sanitizeLog(log, { runtime, hostName } = {}) {
   try {
     return { ...log, message: scrubText(message), attributes: { ...scrubValue(attributes), ...serviceAttributes } };
   } catch (error) {
-    return { ...log, message: `monitoring: log could not be scrubbed, ${String(error?.message || error).slice(0, 200)}`, attributes: serviceAttributes };
+    return { ...log, message: `monitoring: log could not be scrubbed (${error?.name || typeof error})`, attributes: serviceAttributes };
   }
 }
 

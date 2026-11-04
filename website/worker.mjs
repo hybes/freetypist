@@ -73,7 +73,7 @@ export async function handleRequest(request, env, upstream = fetch) {
       const duration = Date.now() - started;
       const what = { fetch: `fetch failed, ${error?.name}: ${error?.message}`, status: `upstream returned ${status}`,
         parse: `is not valid JSON, ${error?.message}`, validate: `rejected, ${String(error?.message).replace(/^Invalid release metadata: /, '')}` }[stage];
-      logOnce('error', `release.json:${stage}:${status}:${error?.message}`, `release: metadata ${what} for ${url.pathname} (${duration} ms)`, {
+      logOnce('error', `${request.method}:${url.pathname}:${stage}:${status}:${error?.message}`, `release: metadata ${what} for ${url.pathname} (${duration} ms)`, {
         ...requestAttributes(request, url), ...errorAttributes(error), stage, 'http.response.status_code': status,
         'duration_ms': duration, 'upstream.url': `${releaseOrigin}/mac.json`,
         'release.version': release?.version, 'release.file': release?.file,
@@ -95,7 +95,7 @@ export async function handleRequest(request, env, upstream = fetch) {
       if (response.status >= 400 && response.status !== 416) {
         const level = response.status >= 500 || name === 'appcast.xml' ? 'error' : 'warn';
         const duration = Date.now() - started;
-        logOnce(level, `release:${name}:${response.status}`, `release: upstream returned ${response.status} for ${name} (${duration} ms)`, {
+        logOnce(level, `${request.method}:${name}:${response.status}`, `release: upstream returned ${response.status} for ${name} (${duration} ms)`, {
           ...requestAttributes(request, url), 'release.file': name, 'http.response.status_code': response.status,
           'duration_ms': duration, 'upstream.url': `${releaseOrigin}/${name}`,
         });
@@ -107,7 +107,7 @@ export async function handleRequest(request, env, upstream = fetch) {
       return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers: outgoing });
     } catch (error) {
       const duration = Date.now() - started;
-      logOnce('error', `release:${name}:fetch:${error?.message}`, `release: ${name} fetch failed, ${error?.name}: ${error?.message} (${duration} ms)`, {
+      logOnce('error', `${request.method}:${name}:fetch:${error?.message}`, `release: ${name} fetch failed, ${error?.name}: ${error?.message} (${duration} ms)`, {
         ...requestAttributes(request, url), ...errorAttributes(error), 'release.file': name,
         'duration_ms': duration, 'upstream.url': `${releaseOrigin}/${name}`,
       });
