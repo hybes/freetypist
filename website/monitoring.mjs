@@ -399,6 +399,46 @@ function fromLocalHost(item, currentUrl) {
   return urls.some(value => isLocalHost(hostOf(value))) || hosts.some(value => isLocalHost(hostOf(value, true)));
 }
 
+// What fetch() rejects with when no answer arrived, in Chrome, Safari and Firefox wording. Sentry's fetch
+// instrumentation adds the host in brackets, as in "Load failed (type.cnnct.uk)".
+const fetchRejection = String.raw`(?:Failed to fetch|Load failed|NetworkError when attempting to fetch resource\.?)(?: \([^()\s]+\))?`;
+const fetchRejectionMessage = new RegExp(`^${fetchRejection}$`);
+const fetchRejectionText = new RegExp(String.raw`(?:^|TypeError: )${fetchRejection}(?=$|[\s,.;)"'])`);
+
+// A browser request that never got an answer because fetch() itself rejected: the visitor's connection
+// dropped, or the page closed or navigated away. An error status from the Worker, our own 10-second timeout
+// (TimeoutError) and a TypeError thrown by our own code are not counted.
+export function isVisitorNetworkFailure(error) {
+  try {
+    if (!error || typeof error !== 'object') return false;
+    if (error.name === 'AbortError') return true;
+    return error.name === 'TypeError' && fetchRejectionMessage.test(String(error.message ?? ''));
+  } catch { return false; }
+}
+
+function isVisitorNetworkFailureEvent(event, hint) {
+  if (isVisitorNetworkFailure(hint?.originalException)) return true;
+  return (event?.exception?.values || []).some(({ type, value = '' }) =>
+    type === 'AbortError' || (type === 'TypeError' && fetchRejectionMessage.test(value)));
+}
+
+function isVisitorNetworkFailureLog(log) {
+  const attributes = log?.attributes || {};
+  if (isVisitorNetworkFailure({ name: attributes['error.type'], message: attributes['error.message'] })) return true;
+  return fetchRejectionText.test(String(log?.message ?? ''));
+}
+
+// Headless and scripted browsers (scrapers, test runners, audits) throw errors no visitor sees. Googlebot is a
+// real browser and still reports.
+const automatedBrowser = /\b(?:Lightpanda|HeadlessChrome|PhantomJS|SlimerJS|HtmlUnit|jsdom|Zombie(?:\.js)?|Chrome-Lighthouse|Puppeteer|Playwright|Cypress|Selenium|WebDriver)\b/i;
+
+export function isAutomatedBrowser(navigatorLike) {
+  try {
+    if (!navigatorLike) return false;
+    return navigatorLike.webdriver === true || automatedBrowser.test(String(navigatorLike.userAgent ?? ''));
+  } catch { return false; }
+}
+
 // Wrangler tells the build which command it runs for (build.mjs bakes it into both bundles). Only
 // `wrangler deploy` and `wrangler versions upload` produce code that runs on Cloudflare; `wrangler dev`,
 // a plain `npm run build`, tests and scripts have no command or `dev`.
@@ -416,14 +456,26 @@ export function deployment(env = {}) {
 
 // Sends only from real deployments. In the browser the page must also be on a public host. SENTRY_FORCE=1
 // turns sending on anywhere except tests, for deliberate local checks.
-export function monitoringOptions(env = {}, runtime = 'worker', { consoleLoggingIntegration, hostName, currentUrl } = {}) {
+export function monitoringOptions(env = {}, runtime = 'worker', { consoleLoggingIntegration, hostName, currentUrl, navigator } = {}) {
   const { deployed, force, environment } = deployment(env);
   const explicitDsn = env.SENTRY_DSN?.trim();
   const testing = environment === 'test' || env.NODE_ENV === 'test' || process.env.NODE_ENV === 'test';
   let pageHost = '';
   try { pageHost = runtime === 'browser' ? hostOf(currentUrl?.()) : ''; } catch { pageHost = ''; }
-  const hosted = deployed && (runtime !== 'browser' || (pageHost !== '' && !isLocalHost(pageHost)));
+  const browser = runtime === 'browser';
+  // In the browser the page must be on a public host and not a headless or scripted browser.
+  const hosted = deployed && (!browser || (pageHost !== '' && !isLocalHost(pageHost) && !isAutomatedBrowser(navigator)));
   const remote = item => force || !fromLocalHost(item, currentUrl);
+  // A visitor's dropped connection is not our fault: no issue, and its log lines go at info.
+  const visitorNetwork = (event, hint) => {
+    try { return browser && isVisitorNetworkFailureEvent(event, hint); } catch { return false; }
+  };
+  const relevel = log => {
+    try {
+      return browser && ['warn', 'error', 'fatal'].includes(log.level) && isVisitorNetworkFailureLog(log)
+        ? { ...log, level: 'info', severityNumber: undefined } : log;
+    } catch { return log; }
+  };
   return {
     dsn: explicitDsn || defaultDsn,
     enabled: !testing && (force || hosted),
@@ -441,7 +493,7 @@ export function monitoringOptions(env = {}, runtime = 'worker', { consoleLogging
       stackFrameVariables: false, frameContextLines: 0,
     },
     sendClientReports: false,
-    beforeSendLog: log => (remote(log) ? sanitizeLog(log, { runtime, hostName }) : null),
+    beforeSendLog: log => (remote(log) ? sanitizeLog(relevel(log), { runtime, hostName }) : null),
     beforeSendMetric: () => null,
     maxBreadcrumbs: 50,
     initialScope: { tags: { application: service, service, monitoring_backend: 'glitchtip', runtime } },
@@ -449,7 +501,7 @@ export function monitoringOptions(env = {}, runtime = 'worker', { consoleLogging
       ...defaults.filter(integration => !['BrowserSession', 'ProcessSession', 'CronTriggers', 'ConversationId'].includes(integration.name)),
       ...(consoleLoggingIntegration ? [consoleLoggingIntegration({ levels: ['warn', 'error'] })] : []),
     ],
-    beforeSend: event => (remote(event) ? sanitizeEvent(event) : null),
+    beforeSend: (event, hint) => (remote(event) && !visitorNetwork(event, hint) ? sanitizeEvent(event) : null),
     beforeSendTransaction: event => (remote(event) ? sanitizeEvent(event) : null),
     beforeBreadcrumb: sanitizeBreadcrumb,
   };
