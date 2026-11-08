@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { consoleLoggingIntegration, getDefaultIntegrations, withSentry } from '@sentry/cloudflare';
 import { getDefaultIntegrations as browserIntegrations } from '@sentry/browser';
 import {
-  createLogger, createRepeatGate, defaultDsn, isLocalHost, isSecretKey, monitoringOptions, sanitizeBreadcrumb, sanitizeEvent,
+  createLogger, createRepeatGate, defaultDsn, isAutomatedBrowser, isLocalHost, isSecretKey, isVisitorNetworkFailure, monitoringOptions, sanitizeBreadcrumb, sanitizeEvent,
   sanitizeLog, sanitizeSpan, scrubText, scrubValue,
 } from './monitoring.mjs';
 import { handleRequest } from './worker.mjs';
@@ -19,8 +19,8 @@ function optionsIn(env, calls) {
   const result = execFileSync(process.execPath, ['--input-type=module', '-e', `
     import { monitoringOptions } from './monitoring.mjs';
     const calls = ${JSON.stringify(calls)};
-    console.log(JSON.stringify(calls.map(([env, runtime, url]) => {
-      const { enabled, environment, dsn, tracesSampleRate } = monitoringOptions(env, runtime, { currentUrl: () => url });
+    console.log(JSON.stringify(calls.map(([env, runtime, url, navigator]) => {
+      const { enabled, environment, dsn, tracesSampleRate } = monitoringOptions(env, runtime, { currentUrl: () => url, navigator });
       return { enabled, environment, dsn, tracesSampleRate };
     })));
   `], {
@@ -59,6 +59,41 @@ test('wrangler deploy reports as production and versions upload as preview', () 
   assert.equal(filePage.enabled, false);
   const [preview] = optionsIn({ WRANGLER_COMMAND: 'versions upload' }, [[{}, 'worker']]);
   assert.deepEqual(preview, { enabled: true, environment: 'preview', dsn: defaultDsn, tracesSampleRate: 0.01 });
+});
+
+test('headless and scripted browsers never report; real browsers and Googlebot do', () => {
+  const page = 'https://type.cnnct.uk/';
+  const automated = ['Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/120.0 Safari/537.36', 'Lightpanda/1.0', 'Mozilla/5.0 PhantomJS/2.1.1', 'Playwright/1.40'];
+  for (const userAgent of automated) assert.equal(isAutomatedBrowser({ userAgent }), true, userAgent);
+  const results = optionsIn({ WRANGLER_COMMAND: 'deploy' }, [
+    ...automated.map(userAgent => [{}, 'browser', page, { userAgent }]),
+    [{}, 'browser', page, { userAgent: 'Mozilla/5.0 Safari/605.1.15', webdriver: true }],
+    [{}, 'browser', page, { userAgent: 'Mozilla/5.0 (Macintosh) Version/18.0 Safari/605.1.15', webdriver: false }],
+    [{}, 'browser', page, { userAgent: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' }],
+  ]);
+  assert.deepEqual(results.map(({ enabled }) => enabled), [false, false, false, false, false, true, true]);
+});
+
+test("a visitor's dropped connection is not an issue in the browser and logs at info; our own errors still report", () => {
+  for (const error of [new TypeError('Failed to fetch'), new TypeError('Load failed (type.cnnct.uk)'),
+    new TypeError('NetworkError when attempting to fetch resource.'), Object.assign(new Error('aborted'), { name: 'AbortError' })])
+    assert.equal(isVisitorNetworkFailure(error), true, error.message);
+  for (const error of [new TypeError("Cannot read properties of undefined (reading 'replace')"), new Error('Failed to fetch'),
+    Object.assign(new Error('signal timed out'), { name: 'TimeoutError' }), null])
+    assert.equal(isVisitorNetworkFailure(error), false, String(error?.message));
+  const page = 'https://type.cnnct.uk/';
+  const browser = monitoringOptions({ SENTRY_FORCE: '1' }, 'browser', { currentUrl: () => page });
+  const exception = (type, value) => ({ exception: { values: [{ type, value }] } });
+  assert.equal(browser.beforeSend(exception('TypeError', 'Failed to fetch (type.cnnct.uk)'), {}), null);
+  assert.equal(browser.beforeSend(exception('TypeError', 'Load failed'), { originalException: new TypeError('Load failed') }), null);
+  assert.ok(browser.beforeSend(exception('TypeError', 'x is not a function'), { originalException: new TypeError('x is not a function') }));
+  const line = (message, attributes = {}) => ({ level: 'warn', message, attributes });
+  assert.equal(browser.beforeSendLog(line('release: download details unavailable', { 'error.type': 'TypeError', 'error.message': 'Load failed' })).level, 'info');
+  assert.equal(browser.beforeSendLog(line('Uncaught TypeError: Failed to fetch')).level, 'info');
+  assert.equal(browser.beforeSendLog(line('release: download details unavailable in the browser, HTTP 503')).level, 'warn');
+  const worker = monitoringOptions({ SENTRY_FORCE: '1' }, 'worker', { currentUrl: () => page });
+  assert.ok(worker.beforeSend(exception('TypeError', 'Failed to fetch'), { originalException: new TypeError('Failed to fetch') }), 'The Worker failing to fetch is ours');
+  assert.equal(worker.beforeSendLog(line('Uncaught TypeError: Failed to fetch')).level, 'warn');
 });
 
 test('SENTRY_FORCE turns local reporting on deliberately, but never in tests', () => {

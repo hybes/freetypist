@@ -1,4 +1,4 @@
-import { captureException, errorAttributes, log } from '../browser.mjs';
+import { captureException, errorAttributes, isVisitorNetworkFailure, log } from '../browser.mjs';
 
 const examples = {
   completion: { before: 'Thanks for ', suggestion: 'your help.', after: 'Thanks for your help.', hint: 'Press Tab to accept', description: 'FreeTypist suggests “your help.” after “Thanks for ”. Tab accepts the suggestion.' },
@@ -116,11 +116,13 @@ fetch('/release.json', { cache: 'no-store', signal: AbortSignal.timeout(10000) }
 }).catch(error => {
   const duration = Math.round(performance.now() - releaseStarted);
   const reason = releaseStatus && releaseStatus >= 400 ? `HTTP ${releaseStatus}` : `${error?.name}: ${error?.message}`;
-  log.warn(`release: download details unavailable in the browser, ${reason} (${duration} ms)`, {
+  // The visitor's connection dropping is not our fault: info, and no issue.
+  const offline = isVisitorNetworkFailure(error);
+  log[offline ? 'info' : 'warn'](`release: download details unavailable in the browser, ${reason} (${duration} ms)`, {
     ...errorAttributes(error), 'url.path': '/release.json', 'http.response.status_code': releaseStatus,
     'duration_ms': duration, 'page.url': location.href, online: navigator.onLine,
   });
-  captureException(error, { tags: { operation: 'release_metadata' } });
+  if (!offline) captureException(error, { tags: { operation: 'release_metadata' } });
   status.textContent = 'The download is being prepared. Please check back shortly.';
   download.textContent = 'Download being prepared';
   download.setAttribute('aria-disabled', 'true');
